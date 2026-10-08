@@ -1,0 +1,21 @@
+# 启用 gRPC TLS 的 Profile：以 --spring.profiles.active=tls 启动
+# 证书用 Spring Boot 的 PEM SSL Bundle 配置；self-signed 测试需把 secure 设为 false
+spring:
+  grpc:
+    server:
+      ssl:
+        bundle: imssl
+        secure: false
+  ssl:
+    bundle:
+      pem:
+        imssl:
+          certificate: classpath:grpc/server.crt
+          private-key: classpath:grpc/server.key
+
+im:
+  node:
+    grpc:
+      tls:
+        enabled: true
+        trust-cert: classpath:grpc/server.crt

@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IM 节点测试客户端</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, "Segoe UI", Arial, sans-serif; margin: 0; padding: 16px;
+           background: #f7f8fa; color: #1f2937; }
+    h2 { margin: 0 0 12px; font-size: 16px; font-weight: 500; }
+    .row { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+    input { padding: 8px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 13px; }
+    button { padding: 8px 14px; border: 0; border-radius: 8px; background: #185fa5; color: #fff;
+             font-size: 13px; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    #log { margin-top: 12px; height: 320px; overflow: auto; background: #fff; border: 1px solid #e2e8f0;
+           border-radius: 8px; padding: 10px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+    .me { color: #185fa5; }
+    .sys { color: #64748b; }
+  </style>
+</head>
+<body>
+  <h2>IM 节点测试客户端（当前节点：<span id="nodeUrl"></span>）</h2>
+  <div class="row">
+    <input id="userId" placeholder="你的 userId，如 alice" style="width:200px">
+    <button id="connectBtn" onclick="connect()">连接</button>
+    <button id="disconnectBtn" onclick="disconnect()" disabled>断开</button>
+  </div>
+  <div class="row">
+    <input id="to" placeholder="接收方 userId，如 bob" style="width:200px">
+    <input id="body" placeholder="消息内容" style="width:260px">
+    <button id="sendBtn" onclick="send()" disabled>发送</button>
+  </div>
+  <div id="log"></div>
+
+  <script>
+    let ws = null;
+    document.getElementById('nodeUrl').textContent = location.host;
+
+    function log(text, cls) {
+      const el = document.getElementById('log');
+      const div = document.createElement('div');
+      div.className = cls || '';
+      div.textContent = text;
+      el.appendChild(div);
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function connect() {
+      const userId = document.getElementById('userId').value.trim();
+      if (!userId) { alert('请填写 userId'); return; }
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(proto + '://' + location.host + '/ws?userId=' + encodeURIComponent(userId));
+      ws.onopen = () => {
+        log('已连接为 ' + userId, 'sys');
+        document.getElementById('connectBtn').disabled = true;
+        document.getElementById('disconnectBtn').disabled = false;
+        document.getElementById('sendBtn').disabled = false;
+      };
+      ws.onmessage = (e) => log('收到: ' + e.data, 'me');
+      ws.onclose = () => {
+        log('连接已关闭', 'sys');
+        document.getElementById('connectBtn').disabled = false;
+        document.getElementById('disconnectBtn').disabled = true;
+        document.getElementById('sendBtn').disabled = true;
+      };
+      ws.onerror = () => log('连接出错', 'sys');
+    }
+
+    function disconnect() { if (ws) ws.close(); }
+
+    function send() {
+      const to = document.getElementById('to').value.trim();
+      const body = document.getElementById('body').value.trim();
+      if (!ws || ws.readyState !== 1) { alert('未连接'); return; }
+      if (!to || !body) { alert('请填写接收方和消息'); return; }
+      ws.send(JSON.stringify({ to: to, body: body }));
+      log('发送 -> ' + to + ': ' + body, 'sys');
+    }
+  </script>
+</body>
+</html>

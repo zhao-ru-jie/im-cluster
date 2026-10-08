@@ -1,0 +1,88 @@
+# Headless Service：clusterIP: None
+# 每个 pod 拥有独立、稳定的 DNS 名（im-node-0.im-service.default.svc.cluster.local），
+# 集群内其他节点可直接寻址；同时也支撑 POD_NAME 兜底解析。
+apiVersion: v1
+kind: Service
+metadata:
+  name: im-service
+  labels:
+    app: im-node
+spec:
+  clusterIP: None
+  selector:
+    app: im-node
+  ports:
+    - name: grpc
+      port: 9090
+      targetPort: 9090
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: im-node
+spec:
+  serviceName: im-service
+  replicas: 3
+  selector:
+    matchLabels:
+      app: im-node
+  template:
+    metadata:
+      labels:
+        app: im-node
+    spec:
+      containers:
+        - name: im-node
+          # 先 docker build 并 push 到你的镜像仓库，再改这里的 image
+          image: your-registry/im-node:latest
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: grpc
+              containerPort: 9090
+          env:
+            # —— K8s Downward API：把 pod 真实信息注入环境变量 ——
+            # 1) pod 真实 IP：NodeAddressResolver 优先用它作为 gRPC 可达地址（节点 ID）
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # 2) pod 名称：StatefulSet 下为 im-node-0 / im-node-1 ...，POD_IP 缺失时兜底
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # gRPC 端口：同 StatefulSet 内所有 pod 都用 9090（各自独立网络命名空间，不冲突）
+            - name: IM_GRPC_PORT
+              value: "9090"
+            # 指向上面的 Redis Service（覆盖 application.yml 里的 localhost）
+            - name: SPRING_DATA_REDIS_HOST
+              value: "redis"
+            # —— 启用 Nacos-Client 动态发现（节点 gRPC 地址注册到 Nacos）——
+            # 把 IM_NACOS_ADDR 改成你的 Nacos Service 地址（如 nacos.nacos.svc.cluster.local:8848）
+            - name: IM_NACOS_ENABLED
+              value: "true"
+            - name: IM_NACOS_ADDR
+              value: "nacos:8848"
+            - name: IM_NACOS_NAMESPACE
+              value: ""
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 9090
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

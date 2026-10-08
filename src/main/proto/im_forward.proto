@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package im.forward;
+
+option java_package = "com.example.im.grpc";
+option java_multiple_files = true;
+
+// 节点间转发请求：源节点 -> 目标节点
+message ForwardRequest {
+  string senderId = 1;   // 发送方用户 ID
+  string receiverId = 2; // 接收方用户 ID
+  string payload = 3;    // 消息体（JSON 字符串）
+  int64 timestamp = 4;   // 发送时间戳（毫秒）
+}
+
+message ForwardResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// 节点间转发服务
+service ForwardService {
+  rpc Forward(ForwardRequest) returns (ForwardResponse);
+}

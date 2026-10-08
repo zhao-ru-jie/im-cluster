@@ -1,0 +1,20 @@
+# Maven / 编译产物
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.project
+.classpath
+
+# 本地生成的 TLS 证书（演示用，勿提交到仓库）
+src/main/resources/grpc/*.key
+src/main/resources/grpc/*.crt
+
+# 运行日志
+logs/
