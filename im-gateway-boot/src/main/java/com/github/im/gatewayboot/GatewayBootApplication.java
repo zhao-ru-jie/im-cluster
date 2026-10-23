@@ -5,7 +5,7 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
- * 长连接服务独立部署入口（阶段 3）。
+ * 长连接服务独立部署入口。
  *
  * <p>本进程只做「连接」这一件事：
  * <ul>

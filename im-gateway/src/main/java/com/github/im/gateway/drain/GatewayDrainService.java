@@ -42,6 +42,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <p><b>注意</b>：显式 drain 不会让进程退出，只是把连接迁走；退出仍由平台负责
  * （这样 preStop 之后 pod 还能继续把迁移计数上报给监控）。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Component
 public class GatewayDrainService {

@@ -35,6 +35,9 @@ import java.util.stream.Collectors;
  * <p><b>不健康监听</b>：订阅实例变更，diff 出掉队的实例并调用
  * {@link GatewayRegistry#removeInstanceBindings(String)} 清理 Redis 路由，
  * 避免窗口期内消息持续推往死实例。清理动作发生在其它健康实例上（死实例自己已无法执行）。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Component
 public class GatewayNacosDiscovery {

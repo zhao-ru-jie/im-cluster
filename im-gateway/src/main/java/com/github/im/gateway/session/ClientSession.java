@@ -12,6 +12,9 @@ package com.github.im.gateway.session;
  * 摘流线程、巡检线程）。实现必须自行保证线程安全——Netty 的 {@code writeAndFlush}
  * 本身是线程安全的（转交给 event loop 串行执行），不要像 Spring 的 WebSocketSession
  * 那样在外面加锁，那会在慢客户端上把业务线程一起阻塞。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public interface ClientSession {
 

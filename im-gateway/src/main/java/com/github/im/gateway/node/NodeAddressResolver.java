@@ -24,6 +24,9 @@ import java.util.Enumeration;
  *   <li>本机第一个非回环 IPv4</li>
  *   <li>{@code 127.0.0.1} 兜底</li>
  * </ol>
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Component
 public class NodeAddressResolver {

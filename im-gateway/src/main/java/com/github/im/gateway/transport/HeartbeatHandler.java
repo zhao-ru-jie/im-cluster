@@ -38,6 +38,9 @@ import java.util.concurrent.TimeUnit;
  *
  * <p><b>未认证连接</b>：握手/认证还没完成时客户端解析不了 ping，因此不发探测，
  * 第二次空闲直接断开（TCP 的 10s 认证窗口通常早就先把它关了）。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public class HeartbeatHandler extends ChannelInboundHandlerAdapter {
 

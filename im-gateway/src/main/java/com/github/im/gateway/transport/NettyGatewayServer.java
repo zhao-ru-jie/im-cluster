@@ -69,6 +69,9 @@ import java.util.concurrent.TimeUnit;
  * <p><b>两个端口而不是一个</b>：同样的能力也可以用一个端口做协议嗅探（首字节是 "GET " 就当
  * HTTP 升级）来合并，但那会让 LB/防火墙/健康检查无法按传输分流，排障时也不好定位。
  * 这里选择显式双端口，运维语义更清楚。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Component
 public class NettyGatewayServer {

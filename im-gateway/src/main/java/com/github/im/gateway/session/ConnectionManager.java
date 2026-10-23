@@ -25,6 +25,9 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p><b>单用户单连接</b>：一个 userId 只保留最后建立的那条连接（多设备支持需要把
  * key 换成 userId+deviceId，届时 {@link #send} 的语义也要改成「推给所有设备」）。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Component
 public class ConnectionManager {

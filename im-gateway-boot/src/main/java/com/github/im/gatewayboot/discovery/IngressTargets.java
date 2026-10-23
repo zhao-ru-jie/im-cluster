@@ -9,6 +9,8 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.util.Assert;
+import org.springframework.util.StringUtils;
 
 import java.util.Arrays;
 import java.util.List;
@@ -49,6 +51,10 @@ import java.util.function.Consumer;
  *       并订阅同服务实例，服务于「IM 服务 → 网关」的下行推送寻址；</li>
  *   <li>本类：<b>不注册</b>，只订阅别人（service=im-server），服务于「网关 → IM 服务」的上行寻址。</li>
  * </ul>
+ *
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public class IngressTargets {
 
@@ -79,13 +85,11 @@ public class IngressTargets {
         this.namespace = namespace;
         this.serviceName = serviceName;
         this.fallback = parse(fallbackAddresses);
-        if (this.fallback.isEmpty()) {
-            throw new IllegalArgumentException("at least one ingress address is required (im.server.address)");
-        }
+        Assert.notEmpty(this.fallback, "at least one ingress address is required (im.server.address)");
     }
 
     private static List<String> parse(String addresses) {
-        if (addresses == null) {
+        if (!StringUtils.hasText(addresses)) {
             return List.of();
         }
         return Arrays.stream(addresses.split(","))

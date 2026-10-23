@@ -1,4 +1,4 @@
-package com.github.im.gatewayboot;
+package com.github.im.gatewayboot.config;
 
 import com.github.im.contract.MessageIngress;
 import com.github.im.gatewayboot.discovery.IngressNameResolverProvider;
@@ -36,11 +36,14 @@ import org.springframework.context.annotation.Configuration;
  *
  * <p><b>本次重接又为什么要预热</b>：channel 的第一次建连（含被调方 gRPC 服务进程的首连接，
  * 实测 260~340ms）必须在流量到来之前完成，否则第一条消息仍然会吃满 deadline。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Configuration
-public class GatewayWiring {
+public class GatewayWiringConfig {
 
-    private static final Logger log = LoggerFactory.getLogger(GatewayWiring.class);
+    private static final Logger log = LoggerFactory.getLogger(GatewayWiringConfig.class);
 
     @Bean(destroyMethod = "close")
     public GrpcChannelFactory grpcChannelFactory(

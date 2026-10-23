@@ -34,6 +34,9 @@ import java.util.Map;
  *
  * <p>降级约定：IM 服务不可用时（{@link ObjectProvider} 取不到实现或调用异常），
  * <b>连接本身必须保住</b>——只回一个可重试的 ACK 错误帧，等 IM 服务恢复后客户端重发。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Component
 public class SessionLifecycle {

@@ -31,6 +31,9 @@ import java.util.List;
  * <p><b>一致性约定</b>：本表是最终一致（TTL 30s / 续期 10s），允许秒级不一致。
  * 不一致窗口内的重复推送由 IM 服务按 {@code PushResult.failed_user_ids} 落离线兜底，
  * 不做分布式锁强一致——代价与收益不成比例。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Component
 public class GatewayRegistry {

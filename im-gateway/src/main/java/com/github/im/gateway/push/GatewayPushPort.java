@@ -22,6 +22,9 @@ import java.util.Map;
  *
  * <p>失败处理原则：<b>永不抛异常给 IM 服务</b>，一律转成 {@code failed_user_ids}，
  * 由 IM 服务走离线兜底——可丢实时性，不可丢消息。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Component
 public class GatewayPushPort implements PushPort {

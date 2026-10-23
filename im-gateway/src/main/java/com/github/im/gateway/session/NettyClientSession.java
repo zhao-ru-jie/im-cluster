@@ -17,6 +17,9 @@ import io.netty.handler.codec.http.websocketx.CloseWebSocketFrame;
  *
  * <p>{@code userId} 之所以可变：TCP 不像 WebSocket 能在 HTTP 握手时带 query 参数，
  * 身份只能由首帧 {@code connect} 声明，认证成功后回填。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public final class NettyClientSession implements ClientSession {
 

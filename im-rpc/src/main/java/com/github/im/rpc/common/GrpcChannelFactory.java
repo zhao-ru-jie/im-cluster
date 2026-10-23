@@ -29,6 +29,9 @@ import java.util.concurrent.TimeUnit;
  * </ul>
  *
  * <p>线程安全：{@link ConcurrentHashMap} + {@code computeIfAbsent} 保证同一 target 只建一次。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public class GrpcChannelFactory implements AutoCloseable {
 

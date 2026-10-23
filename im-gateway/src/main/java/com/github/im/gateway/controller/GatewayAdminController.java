@@ -23,6 +23,9 @@ import java.util.Map;
  *
  * <p><b>安全边界</b>：本入口不做鉴权，必须只在内网/集群内可达（K8s 用 NetworkPolicy
  * 或独立 management 端口 + Service 限制访问），不要暴露到公网 Ingress。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @RestController
 @RequestMapping("/admin")

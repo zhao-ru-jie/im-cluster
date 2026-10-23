@@ -24,6 +24,9 @@ import java.util.function.Consumer;
  *
  * <p>实例变更是<b>推送式</b>的：Nacos 通知 → {@link IngressTargets#addListener} → 这里重新
  * {@code onResult}，gRPC 据此增减 subchannel，不需要轮询或重建 channel。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public class IngressNameResolver extends NameResolver {
 

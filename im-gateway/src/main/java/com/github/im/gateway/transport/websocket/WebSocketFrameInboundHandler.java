@@ -21,6 +21,9 @@ import io.netty.handler.codec.http.websocketx.WebSocketServerProtocolHandler;
  *
  * <p>协议级 ping/pong 帧（{@code PingWebSocketFrame}）由 {@code WebSocketServerProtocolHandler}
  * 自动应答，不会走到这里——业务层的 {@code {"type":"ping"}} 是另一套应用级心跳。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public class WebSocketFrameInboundHandler extends SimpleChannelInboundHandler<TextWebSocketFrame> {
 

@@ -35,6 +35,9 @@ import java.util.Map;
  * </ol>
  *
  * <p>原生 TCP 不需要这一步：它没有 HTTP 握手，身份由首帧 {@code connect} 声明。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public class WebSocketHandshakeGate extends ChannelInboundHandlerAdapter {
 

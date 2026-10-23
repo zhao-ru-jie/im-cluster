@@ -21,6 +21,9 @@ import java.net.URI;
  *
  * <p>注册是<b>进程级</b>的（{@link NameResolverRegistry} 是全局表），所以由装配层创建单例并在
  * 关闭时 {@link #close()} 反注册，避免多次启动/关闭（测试、热重启）时残留。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public class IngressNameResolverProvider extends NameResolverProvider {
 

@@ -26,6 +26,9 @@ import java.util.Map;
  * 网关回 {"type":"connected"}；认证前的任何其他帧都会被拒并断开。
  * （WebSocket 不需要这一步：userId 在 HTTP 握手 query 里带，握手成功即认证完成。）
  * </pre>
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 // 显式命名：im-server 里也有一个同名类（各自只产出自己负责的帧类型），
 // 同进程装配时靠 bean 名区分，拆进程后各自独立。

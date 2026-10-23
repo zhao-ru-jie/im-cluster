@@ -31,6 +31,9 @@ import org.springframework.stereotype.Component;
  * </ul>
  *
  * <p>没有 {@link MeterRegistry}（未启用 actuator/metrics）时自动降级为空实现，不影响网关功能。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Component
 public class GatewayMetrics {

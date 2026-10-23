@@ -26,6 +26,9 @@ import java.util.concurrent.TimeUnit;
  * 文件句柄和内存，而又不在 {@code ConnectionManager} 里（空闲巡检看不到它）。
  *
  * <p>未认证前的任何非 connect 帧一律拒绝并断开，避免「匿名连接」进入业务通道。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public class TcpFrameInboundHandler extends SimpleChannelInboundHandler<String> {
 

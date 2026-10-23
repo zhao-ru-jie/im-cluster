@@ -24,6 +24,9 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>场景：用户连在网关 A，但 IM 服务把帧交给了网关 B（例如 B 是该会话的上报方，
  * 或 IM 服务做了批量聚合）。B 需要把帧转给 A，走本客户端。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Component
 public class GatewayPushClient {

@@ -34,6 +34,9 @@ import java.util.List;
  * 若 ID 由 {@code conversationId#seq} 派生，seq 回绕就等于消息 ID 撞车；拆开后
  * 「唯一性」交给 UUIDv7（本地生成、不回绕），「顺序性」交给 seq（只要求会话内单调、
  * 允许有洞），两者的故障域彻底分开。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Service
 public class MessageService implements MessageIngress {

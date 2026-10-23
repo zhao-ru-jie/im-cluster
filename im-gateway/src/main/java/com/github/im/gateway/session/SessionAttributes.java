@@ -7,6 +7,9 @@ import io.netty.util.AttributeKey;
  *
  * <p>集中定义的原因：心跳、认证、传输适配三处都要读同一份身份，
  * 各写一个 {@code AttributeKey.valueOf(...)} 字符串容易拼错且拿不到值（AttributeKey 按名字相等）。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public final class SessionAttributes {
 

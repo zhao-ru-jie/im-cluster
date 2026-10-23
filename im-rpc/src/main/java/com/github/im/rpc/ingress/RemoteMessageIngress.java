@@ -42,6 +42,9 @@ import java.util.function.Function;
  *
  * <p><b>重试语义</b>：本类<b>不做</b>重试。接口本身幂等，重试由上层决定（客户端退避重发），
  * 这样避免「网关重试 + 客户端重试」叠加把 IM 服务打穿。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public class RemoteMessageIngress implements MessageIngress {
 
