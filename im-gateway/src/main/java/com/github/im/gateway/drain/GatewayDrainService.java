@@ -111,7 +111,7 @@ public class GatewayDrainService {
         log.warn("[drain] 开始摘流 instance={} reason={} connections={} timeoutMs={}",
                 instanceId, reason, total, timeoutMs);
 
-        // 1) 从注册中心摘除 + 就绪探针翻红：先断新流量（K8s / LB 都不再导流进来）
+        // 1. 从注册中心摘除 + 就绪探针翻红：先断新流量（K8s / LB 都不再导流进来）
         registryAccessor.deregister();
         try {
             AvailabilityChangeEvent.publish(events, this, ReadinessState.REFUSING_TRAFFIC);
@@ -119,18 +119,18 @@ public class GatewayDrainService {
             log.debug("[drain] 发布 readiness=REFUSING_TRAFFIC 失败（忽略）: {}", e.getMessage());
         }
 
-        // 2) 广播 session.migrate：让客户端主动重连到其它实例
+        // 2. 广播 session.migrate：让客户端主动重连到其它实例
         int notified = 0;
         String migrateFrame = frames.migrate(reason, retryAfterMs);
-        for (Map.Entry<String, ClientSession> entry : connectionManager.snapshot().entrySet()) {
-            if (connectionManager.sendTo(entry.getKey(), entry.getValue(), migrateFrame)) {
+        for (ClientSession session : connectionManager.sessions()) {
+            if (connectionManager.sendTo(session.userId(), session, migrateFrame)) {
                 notified++;
             }
         }
         metrics.sessionMigrated(notified);
         log.info("[drain] 已向 {} 个连接下发 session.migrate，等待客户端迁移（最长 {}ms）", notified, timeoutMs);
 
-        // 3) 等待连接自然退出（客户端重连 -> 旧连接关闭）
+        // 3. 等待连接自然退出（客户端重连 -> 旧连接关闭）
         long deadline = System.currentTimeMillis() + timeoutMs;
         while (System.currentTimeMillis() < deadline && connectionManager.connectionCount() > 0) {
             try {
@@ -141,10 +141,10 @@ public class GatewayDrainService {
             }
         }
 
-        // 4) 兜底：窗口结束仍在的连接强制关闭
+        // 4. 兜底：窗口结束仍在的连接强制关闭（多端时是「连接数」而不是「用户数」）
         int forced = connectionManager.connectionCount();
-        for (Map.Entry<String, ClientSession> entry : connectionManager.snapshot().entrySet()) {
-            connectionManager.close(entry.getKey(), entry.getValue(), "gateway-draining");
+        for (ClientSession session : connectionManager.sessions()) {
+            connectionManager.close(session.userId(), session, "gateway-draining");
         }
         log.warn("[drain] 摘流结束 instance={} notified={} forcedClose={} remaining={}",
                 instanceId, notified, forced, connectionManager.connectionCount());

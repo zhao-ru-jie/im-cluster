@@ -43,6 +43,15 @@ management:
       application: ${spring.application.name}
 
 im:
+  # —— 接入鉴权（长连接建立时校验 token）——
+  # off     ：不校验，客户端只需带 userId（默认，本地联调/内网）
+  # warn    ：校验 + 记 gateway_auth_rejected 指标与日志，但一律放行（上线前观察）
+  # enforce ：校验失败即拒绝（WS 回 HTTP 401，TCP 回 error 401 并断开）
+  # token 由认证中心用同一个 secret 签发：v1.<过期秒>.<base64url(HMAC-SHA256(secret,"v1|userId|过期秒"))>
+  # 本地签发：java -cp ... com.github.im.gateway.auth.HmacTokenAuthenticator <secret> <userId> [ttlSeconds]
+  auth:
+    mode: ${IM_AUTH_MODE:off}
+    secret: ${IM_AUTH_SECRET:}
   # IM 服务地址（K8s 下填 im-server 的 Service 名，如 http:// 不需要 —— gRPC 用 host:port）
   server:
     # 降级地址：Nacos 关闭 / 初始化失败 / 拿不到健康实例时才用它；支持逗号分隔多地址，
@@ -55,7 +64,14 @@ im:
   gateway:
     # —— 长连接接入（Netty）——
     # 两个端口并存：ws-port 给浏览器/小程序，tcp-port 给原生客户端（更省流量、可控心跳）
-    # 同一用户先 WS 后 TCP 重连时，旧连接会被新连接踢掉（单用户单连接）
+    # 多端：同一 userId 下不同 deviceId 可并存（手机+网页+桌面）；同一 deviceId 重连会踢掉旧连接。
+    # 不带 deviceId 的客户端共用 default 槽位，等价于旧的「单用户单连接」。
+    max-devices-per-user: ${IM_MAX_DEVICES_PER_USER:5}
+    # 上行业务执行器：event loop 只做编解码，同步 gRPC/Redis 跑在「每连接一条」的串行虚拟线程上。
+    # max-pending-frames = 单连接积压高水位。超过它时暂停从该连接读取（setAutoRead(false)），
+    # 降到一半自动恢复——即真背压：不丢帧、不断连，由 TCP 窗口让客户端自己减速。
+    biz:
+      max-pending-frames: ${IM_MAX_PENDING_FRAMES:1024}
     transport:
       ws-enabled: ${IM_WS_ENABLED:true}
       ws-port: ${IM_WS_PORT:8081}

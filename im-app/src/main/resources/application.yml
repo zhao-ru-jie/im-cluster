@@ -45,6 +45,11 @@ management:
       application: ${spring.application.name}
 
 im:
+  # —— 接入鉴权（与 im-gateway 同一套实现与配置项）——
+  # off（默认）/ warn（只记录不阻断）/ enforce（校验失败即拒绝）
+  auth:
+    mode: ${IM_AUTH_MODE:off}
+    secret: ${IM_AUTH_SECRET:}
   # —— 消息存储形态 ——
   #   redis（默认）: Redis List，零外部数据库依赖，本地开发/联调
   #   jdbc         : MySQL（im-storage-jdbc 模块），生产形态；需要配下面 im.db.*
@@ -80,6 +85,12 @@ im:
     # —— 长连接接入（Netty，WebSocket 与原生 TCP 双通道并存）——
     # 注意：这两套端口由 Netty 自己监听，与上面 Tomcat 的 server.port 相互独立；
     # 测试页面 index.html 默认连 ws-port，原生客户端连 tcp-port。
+    # 多端：不同 deviceId 可并存，同一 deviceId 重连踢旧连接，无 deviceId 走 default 槽位
+    max-devices-per-user: ${IM_MAX_DEVICES_PER_USER:5}
+    # 上行业务执行器：event loop 只做编解码，同步 gRPC/Redis 跑在「每连接一条」的串行虚拟线程上。
+    # max-pending-frames = 单连接积压高水位：超过即暂停读取（setAutoRead(false)），降到一半恢复。
+    biz:
+      max-pending-frames: ${IM_MAX_PENDING_FRAMES:1024}
     transport:
       ws-enabled: ${IM_WS_ENABLED:true}
       ws-port: ${IM_WS_PORT:8081}

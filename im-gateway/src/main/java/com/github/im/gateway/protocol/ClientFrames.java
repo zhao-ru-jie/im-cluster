@@ -18,13 +18,18 @@ import java.util.Map;
  *
  * <pre>
  * 客户端 → 网关：{"ver":1,"type":"msg.send|ping","clientMsgId":"...","to":"bob","body":"hi"}
+ *                traceId 可选：带了服务端全程复用（日志、下行 PushTask、msg.ack 回显），
+ *                不带则由网关生成一个 32 位十六进制 ID
  *                {"ver":1,"type":"sync","watermarks":{"s:alice:bob":100,"g:group1":42}}
  *                兼容旧报文：不带 type 时按 {"to","body"} 处理
  * 网关 → 客户端：{"ver":1,"type":"msg.ack|msg.push|pong|error",...}
  *
- * 仅原生 TCP：连接后<b>首帧</b>必须是 {"ver":1,"type":"connect","userId":"alice","deviceId":"mobile"}，
+ * 仅原生 TCP：连接后<b>首帧</b>必须是 {"ver":1,"type":"connect","userId":"alice","deviceId":"mobile","token":"..."}，
  * 网关回 {"type":"connected"}；认证前的任何其他帧都会被拒并断开。
- * （WebSocket 不需要这一步：userId 在 HTTP 握手 query 里带，握手成功即认证完成。）
+ * （WebSocket 不需要这一步：userId/token 在 HTTP 握手 query 里带，握手成功即认证完成。）
+ *
+ * <p>{@code token} 是否必填取决于 {@code im.auth.mode}：off 时可省略，enforce 时缺失/无效
+ * 会分别收到 HTTP 401（WS）或 {"type":"error","code":401}（TCP）。
  * </pre>
  *
  * @author zhaorujie
@@ -67,12 +72,19 @@ public class ClientFrames {
         return objectMapper.readTree(payload);
     }
 
-    public String ack(String clientMsgId, String serverMsgId, long seq) {
+    /**
+     * @param traceId 回显本帧的链路追踪 ID（客户端带了就原样带回，没带则是服务端生成的）。
+     *                客户端把它记进自己的日志，线上排障时「客户端一条日志 ↔ 服务端一条日志」就能对上。
+     */
+    public String ack(String clientMsgId, String serverMsgId, long seq, String traceId) {
         Map<String, Object> frame = base(TYPE_ACK);
         frame.put("clientMsgId", clientMsgId);
         frame.put("serverMsgId", serverMsgId);
         frame.put("seq", seq);
         frame.put("code", 0);
+        if (traceId != null && !traceId.isBlank()) {
+            frame.put("traceId", traceId);
+        }
         return write(frame);
     }
 

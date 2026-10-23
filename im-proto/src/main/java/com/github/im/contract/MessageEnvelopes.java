@@ -14,9 +14,15 @@ public final class MessageEnvelopes {
     private MessageEnvelopes() {
     }
 
+    /**
+     * @param traceId 链路追踪 ID：网关优先复用客户端带来的（{@code traceId} 字段，便于端到端对齐），
+     *                没有则由网关生成一个，贯穿上行 RPC、消息受理日志与下行 {@code PushTask}。
+     *                <b>不要</b>用 {@code serverMsgId} 冒充它——那是消息标识，不是追踪标识。
+     */
     public static SubmitMessageRequest toRequest(MessageEnvelope envelope,
                                                  String deviceId,
-                                                 String gatewayInstance) {
+                                                 String gatewayInstance,
+                                                 String traceId) {
         SubmitMessageRequest.Builder builder = SubmitMessageRequest.newBuilder()
                 .setClientMsgId(envelope.clientMsgId())
                 .setFromUserId(envelope.from())
@@ -30,6 +36,9 @@ public final class MessageEnvelopes {
         }
         if (gatewayInstance != null) {
             builder.setGatewayInstance(gatewayInstance);
+        }
+        if (traceId != null && !traceId.isBlank()) {
+            builder.setTraceId(traceId);
         }
         return builder.build();
     }

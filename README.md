@@ -92,7 +92,7 @@ im-server-boot  ──> im-server  / im-rpc / im-storage-jdbc ──> im-proto
                              ↑                                                │
                              └────────── gRPC DownstreamPush.Push ────────────┘
 
-im-gateway ──写──> Redis(im:gw:user:{userId})
+im-gateway ──写──> Redis(im:gw:user:{userId} = SET{网关实例})
 im-server  ──读写──> Redis(im:conv:msgs / im:offline / im:seq / im:idem)（im.storage=jdbc 时消息落 MySQL）
 ```
 
@@ -106,8 +106,8 @@ im-server  ──读写──> Redis(im:conv:msgs / im:offline / im:seq / im:ide
 4. **保序 + 标识**：按 `conversationId` 用**逐条 Redis 原子递增**（Lua `INCR`）分配单调 `seq`，
    并**独立**生成 `serverMsgId`（UUIDv7）——两者解耦，seq 允许有洞、回绕也不会撞 ID；
 5. **落库（write-ahead）**：经 `MessageRepository.append()` 写存储——先落库，再推送；
-6. **路由**：读 `im:gw:user:{bob}` 得到网关 2 的实例 ID；Nacos 启用时再解析成健康 ip:port；
-7. **下发**：`PushPort.push()` → gRPC `DownstreamPush.Push` 到网关 2 → 按 `userId` 找本地会话 → 写帧；
+6. **路由**：读 `im:gw:user:{bob}`（集合）得到 bob 所在的**所有**网关实例；Nacos 启用时再解析成健康 ip:port；
+7. **下发**：`PushPort.push()` → gRPC `DownstreamPush.Push` 到这些实例 → 各实例按 `userId` 找**本机全部设备** → 逐条写帧；
 8. **离线兜底**：网关 2 返回失败（不在线 / 推送异常）→ 该帧落 `im:offline:{bob}`，bob 重连时补发；
 9. **确认**：网关 1 收到结果后给 alice 回 `msg.ack`（含 `serverMsgId`、`seq`）。
 
@@ -152,12 +152,62 @@ im-server  ──读写──> Redis(im:conv:msgs / im:offline / im:seq / im:ide
 
 Tomcat 仍然保留，但只服务 `/admin/*`、`/actuator/*`、测试页面等短请求。
 
+### 上行业务的线程模型（event loop 不碰阻塞）
+
+一条 `msg.send` 的链路上有一次同步 gRPC（≤300ms）和若干 Redis/DB 往返。如果直接在
+`channelRead0` 里做，event loop 线程被占住，**挂在同一个线程上的所有连接一起停摆**，
+单实例上行并发被锁死在 `2×CPU`，而且任何一个下游抖动都会放大成全实例卡死。
+
+```text
+event loop:  解码 → serial.offer(帧) → 立刻返回，继续服务其它连接
+虚拟线程:    onOpen / onFrame / onClose 串行执行（每连接一个 SerialExecutor）
+```
+
+| 组件 | 职责 |
+|---|---|
+| `transport/BusinessDispatcher` | 虚拟线程池（`newVirtualThreadPerTaskExecutor`），为每条连接发一个 `SerialExecutor` |
+| `transport/SerialExecutor` | 同一连接的任务 **FIFO 严格串行**：保序（connect 先于 msg.send）、但绝不占 event loop |
+| `*FrameInboundHandler` | 只做「取数据 + 提交任务」，认证/会话判断也放在任务体内（否则连发两帧时会误判未认证） |
+
+两条边界：
+
+- **背压是「暂停读」而不是「断连」**：单连接积压超过 `im.gateway.biz.max-pending-frames`
+  （默认 1024 帧，**每连接独立计数**）时执行 `setAutoRead(false)`，从 socket 停止读取；
+  积压降到高水位一半时自动恢复。
+  - 为什么不断连：客户端典型行为是「本地发件箱一次 flush」（离线期间攒了上千条），
+    断连只会让它重连后重发同一批 → **越重试越糟的活锁**。
+  - 为什么不丢帧：已经读进内存的这一批丢掉会破坏消息顺序语义，宁可让它排队。
+  - 内存有界：暂停后数据停在客户端/内核缓冲区，TCP 窗口收缩，客户端自己就被限速；
+    上限约为 `maxPending` + 一次 read 批次的帧数。
+  - 最后的兜底：暂停读期间收不到任何上行，`IdleStateHandler` 45~90s 后判定超时断开，
+    卡死的连接不会永久占着内存。
+- **清理任务不走背压**：`onClose` 用 `submit` 而不是 `offer`——它要是被推迟到队列末尾，
+  会话表和 Redis 路由就会留下脏数据（TTL 内消息会继续推到死连接上）。
+
+> 注意 `max-pending-frames` 是**每连接**的：5000 人群里 5000 个用户各发一条，是 5000 条连接各
+> `pending=1`，与群规模无关；群聊的**下行扇出**走 `ConnectionManager.send → writeAndFlush`，
+> 根本不经过 `SerialExecutor`。
+
+**代价**：同一连接内处理是串行的，单连接吞吐 = `1 / 单条消息耗时`（约 300 QPS @ 3ms）。
+这是保序换来的，真实客户端一条连接也不需要更高；要更高并发应该「多连接」而不是「单连接并发」。
+换来的是**实例级**上限：不再被 `2×CPU` 锁死，只受 Redis/DB/gRPC 这些真实下游限制。
+
+**已验证**（本机单体实例 + 真实客户端）：WS 两个连接 alice→bob，双方拿到同一条 `seq=1` 的
+`msg.ack` / `msg.push`；TCP 把 `connect` 与 `msg.send` **连发**（不等 `connected` 应答）时，
+依次收到 `connected` → `msg.push` → `msg.ack`，证明串行队列确实保证「先认证后业务」；
+客户端断开后 `/admin/status` 的 `connections` 从 2/1 归 0，虚拟线程承担清理也不泄漏会话。
+背压也实测过：把高水位临时配成 2、同一连接连发 5 帧，服务端日志出现
+`积压 3 帧超过高水位 2，暂停读取`，而 5 帧的 `msg.ack`（seq 1~5）**全部收到、连接未断**；
+「暂停只触发一次 / 降到低水位才恢复 / 一帧不丢」由 `SerialExecutorTest` 覆盖。
+
 ### 双通道与端口
 
 | 传输 | 默认端口 | 接入地址 | 身份来源 |
 |------|---------|----------|----------|
-| WebSocket | `8081`（`IM_WS_PORT`） | `ws://host:8081/ws?userId=alice&deviceId=web` | 握手 query 参数 |
-| 原生 TCP | `9092`（`IM_TCP_PORT`） | 裸 TCP 连接 | 首帧 `connect` |
+| WebSocket | `8081`（`IM_WS_PORT`） | `ws://host:8081/ws?userId=alice&deviceId=web&token=...` | 握手 query 参数 |
+| 原生 TCP | `9092`（`IM_TCP_PORT`） | 裸 TCP 连接 | 首帧 `connect`（含 `token`） |
+
+> `userId` 一律必填；`token` 是否必填取决于 `im.auth.mode`（默认 `off`，见「接入鉴权」）。
 
 两种传输**共用同一份会话抽象**（`ClientSession`）与同一份生命周期实现（`SessionLifecycle`）：
 连接登记、心跳应答、上行转发、掉线清路由只有一份代码。传输差异被收敛到极小的位置：
@@ -197,18 +247,19 @@ TCP      : IdleStateHandler(按原始字节计时) → LengthFieldBasedFrameDeco
 ```
 
 网关回 `{"type":"connected","userId":"alice","transport":"tcp"}` 后即可正常收发；认证前的其他帧一律拒绝并断开。
+鉴权开启时连接帧里还要带 `token`，缺失/无效会收到 `{"type":"error","code":401,...}` 并被断开。
 
 ### 应用层帧
 
 ```jsonc
 // 客户端 → 网关
-{"ver":1,"type":"msg.send","clientMsgId":"c-1","to":"bob","body":"hi"}
+{"ver":1,"type":"msg.send","clientMsgId":"c-1","to":"bob","body":"hi","traceId":"可选"}
 {"ver":1,"type":"ping"}
 {"ver":1,"type":"sync","watermarks":{"s:alice:bob":100}}          // 上报各会话已见最大 seq
-{"ver":1,"type":"connect","userId":"alice","deviceId":"native"}   // 仅 TCP 首帧
+{"ver":1,"type":"connect","userId":"alice","deviceId":"native","token":"..."}   // 仅 TCP 首帧
 
 // 网关 → 客户端
-{"ver":1,"type":"msg.ack","clientMsgId":"c-1","serverMsgId":"0192f0c4-8a3b-7c2d-9f01-4b7a2c8d5e60","seq":7,"code":0}
+{"ver":1,"type":"msg.ack","clientMsgId":"c-1","serverMsgId":"0192f0c4-8a3b-7c2d-9f01-4b7a2c8d5e60","seq":7,"code":0,"traceId":"..."}
 {"ver":1,"type":"msg.push","conversationId":"s:alice:bob","convType":"SINGLE","seq":7,
  "serverMsgId":"0192f0c4-8a3b-7c2d-9f01-4b7a2c8d5e60","clientMsgId":"c-1","from":"alice","to":"bob","body":"hi","ts":1750000000000}
 {"ver":1,"type":"pong","ts":1750000000000}
@@ -218,6 +269,81 @@ TCP      : IdleStateHandler(按原始字节计时) → LengthFieldBasedFrameDeco
 
 `msg.push` 与 `GET /conv/{conversationId}/messages` 返回的历史消息**同构**（同一份模板渲染），
 客户端「拉历史 + 接实时帧」不需要两套解析。旧报文 `{"to":...,"body":...}`（不带 `type`）仍然可用。
+
+### 接入鉴权（token）
+
+三档开关，默认 `off`（保持本地联调无需凭据）：
+
+| `im.auth.mode` | 行为 | 用途 |
+|---|---|---|
+| `off`（默认） | 不校验，只认 `userId` | 本地联调、纯内网 |
+| `warn` | **校验并记录**，但一律放行 | 上线前观察：看 `gateway_auth_rejected_total{reason}` 是否只覆盖该被拒的客户端 |
+| `enforce` | 校验失败即拒绝：WS 回 HTTP 401、TCP 回 `error 401` 并断开 | 正式生效 |
+
+token 由认证中心用**同一个密钥**签发，格式不引入 JWT 依赖：
+
+```text
+v1.<过期时间 epoch 秒>.<base64url(HMAC-SHA256(secret, "v1|userId|过期秒"))>
+```
+
+签名材料里带 `userId` 是为了**防冒用**：只签 token 不签身份的话，任何人拿自己的 token 改一下
+`userId` 参数就能冒充别人。本地签发：
+
+```bash
+java -cp im-gateway/target/classes com.github.im.gateway.auth.HmacTokenAuthenticator <secret> <userId> [ttlSeconds=3600]
+```
+
+拒绝原因（同时是指标 tag，固定小枚举、不含 token 内容）：`missing_token` / `malformed_token` /
+`expired_token` / `bad_signature` / `missing_user`。
+
+配置错误炸在启动时：`mode=warn|enforce` 却没配 `im.auth.secret` 直接启动失败——避免出现
+「以为开了鉴权、其实一直在放行」这种最危险的状态。换 JWT 或接认证中心时实现
+`SessionAuthenticator` 即可，传输层不用动。
+
+**已验证**（真实网关进程 + 真实客户端）：无 token → 401、`token=garbage` → 401、
+有效 token → OPEN、**把 alice 的 token 拿去当 bob 用 → 401**（最关键的一条）。
+
+### 链路追踪（traceId）
+
+`msg.send` 可以带 `traceId`，不带则网关生成一个 32 位十六进制 ID。同一个 ID 贯穿：
+
+```
+网关日志 → 上行 SubmitMessageRequest.trace_id → IM 受理日志
+        → 下行 PushTask.trace_id → 网关推送日志 → msg.ack 回显（客户端可记进自己的日志）
+```
+
+以前这条链路上塞的是 `serverMsgId`（消息标识），既搜不到请求也串不起链路，等于「看着有追踪、实际查不出东西」。
+真实受理日志长这样：
+
+```text
+message accepted: traceId=trace-e2e-0001 conv=s:alice:bob seq=13 msgId=01a166bb-... from=alice to=bob offline=1
+```
+
+### 多端在线（同一账号多设备）
+
+设备身份取 `deviceId`（WS query / TCP connect 帧），语义三条：
+
+| 场景 | 行为 |
+|---|---|
+| 同一 `deviceId` 再建连 | 视为该设备重连 → 踢掉旧连接（避免消息推到僵尸连接） |
+| 不同 `deviceId` | 并存；一条消息推给该用户的**每一个**设备 |
+| 不带 `deviceId` | 落 `default` 槽位，等价于旧的「单用户单连接」 |
+
+链路上三处同时配合才成立：
+
+1. **本机会话表**：`ConnectionManager` 变成 `userId → deviceId → 会话`，`send(userId, frame)` 扇出到
+   所有设备。部分设备写失败只要有一台成功就算投递成功——其余设备重连后按 seq 拉齐；
+2. **在线路由**：`im:gw:user:{userId}` 从 String 变成 **SET**：手机连网关 A、网页连网关 C 时集合里
+   有两个实例，IM 服务逐个实例推，各实例再分给本机设备；
+3. **failed 语义**：`failed = 目标 − 已投递`。不能直接汇总各实例返回的 failed，否则
+   「手机推到、网页所在实例失败」会让一个**已经收到消息的人**被再排一份离线。
+
+设备数上限 `im.gateway.max-devices-per-user`（默认 5）：超限时**拒绝新连接**而不是踢掉老设备，
+避免一个客户端 bug 反复重连把用户其它设备挤下线。
+
+**已验证**（网关 + IM 服务 + 三个真实 WS 客户端）：alice 的 phone 与 web 同时在线，bob 发一条消息 →
+两个设备都收到同一条 `seq=16` 的 `msg.push`；phone 重连后 `/admin/status` 的 `connections`
+从 3 变 2（旧连接被踢且已移出会话表），全部断开后归 0（无空壳泄漏）。
 
 `sync` 帧是客户端**重连后必须发一次**的对账动作：它把「每个会话我见到了哪个 seq」报给服务端。
 服务端用它做两件事——补拉缺口、抬高 seq 发号下界。后者是 Redis 序号计数器整体丢失时
@@ -355,7 +481,7 @@ CREATE TABLE im_group_member (
 
 - **上行**：网关解帧 → `MessageIngress.submit()`；实现可换（本地直调 / gRPC 远程），业务代码不变；
 - **下行**：IM 服务只调 `PushPort.push(task)`，`frame` 已是完整报文，网关**原样透传**；
-- **在线路由**：`im:gw:user:{userId}` 只由网关写（TTL 30s + 10s 续期），IM 服务只读。
+- **在线路由**：`im:gw:user:{userId}`（SET 集合，多端时含多个实例）只由网关写（TTL 30s + 10s 续期），IM 服务只读。
 
 ### 上行通道三档（按部署形态切换）
 
@@ -521,13 +647,14 @@ IM_GRPC_PORT=9090 IM_GRPC_HOST=127.0.0.1 \
 ### 测试
 
 ```bash
-./mvnw test                            # 全量（当前 15 个用例，分布见下）
+./mvnw test                            # 全量（当前 27 个用例，分布见下）
 ```
 
 | 模块 | 用例 | 依赖 |
 |---|---|---|
 | `im-server` | `SeqAllocatorTest`（冷启动 / 客户端水位 / Redis 回退到旧快照 / 多实例顺序 / 8 线程并发 / DB 下界查询摊薄）、`RedisMessageRepositoryTest`（落库乱序时 `maxSeq` 仍取真正最大值） | **真实 Redis** |
 | `im-rpc` | `GrpcChannelFactoryHealthTest`（NOT_SERVING 实例被摘出轮询、无健康服务的对端仍可用、waitForReady 等到 deadline、关开关回到旧行为） | 真实 gRPC 服务端（进程内起） |
+| `im-gateway` | `HmacTokenAuthenticatorTest`（越权冒用 / 过期 / 篡改过期时间 / 换密钥伪造 / 格式错误）、`AuthGuardTest`（off 全放行、warn 只记录不误伤、enforce 拒绝、缺 secret 启动失败）、`SerialExecutorTest`（串行 / 保序 / 积压上限拒新 / 控制任务不受背压 / 单任务异常不中断） | 无 |
 | `im-server-boot` | `GrpcHealthEndpointTest`（健康服务确实被绑定且最终 SERVING） | Spring 上下文 + Redis |
 
 Redis 相关用例默认连 `127.0.0.1:6379`（可用 `-Dim.test.redis.host=... -Dim.test.redis.port=...` 改），
@@ -619,28 +746,39 @@ kubectl apply -f k8s/im-node.yaml     # 或 im-gateway.yaml + im-server.yaml（�
 | `im.gateway.transport.ws-enabled` / `ws-port` / `ws-path` | `IM_WS_ENABLED` / `IM_WS_PORT` / `IM_WS_PATH` | `true` / `8081` / `/ws` | WebSocket |
 | `im.gateway.transport.tcp-enabled` / `tcp-port` | `IM_TCP_ENABLED` / `IM_TCP_PORT` | `true` / `9092` | 原生 TCP |
 | `im.gateway.transport.max-frame-bytes` | `IM_MAX_FRAME_BYTES` | `1048576` | 单帧上限，超限断链 |
+| `im.gateway.max-devices-per-user` | `IM_MAX_DEVICES_PER_USER` | `5` | 单账号并存设备数上限，超限拒绝新连接 |
+| `im.gateway.biz.max-pending-frames` | `IM_MAX_PENDING_FRAMES` | `1024` | 单连接上行积压**高水位**：超过即暂停读取（降到一半恢复），不丢帧不断连 |
 | `im.gateway.transport.tcp-auth-timeout-ms` | `IM_TCP_AUTH_TIMEOUT_MS` | `10000` | TCP 首帧认证窗口 |
 | `im.gateway.idle.enabled` | `IM_IDLE_ENABLED` | `true` | 心跳总开关 |
 | `im.gateway.idle.ping-after-ms` | `IM_IDLE_PING_AFTER_MS` | `45000` | 空闲多久发 ping |
 | `im.gateway.idle.close-after-ms` | `IM_IDLE_CLOSE_AFTER_MS` | `90000` | 空闲多久断开 |
 | `im.gateway.drain.enabled` / `timeout-ms` / `retry-after-ms` | `IM_DRAIN_*` | `true` / `45000` / `1500` | 优雅摘流 |
 
+### 接入鉴权
+
+| 配置 | 环境变量 | 默认 | 说明 |
+|------|----------|------|------|
+| `im.auth.mode` | `IM_AUTH_MODE` | `off` | `off` / `warn` / `enforce` |
+| `im.auth.secret` | `IM_AUTH_SECRET` | 空 | `warn`/`enforce` 时必填，与 token 签发方共用 |
+
 ### 集群与服务发现
 
 | 配置 | 环境变量 | 默认 | 说明 |
 |------|----------|------|------|
 | `im.ingress.transport` | `IM_INGRESS_TRANSPORT` | `local` | `local` / `shadow` / `grpc`（仅单体装配入口） |
-| `im.server.address` / `timeout-ms` | `IM_SERVER_ADDR` / `IM_SERVER_TIMEOUT_MS` | `127.0.0.1:9091` / `300` | 网关 → IM |
-| `im.push.timeout-ms` | `IM_PUSH_TIMEOUT_MS` | `800` | IM → 网关，超时即落离线 |
+| `im.server.address` / `timeout-ms` / `wait-for-ready` | `IM_SERVER_ADDR` / `IM_SERVER_TIMEOUT_MS` / `IM_SERVER_WAIT_FOR_READY` | `127.0.0.1:9091` / `300` / `true` | 网关 → IM |
+| `im.push.timeout-ms` / `wait-for-ready` | `IM_PUSH_TIMEOUT_MS` / `IM_PUSH_WAIT_FOR_READY` | `800` / `false` | IM → 网关，超时即落离线 |
 | `im.node.grpc-port` / `grpc-host` | `IM_GRPC_PORT` / `IM_GRPC_HOST` | `9090` / 自动探测 | 实例 ID |
 | `im.node.grpc.tls.enabled` / `trust-cert` | `IM_GRPC_TLS` / `IM_GRPC_TRUST` | `false` / 空 | gRPC TLS |
+| `im.node.grpc.health-check-enabled` | `IM_GRPC_HEALTH_CHECK` | `true` | 客户端健康检查（排除 NOT_SERVING 实例） |
+| `spring.grpc.server.health.enabled` | — | `true` | 服务端 grpc.health.v1.Health（需 `grpc-services`） |
 | `im.nacos.enabled` / `server-addr` / `service-name` / `namespace` | `IM_NACOS_*` | `false` / `127.0.0.1:8848` / `im-gateway` / 空 | 实例发现 |
 
 ### Redis key 归属
 
 | key | 写方 | 读方 |
 |-----|------|------|
-| `im:gw:user:{userId}` | 网关（TTL 续期） | IM 服务（下行路由） |
+| `im:gw:user:{userId}` (SET) | 网关（TTL 续期） | IM 服务（下行路由：用户 → 网关实例集合） |
 | `im:offline:{userId}` | IM 服务 | IM 服务 |
 | `im:conv:msgs:{conversationId}` | IM 服务（`im.storage=redis`） | IM 服务 |
 | `im:seq:{conversationId}` | IM 服务 | IM 服务 |
@@ -686,15 +824,19 @@ im-cluster/
 │       └── GatewayRouteReader.java           # 在线路由只读视图
 │
 ├── im-gateway/                  # 长连接服务
+│   ├── auth/AuthGuard.java                   # 鉴权闸门（off/warn/enforce 三档）
+│   ├── auth/HmacTokenAuthenticator.java      # HMAC token 校验 + 本地签发工具
 │   ├── node/NodeAddressResolver.java         # 探测本实例可达地址（POD_IP 等）
 │   ├── node/GatewayNacosDiscovery.java       # 实例注册 + 健康剔除 + 清理脏路由
 │   ├── session/ClientSession.java            # 传输无关的会话抽象
 │   ├── session/NettyClientSession.java       # Netty Channel 上的实现（文本帧 / 长度帧）
-│   ├── session/ConnectionManager.java        # 本实例 用户→会话（唯一不外部化的状态）
-│   ├── session/GatewayRegistry.java          # Redis 路由 im:gw:user:{userId} + 续期
+│   ├── session/ConnectionManager.java        # 本实例 用户→设备→会话（唯一不外部化的状态）
+│   ├── session/GatewayRegistry.java          # Redis 路由 im:gw:user:{userId}=SET{实例} + 续期
 │   ├── session/SessionAttributes.java        # Channel 属性：userId/deviceId/session
 │   ├── transport/NettyGatewayServer.java     # Netty 双通道接入（WS + TCP）
 │   ├── transport/SessionLifecycle.java       # 连接生命周期 + 上行帧处理（两种传输唯一实现）
+│   ├── transport/BusinessDispatcher.java     # 上行业务执行器：虚拟线程池，每连接发一个串行执行器
+│   ├── transport/SerialExecutor.java         # 每连接 FIFO 串行（保序 + 积压上限背压）
 │   ├── transport/HeartbeatHandler.java       # 心跳：发 ping / 超时断开
 │   ├── transport/websocket/*                 # WS pipeline：握手准入 + 文本帧适配
 │   ├── transport/tcp/*                       # TCP pipeline：长度帧 + 首帧 connect 认证
@@ -749,10 +891,19 @@ im-cluster/
   `uri().equals(websocketPath)` 判断，`/ws?userId=alice` 不等于 `/ws`，请求会被静默转发到 pipeline 尾部丢弃
   ——既不应答 101 也不报错，客户端只表现为握手超时。本项目在握手闸门里校验完身份后
   `request.setUri(wsPath)` 再交下去。
-- **单用户单连接**：`ConnectionManager` 以 `userId` 为 key，后建立的连接会踢掉旧连接。
-  要多设备并存需要把 key 换成 `userId + deviceId`，同时把「推给谁」的语义改成「推给所有设备」。
+- **多端靠 deviceId 区分**：`ConnectionManager` 的 key 是 `userId → deviceId → 会话`。
+  同一 deviceId 重连踢旧连接；**不带 deviceId 的客户端全部落到 `default` 槽位**，
+  等价于旧的「单用户单连接」——想多端必须带 deviceId。
+- **离线队列是「用户级」的**：`im:offline:{userId}` 会被**第一个**重连的设备一次性取走（`LTRIM` 语义），
+  其它设备拿不到同一批帧，需要按 seq 拉历史补齐。要真正做到「每设备独立水位」得把队列按
+  `userId+deviceId` 分片，那是下一步的事。
 - **断连必须按会话移除**：见「可靠性设计」里的快速重连条目。
 - **客户端必须回 `pong`**：服务端发的应用层 `{"type":"ping"}` 需要应答，否则空闲超时后会被断开。
+- **鉴权只在建连时校验一次**：连接建立后 token 过期不会主动断连（长连接可能远活过 token 的 TTL）。
+  需要「过期即踢」的话，得在心跳里带剩余有效期，或定期重放一次校验——目前没做。
+  另外 `warn` 档是**每条连接一条 warn 日志**，客户端规模大时上线前观察期要注意日志量。
+- **鉴权默认是 `off`**：这意味着不配 `im.auth.mode` 时任何人构造 `?userId=任意人` 就能冒充。
+  对外发布前必须切到 `warn`（观察）→ `enforce`，并通过环境变量注入 `IM_AUTH_SECRET`。
 
 ### 框架与依赖
 

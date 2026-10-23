@@ -10,9 +10,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -23,8 +26,11 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>处理流程：
  * <ol>
- *   <li>读在线路由表，把 userId 按目标网关实例分组（一次任务可能跨多个实例）；</li>
- *   <li>逐实例 gRPC 推送，收集 delivered / failed；</li>
+ *   <li>读在线路由表，把 userId 按目标网关实例分组（一次任务可能跨多个实例，
+ *       多端时同一个 userId 会进入多个实例的分组）；</li>
+ *   <li>逐实例 gRPC 推送，收集 delivered；</li>
+ *   <li>{@code failed = 目标 − delivered}（不能直接汇总各实例的 failed，否则多端下
+ *       一个用户会同时出现在两份列表里，导致已收到消息的人被再排一份离线）；</li>
  *   <li>路由缺失、实例不可达、超时一律记 failed —— <b>本类永不抛异常</b>，
  *       由 IM 服务统一落离线，保证「可丢实时性、不可丢消息」。</li>
  * </ol>
@@ -58,17 +64,20 @@ public class RemoteGatewayPushPort implements PushPort {
 
     @Override
     public PushResult push(PushTask task) {
-        List<String> delivered = new ArrayList<>();
-        List<String> failed = new ArrayList<>();
+        List<String> targets = task.getTargetUserIdsList();
+        Set<String> delivered = new LinkedHashSet<>();
 
+        // 按「目标网关实例」分组。多端下同一个 userId 会出现在多个实例的分组里，
+        // 这是对的：每个实例负责把它本机上的设备都推一遍。
         Map<String, List<String>> byInstance = new LinkedHashMap<>();
-        for (String userId : task.getTargetUserIdsList()) {
-            String instanceId = routeReader.instanceOf(userId);
-            if (instanceId == null) {
-                failed.add(userId);
-                continue;
+        for (String userId : targets) {
+            Set<String> instances = routeReader.instancesOf(userId);
+            if (instances.isEmpty()) {
+                continue;   // 不在线：最后统一算作 failed
             }
-            byInstance.computeIfAbsent(instanceId, _ -> new ArrayList<>()).add(userId);
+            for (String instanceId : sorted(instances)) {
+                byInstance.computeIfAbsent(instanceId, key -> new ArrayList<>()).add(userId);
+            }
         }
 
         for (Map.Entry<String, List<String>> entry : byInstance.entrySet()) {
@@ -87,17 +96,31 @@ public class RemoteGatewayPushPort implements PushPort {
                 }
                 PushResult result = stub.push(subTask);
                 delivered.addAll(result.getDeliveredUserIdsList());
-                failed.addAll(result.getFailedUserIdsList());
             } catch (Exception e) {
                 log.warn("push to gateway {} (address {}) failed, fallback to offline: {}",
                         entry.getKey(), address, e.getMessage());
-                failed.addAll(users);
             }
         }
 
+        // failed 必须由「目标 − 已投递」算出来，不能直接汇总各实例的 failed：
+        // 多端时某用户的手机推成功、网页所在实例推失败，合并两份列表会让他同时出现在
+        // delivered 和 failed 里，IM 服务就会给一个已经收到消息的人再排一份离线。
+        List<String> failed = new ArrayList<>();
+        for (String userId : targets) {
+            if (!delivered.contains(userId)) {
+                failed.add(userId);
+            }
+        }
         return PushResult.newBuilder()
                 .addAllDeliveredUserIds(delivered)
                 .addAllFailedUserIds(failed)
                 .build();
+    }
+
+    /** 实例顺序稳定一下：便于排障时对照日志，也让子任务顺序可复现 */
+    private static List<String> sorted(Set<String> instances) {
+        List<String> list = new ArrayList<>(instances);
+        Collections.sort(list);
+        return list;
     }
 }

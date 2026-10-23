@@ -11,8 +11,10 @@ import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * {@link PushPort} 的网关侧实现：把「推给这些 userId」翻译成「本实例直接推 / 跨实例 gRPC 推」。
@@ -48,19 +50,17 @@ public class GatewayPushPort implements PushPort {
 
     @Override
     public PushResult push(PushTask task) {
-        List<String> delivered = new ArrayList<>();
-        List<String> failed = new ArrayList<>();
+        List<String> targets = task.getTargetUserIdsList();
+        Set<String> delivered = new LinkedHashSet<>();
 
         // 按「目标网关实例」分组：同一次任务可能涉及多个实例（群聊扇出、多端跨实例）
         Map<String, List<String>> byInstance = new LinkedHashMap<>();
-        for (String userId : task.getTargetUserIdsList()) {
-            String instance = registry.instanceOf(userId);
-            if (instance == null) {
-                // 路由表里没有 = 视为离线；真正的离线存储在 IM 服务侧
-                failed.add(userId);
-                continue;
+        for (String userId : targets) {
+            // 路由表里没有 = 视为离线；真正的离线存储在 IM 服务侧。
+            // 多端时一个用户可能同时在多个实例上，必须每个实例都推。
+            for (String instance : registry.instancesOf(userId)) {
+                byInstance.computeIfAbsent(instance, key -> new ArrayList<>()).add(userId);
             }
-            byInstance.computeIfAbsent(instance, key -> new ArrayList<>()).add(userId);
         }
 
         for (Map.Entry<String, List<String>> entry : byInstance.entrySet()) {
@@ -77,15 +77,18 @@ public class GatewayPushPort implements PushPort {
             } else {
                 result = pushRemote(instance, subTask);
             }
-
-            if (result == null) {
-                failed.addAll(users);
-            } else {
+            if (result != null) {
                 delivered.addAll(result.getDeliveredUserIdsList());
-                failed.addAll(result.getFailedUserIdsList());
             }
         }
 
+        // failed = 目标 − 已投递：多端时「手机推到、网页所在实例推失败」不该让这个人再收一份离线
+        List<String> failed = new ArrayList<>();
+        for (String userId : targets) {
+            if (!delivered.contains(userId)) {
+                failed.add(userId);
+            }
+        }
         return PushResult.newBuilder()
                 .addAllDeliveredUserIds(delivered)
                 .addAllFailedUserIds(failed)

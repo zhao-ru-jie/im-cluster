@@ -20,6 +20,7 @@ import tools.jackson.databind.JsonNode;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.UUID;
 
 /**
  * 连接生命周期与上行帧处理的<b>唯一实现</b>，被所有传输复用。
@@ -72,11 +73,17 @@ public class SessionLifecycle {
             session.close("missing-user-id");
             return;
         }
-        connectionManager.add(userId, session);
+        // 多设备上限在这里兜住：超限就拒绝这条新连接，不要登记路由（否则会往一个死连接推消息）
+        if (!connectionManager.add(userId, session)) {
+            session.close("too-many-devices");
+            return;
+        }
         metrics.sessionOpened();
-        // 连接状态落 Redis：IM 服务据此决定下行帧推到哪个网关实例
+        // 连接状态落 Redis：IM 服务据此决定下行帧推到哪些网关实例（多端时是集合）
         registry.bindUser(userId);
-        log.info("user {} connected on gateway {} via {}", userId, registry.localInstanceId(), session.transport());
+        log.info("user {} connected on gateway {} via {} device={} devices={}", userId,
+                registry.localInstanceId(), session.transport(), session.deviceId(),
+                connectionManager.deviceCount(userId));
         pullPending(userId, Map.of());
     }
 
@@ -160,18 +167,22 @@ public class SessionLifecycle {
             return;
         }
 
+        // 链路追踪 ID：优先复用客户端带来的（它自己的 traceId，便于端到端对齐），否则这里生成。
+        // 之前这条链路上塞的是 serverMsgId，那是消息标识，拿它当时序/追踪 ID 会误导排障。
+        String traceId = traceIdOf(node);
         SubmitMessageRequest request = MessageEnvelopes.toRequest(envelope,
-                session.deviceId(), registry.localInstanceId());
+                session.deviceId(), registry.localInstanceId(), traceId);
         try {
             SubmitMessageResponse response = ingress.submit(request);
             if (MessageEnvelopes.isOk(response)) {
-                session.send(frames.ack(response.getClientMsgId(), response.getServerMsgId(), response.getSeq()));
+                session.send(frames.ack(response.getClientMsgId(), response.getServerMsgId(),
+                        response.getSeq(), traceId));
             } else {
                 session.send(frames.error(envelope.clientMsgId(), response.getCode(), response.getMessage()));
             }
         } catch (RuntimeException e) {
             metrics.ingressFailed("submit", e);
-            log.warn("submit message from {} failed: {}", userId, e.getMessage());
+            log.warn("submit message from {} failed: traceId={} err={}", userId, traceId, e.getMessage());
             session.send(frames.error(envelope.clientMsgId(), CODE_UNAVAILABLE, "im service unavailable"));
         }
     }
@@ -232,6 +243,21 @@ public class SessionLifecycle {
             }
         }
         return parsed;
+    }
+
+    /**
+     * 取本帧的 traceId：客户端带了就用它（客户端自己的链路标识，便于和服务端日志对齐），
+     * 没带就现场生成一个 32 位十六进制（UUID 去掉分隔符，日志里好搜也够短）。
+     *
+     * <p>为什么不强制要求客户端带：traceId 是排障辅助，缺了不该拒消息；
+     * 但服务端必须保证「这条消息在整条链路上有同一个 ID」，所以不能留空。
+     */
+    private static String traceIdOf(JsonNode node) {
+        String provided = text(node, "traceId");
+        if (provided != null && !provided.isBlank()) {
+            return provided;
+        }
+        return UUID.randomUUID().toString().replace("-", "");
     }
 
     private static String text(JsonNode node, String field) {

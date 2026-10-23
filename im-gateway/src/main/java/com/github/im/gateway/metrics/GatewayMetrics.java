@@ -71,6 +71,23 @@ public class GatewayMetrics {
         this.idleClosed = Counter.builder("gateway.sessions.idle.closed").description("心跳超时被清理的连接数").register(registry);
     }
 
+    /**
+     * 记录一次鉴权拒绝（{@code gateway.auth.rejected}，tag {@code reason}）。
+     *
+     * <p>{@code warn} 档下这个计数也在涨——它正是「先观测再阻断」的观测手段：
+     * 上线前先确认曲线只覆盖该被拒的那批客户端，再切 {@code enforce}。
+     */
+    public void authRejected(String reason) {
+        if (registry == null) {
+            return;
+        }
+        Counter.builder("gateway.auth.rejected")
+                .description("接入鉴权未通过的连接数（按原因）")
+                .tag("reason", reason)
+                .register(registry)
+                .increment();
+    }
+
     public void sessionOpened() {
         if (opened != null) {
             opened.increment();

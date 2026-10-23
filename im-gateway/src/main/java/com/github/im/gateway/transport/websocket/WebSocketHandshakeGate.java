@@ -1,5 +1,7 @@
 package com.github.im.gateway.transport.websocket;
 
+import com.github.im.gateway.auth.AuthGuard;
+import com.github.im.gateway.auth.AuthVerdict;
 import com.github.im.gateway.drain.GatewayDrainService;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelFutureListener;
@@ -31,7 +33,9 @@ import java.util.Map;
  *   <li><b>摘流拦截</b>：处于 drain 中的实例直接 503，避免「边摘边进」；</li>
  *   <li>路径校验：只接受 {@code im.gateway.transport.ws-path}（默认 {@code /ws}）；</li>
  *   <li>身份提取：{@code userId} 必填、{@code deviceId} 可选，写进 Channel 属性供后续使用；</li>
- *   <li>（未来）token 校验 / 风控：接入 API 网关时补在这里。</li>
+ *   <li><b>token 校验</b>：交给 {@link AuthGuard}（{@code im.auth.mode} 三档）。
+ *       放在握手阶段而不是首帧，是因为此时还能回一个正常的 HTTP 401，
+ *       客户端能直接看出「凭据不对」而不是「连上了但被断」。</li>
  * </ol>
  *
  * <p>原生 TCP 不需要这一步：它没有 HTTP 握手，身份由首帧 {@code connect} 声明。
@@ -45,10 +49,12 @@ public class WebSocketHandshakeGate extends ChannelInboundHandlerAdapter {
 
     private final GatewayDrainService drainService;
     private final String wsPath;
+    private final AuthGuard authGuard;
 
-    public WebSocketHandshakeGate(GatewayDrainService drainService, String wsPath) {
+    public WebSocketHandshakeGate(GatewayDrainService drainService, String wsPath, AuthGuard authGuard) {
         this.drainService = drainService;
         this.wsPath = wsPath;
+        this.authGuard = authGuard;
     }
 
     @Override
@@ -77,6 +83,15 @@ public class WebSocketHandshakeGate extends ChannelInboundHandlerAdapter {
         if (userId == null || userId.isBlank()) {
             reject(ctx, request, HttpResponseStatus.BAD_REQUEST, "userId is required");
             return;
+        }
+        // 鉴权：mode=off 时直接放行；warn 只记录；enforce 拒绝并回 401
+        if (authGuard != null) {
+            AuthVerdict verdict = authGuard.check(userId, query.get("token"));
+            if (!verdict.accepted()) {
+                log.debug("reject handshake: userId={} reason={}", userId, verdict.reason());
+                reject(ctx, request, HttpResponseStatus.UNAUTHORIZED, verdict.reason());
+                return;
+            }
         }
         ctx.channel().attr(SessionAttributes.USER_ID).set(userId);
         String deviceId = query.get("deviceId");

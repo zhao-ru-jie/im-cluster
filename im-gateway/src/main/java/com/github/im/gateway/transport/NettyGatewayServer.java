@@ -1,5 +1,6 @@
 package com.github.im.gateway.transport;
 
+import com.github.im.gateway.auth.AuthGuard;
 import com.github.im.gateway.drain.GatewayDrainService;
 import com.github.im.gateway.metrics.GatewayMetrics;
 import com.github.im.gateway.protocol.ClientFrames;
@@ -95,6 +96,10 @@ public class NettyGatewayServer {
     private final GatewayDrainService drainService;
     private final ClientFrames frames;
     private final GatewayMetrics metrics;
+    /** 接入鉴权闸门（off / warn / enforce 三档，见 AuthMode） */
+    private final AuthGuard authGuard;
+    /** 上行业务执行器：把同步 gRPC / Redis 调用搬离 event loop（每连接一个串行虚拟线程） */
+    private final BusinessDispatcher businessDispatcher;
 
     /** 心跳：每个连接由自己的 event loop 计时，不做全局扫描 */
     private final boolean heartbeatEnabled;
@@ -118,6 +123,8 @@ public class NettyGatewayServer {
                               GatewayDrainService drainService,
                               ClientFrames frames,
                               GatewayMetrics metrics,
+                              AuthGuard authGuard,
+                              BusinessDispatcher businessDispatcher,
                               @Value("${im.gateway.transport.ws-enabled:true}") boolean wsEnabled,
                               @Value("${im.gateway.transport.ws-port:8081}") int wsPort,
                               @Value("${im.gateway.transport.ws-path:/ws}") String wsPath,
@@ -133,6 +140,8 @@ public class NettyGatewayServer {
         this.drainService = drainService;
         this.frames = frames;
         this.metrics = metrics;
+        this.authGuard = authGuard;
+        this.businessDispatcher = businessDispatcher;
         this.wsEnabled = wsEnabled;
         this.wsPort = wsPort;
         this.wsPath = wsPath;
@@ -154,7 +163,8 @@ public class NettyGatewayServer {
         }
         boolean isLinux = isLinux();
         bossGroup = new MultiThreadIoEventLoopGroup(1, isLinux ? EpollIoHandler.newFactory() : NioIoHandler.newFactory());
-        // 0 = 默认 2 * CPU 核数；长连接场景下 event loop 只做编解码与转发，足够
+        // 0 = 默认 2 * CPU 核数。event loop 只做编解码与「把帧投进每条连接的串行队列」，
+        // 同步 gRPC / Redis 都跑在 BusinessDispatcher 的虚拟线程上，所以这个数字不再是上行吞吐上限。
         workerGroup = new MultiThreadIoEventLoopGroup(0, isLinux ? EpollIoHandler.newFactory() : NioIoHandler.newFactory());
 
         if (heartbeatEnabled) {
@@ -289,14 +299,17 @@ public class NettyGatewayServer {
                 pipeline.addLast("http-codec", new HttpServerCodec());
                 pipeline.addLast("http-aggregator", new HttpObjectAggregator(MAX_HTTP_HANDSHAKE_BYTES));
                 // 必须在协议处理器之前：握手一旦完成就没法再回 503/400 了
-                pipeline.addLast("ws-handshake-gate", new WebSocketHandshakeGate(drainService, wsPath));
+                pipeline.addLast("ws-handshake-gate", new WebSocketHandshakeGate(drainService, wsPath, authGuard));
                 // 空闲计时放在协议处理器之前：协议级 WebSocket Ping 也算「活着」
                 addIdleTimer(pipeline, "ws", heartbeat);
                 pipeline.addLast("ws-protocol",
                         new WebSocketServerProtocolHandler(wsPath, null, true, maxFrameBytes));
                 pipeline.addLast("ws-encoder", new StringToWebSocketFrameEncoder());
                 addHeartbeatHandler(pipeline, "ws", heartbeat);
-                pipeline.addLast("ws-handler", new WebSocketFrameInboundHandler(lifecycle));
+                // 上行业务跑在每连接一条的串行虚拟线程上（见 BusinessDispatcher），
+                // event loop 只负责解码与把帧投递进队列，不再等 IM 服务
+                pipeline.addLast("ws-handler",
+                        new WebSocketFrameInboundHandler(lifecycle, businessDispatcher.serial("ws")));
             }
         };
     }
@@ -316,7 +329,13 @@ public class NettyGatewayServer {
                 pipeline.addLast("tcp-string-decoder", new StringDecoder(StandardCharsets.UTF_8));
                 pipeline.addLast("tcp-string-encoder", new StringEncoder(StandardCharsets.UTF_8));
                 addHeartbeatHandler(pipeline, "tcp", heartbeat);
-                pipeline.addLast("tcp-handler", new TcpFrameInboundHandler(lifecycle, frames, tcpAuthTimeoutMs));
+                // 必须每连接 new：该 handler 持有本连接的 session 字段（认证前为 null），
+                // 共享会让不同连接串用同一个身份。它不是 @Sharable，共享也会被 Netty 直接拒绝。
+                // 无状态依赖（lifecycle / frames / authGuard）本来就是构造注入的单例，不需要在这里省。
+                // 认证与业务帧都由它投递到本连接的串行虚拟线程，event loop 不再被 gRPC 阻塞。
+                pipeline.addLast("tcp-handler",
+                        new TcpFrameInboundHandler(lifecycle, frames, tcpAuthTimeoutMs, authGuard,
+                                businessDispatcher.serial("tcp")));
             }
         };
     }

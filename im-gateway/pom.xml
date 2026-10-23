@@ -50,6 +50,13 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-grpc-server</artifactId>
         </dependency>
+
+        <!-- 测试：鉴权档位与 token 校验不依赖网络，纯单测即可覆盖 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
         <!-- 本实例也暴露 grpc.health.v1.Health（同上，Boot 自动配置的生效前提）。
              网关是服务端：IM 服务推下行时据此避开正在启动/摘流的网关实例。 -->
         <dependency>

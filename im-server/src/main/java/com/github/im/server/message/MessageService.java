@@ -16,6 +16,7 @@ import org.springframework.util.StringUtils;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.UUID;
 
 /**
  * 消息受理主流程（IM 服务的业务核心，也是 {@link MessageIngress} 的本地实现）。
@@ -101,6 +102,8 @@ public class MessageService implements MessageIngress {
                 return response(envelope, hit.serverMsgId(), hit.seq(), receivedAt, true);
             }
 
+            // 只算一次：客户端没带 traceId 时这里会生成，多算一次就会「日志一个 ID、推送另一个 ID」
+            String traceId = traceId(request);
             long seq = seqAllocator.next(envelope.conversationId());
             String serverMsgId = MessageIds.next();
             String frame = frames.pushFrame(envelope, serverMsgId, seq, receivedAt);
@@ -113,12 +116,13 @@ public class MessageService implements MessageIngress {
                     envelope.clientMsgId(), envelope.body(), receivedAt));
             redis.opsForValue().set(idemKey, serverMsgId + IDEM_SEP + seq, IDEM_TTL);
 
-            List<String> failed = router.deliver(envelope, frame, serverMsgId);
+            List<String> failed = router.deliver(envelope, frame, traceId);
             for (String userId : failed) {
                 offlineMessageStore.store(userId, frame);
             }
-            log.info("message accepted: conv={} seq={} msgId={} from={} to={} offline={}",
-                    envelope.conversationId(), seq, serverMsgId, envelope.from(), envelope.to(), failed.size());
+            log.info("message accepted: traceId={} conv={} seq={} msgId={} from={} to={} offline={}",
+                    traceId, envelope.conversationId(), seq, serverMsgId,
+                    envelope.from(), envelope.to(), failed.size());
             return response(envelope, serverMsgId, seq, receivedAt, false);
         } catch (RuntimeException e) {
             // 竞态下的重复插入由唯一索引兜底（生产环境），这里按可重试返回
@@ -135,7 +139,7 @@ public class MessageService implements MessageIngress {
      * 网关侧 REST 测试入口复用同一套受理流程，避免出现「测试通路绕过业务」。
      */
     public SubmitMessageResponse dispatch(MessageEnvelope envelope) {
-        return submit(MessageEnvelopes.toRequest(envelope, null, null));
+        return submit(MessageEnvelopes.toRequest(envelope, null, null, null));
     }
 
     @Override
@@ -153,6 +157,20 @@ public class MessageService implements MessageIngress {
                 .addAllFrames(frames)
                 .setRemaining((int) offlineMessageStore.size(userId))
                 .build();
+    }
+
+    /**
+     * 取本次受理的链路追踪 ID：优先用网关透传的 traceId（客户端带来的或网关生成的），缺了才现场生成。
+     *
+     * <p>以前 {@code PushTask.trace_id} 里装的是 {@code serverMsgId}——那是消息标识，
+     * 既搜不到请求也串不起链路，等于「看着有追踪、实际查不出东西」。改成真正的 traceId 后，
+     * 同一个 ID 会出现在：网关日志 → 上行 RPC → 受理日志 → 下行 PushTask → 网关推送日志。
+     */
+    private static String traceId(SubmitMessageRequest request) {
+        if (StringUtils.hasText(request.getTraceId())) {
+            return request.getTraceId();
+        }
+        return UUID.randomUUID().toString().replace("-", "");
     }
 
     /**

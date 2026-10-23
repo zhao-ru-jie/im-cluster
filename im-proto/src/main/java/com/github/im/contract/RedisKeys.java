@@ -7,7 +7,7 @@ package com.github.im.contract;
  * <table border="1">
  *   <caption>key 归属</caption>
  *   <tr><th>key</th><th>写方</th><th>读方</th></tr>
- *   <tr><td>{@link #GATEWAY_USER_PREFIX}{userId}</td><td>长连接服务</td><td>IM 服务（下行路由）</td></tr>
+ *   <tr><td>{@link #GATEWAY_USER_PREFIX}{userId}</td><td>长连接服务</td><td>IM 服务（下行路由，SET 集合：多端可能同时在多个实例上）</td></tr>
  *   <tr><td>{@link #OFFLINE_PREFIX}{userId}</td><td>IM 服务</td><td>IM 服务</td></tr>
  *   <tr><td>{@link #CONV_MESSAGES_PREFIX}{conversationId}</td><td>IM 服务</td><td>IM 服务</td></tr>
  *   <tr><td>{@link #SEQ_PREFIX}{conversationId}</td><td>IM 服务</td><td>IM 服务</td></tr>
@@ -17,7 +17,12 @@ package com.github.im.contract;
  */
 public final class RedisKeys {
 
-    /** 在线路由：gw 实例 ID，带 TTL，由网关心跳续期 */
+    /**
+     * 在线路由：SET{网关实例 ID}，带 TTL，由网关心跳续期。
+     *
+     * <p>是集合而不是单值：多端时同一用户可能同时连在多个网关实例上，
+     * 下行必须逐个实例推送，再由各实例分发给本机上的设备。
+     */
     public static final String GATEWAY_USER_PREFIX = "im:gw:user:";
     /** 离线消息帧队列（List） */
     public static final String OFFLINE_PREFIX = "im:offline:";

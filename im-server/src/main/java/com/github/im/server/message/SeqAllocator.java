@@ -106,7 +106,7 @@ public class SeqAllocator {
      * @param conversationId 会话 ID（seq 的作用域）
      */
     public long next(String conversationId) {
-        ConversationSeq state = conversations.computeIfAbsent(conversationId, key -> new ConversationSeq());
+        ConversationSeq state = conversations.computeIfAbsent(conversationId, _ -> new ConversationSeq());
         if (state.needsFloorRefresh()) {
             state.raiseFloor(storageFloor(conversationId));
         }
