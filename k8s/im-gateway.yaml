@@ -1,0 +1,191 @@
+# 长连接服务（im-gateway）独立部署清单
+#
+# 与 IM 服务的部署差异（这也是为什么必须拆成两个 Deployment）：
+#   1) 网关持有大量长连接，内存/fd 是主要约束，CPU 空闲时接近 0；
+#   2) 扩容主指标是「每实例连接数」而不是 CPU（见 HPA 注释）；
+#   3) 滚动更新必须「先摘流、后杀进程」，否则会制造重连风暴；
+#   4) 客户端连接建立后整个生命周期只落在一个 pod 上，因此 Service 不需要会话保持。
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: im-gateway
+  labels:
+    app: im-gateway
+spec:
+  selector:
+    app: im-gateway
+  ports:
+    # 8080 是 Tomcat：/admin/drain、/actuator/*（短请求）
+    - name: http
+      port: 8080
+      targetPort: 8080
+    # 8081 是 Netty 的 WebSocket 接入（浏览器/小程序）
+    - name: ws
+      port: 8081
+      targetPort: 8081
+    # 9092 是 Netty 的原生 TCP 接入（App/长连接 SDK），LB 需按 TCP 类型转发
+    - name: tcp
+      port: 9092
+      targetPort: 9092
+    - name: grpc-push
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: im-gateway
+  labels:
+    app: im-gateway
+spec:
+  replicas: 2
+  # 滚动更新：不允许减少可用副本，且新 pod 就绪后要稳定一小段时间才继续
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  minReadySeconds: 15
+  selector:
+    matchLabels:
+      app: im-gateway
+  template:
+    metadata:
+      labels:
+        app: im-gateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /actuator/prometheus
+        prometheus.io/port: "8080"
+    spec:
+      # 必须先大于 drain.timeout-ms（默认 45s），否则 pod 会被 SIGKILL 打断摘流
+      terminationGracePeriodSeconds: 90
+      containers:
+        - name: im-gateway
+          image: your-registry/im-gateway:latest
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: ws
+              containerPort: 8081
+            - name: tcp
+              containerPort: 9092
+            - name: grpc-push
+              containerPort: 9090
+          env:
+            # 实例 ID = POD_IP:19090（gRPC 端口），写进 Redis 在线路由表 im:gw:user:{userId}
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: IM_GRPC_PORT
+              value: "9090"
+            - name: SERVER_PORT
+              value: "8080"
+            # Netty 双通道接入（与 SERVER_PORT 的 Tomcat 并存）
+            - name: IM_WS_PORT
+              value: "8081"
+            - name: IM_TCP_PORT
+              value: "9092"
+            # 上行：所有消息交给 IM 服务的 gRPC 入口
+            - name: IM_SERVER_ADDR
+              value: "im-server:9091"
+            - name: SPRING_DATA_REDIS_HOST
+              value: "redis"
+            - name: IM_NACOS_ENABLED
+              value: "true"
+            - name: IM_NACOS_ADDR
+              value: "nacos:8848"
+            - name: IM_NACOS_SERVICE_NAME
+              value: "im-gateway"
+            # 摘流窗口（必须 < terminationGracePeriodSeconds）
+            - name: IM_DRAIN_TIMEOUT_MS
+              value: "45000"
+          # 摘流三步：K8s 先从 Endpoints 摘掉 -> preStop 等 LB/客户端感知 -> SIGTERM 触发 GatewayDrainService
+          # （应用侧会再走一遍：注销 Nacos、就绪翻红、广播 session.migrate、等待、强制关闭）
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 10"]
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            # 连接数与 fd 是主要约束，内存按「每连接 ~10-50KB + 堆外缓冲」估算
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+---
+# HPA：以「每实例连接数」为主指标
+#   - 自定义指标 gateway_connections_active 需要 prometheus-adapter 把
+#     Pods 指标暴露成 k8s custom metrics（见文末说明）
+#   - CPU 只作为兜底（空闲连接的 CPU≈0，绝不能单独用 CPU 扩缩）
+#   - scaleDown 要慢：连接迁移成本高，避免抖动式缩容
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: im-gateway
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: im-gateway
+  minReplicas: 2
+  maxReplicas: 30
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          name: gateway_connections_active
+        target:
+          type: AverageValue
+          averageValue: "60000"   # 单 pod 目标连接数（按实测容量留 60% 余量）
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          utilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 180
+---
+# prometheus-adapter 规则示例（放到 kube-prometheus-stack 的 additionalRules 里）：
+#
+# rules:
+#   - seriesQuery: 'gateway_connections_active{namespace!="",pod!=""}'
+#     resources:
+#       overrides:
+#         namespace: {resource: "namespace"}
+#         pod: {resource: "pod"}
+#     name:
+#       matches: "^(.*)$"
+#       as: "${1}"
+#     metricsQuery: 'avg_over_time(<<.Series>>{<<.LabelMatchers>>}[1m]) by (<<.GroupBy>>)'

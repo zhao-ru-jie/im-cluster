@@ -1,0 +1,36 @@
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v4.1.1)
+
+2026-10-22T15:53:05.975+08:00  INFO 84524 --- [im-app] [           main] com.github.im.ImClusterApplication       : Starting ImClusterApplication v1.0.0 using Java 25.0.2 with PID 84524 (D:\MyCode\im-cluster\im-app\target\im-app-1.0.0.jar started by rujie_z in D:\MyCode\im-cluster)
+2026-10-22T15:53:05.978+08:00  INFO 84524 --- [im-app] [           main] com.github.im.ImClusterApplication       : No active profile set, falling back to 1 default profile: "default"
+2026-10-22T15:53:07.377+08:00  INFO 84524 --- [im-app] [           main] .s.d.r.c.RepositoryConfigurationDelegate : Multiple Spring Data modules found, entering strict repository configuration mode
+2026-10-22T15:53:07.382+08:00  INFO 84524 --- [im-app] [           main] .s.d.r.c.RepositoryConfigurationDelegate : Bootstrapping Spring Data Redis repositories in DEFAULT mode.
+2026-10-22T15:53:07.433+08:00  INFO 84524 --- [im-app] [           main] .s.d.r.c.RepositoryConfigurationDelegate : Finished Spring Data repository scanning in 29 ms. Found 0 Redis repository interfaces.
+2026-10-22T15:53:08.268+08:00  INFO 84524 --- [im-app] [           main] o.s.boot.tomcat.TomcatWebServer          : Tomcat initialized with port 28080 (http)
+2026-10-22T15:53:08.295+08:00  INFO 84524 --- [im-app] [           main] o.apache.catalina.core.StandardService   : Starting service [Tomcat]
+2026-10-22T15:53:08.295+08:00  INFO 84524 --- [im-app] [           main] o.apache.catalina.core.StandardEngine    : Starting Servlet engine: [Apache Tomcat/11.0.24]
+2026-10-22T15:53:08.332+08:00  INFO 84524 --- [im-app] [           main] b.w.c.s.WebApplicationContextInitializer : Root WebApplicationContext: initialization completed in 2308 ms
+2026-10-22T15:53:09.170+08:00  INFO 84524 --- [im-app] [           main] c.g.i.g.node.GatewayNacosDiscovery       : [nacos] disabled (im.nacos.enabled=false)，跨实例推送的目标地址回退为直接使用实例 ID
+2026-10-22T15:53:09.340+08:00  INFO 84524 --- [im-app] [           main] c.g.i.g.transport.NettyGatewayServer     : [netty] 心跳已启用：45000~50000ms 无上行发 ping（每连接随机抖动 ≤5000ms），再按 close-after=90000ms 判定超时断开
+2026-10-22T15:53:09.385+08:00  INFO 84524 --- [im-app] [           main] c.g.i.g.transport.NettyGatewayServer     : [netty] websocket 接入已启动，端口 28081
+2026-10-22T15:53:09.386+08:00  INFO 84524 --- [im-app] [           main] c.g.i.g.transport.NettyGatewayServer     : [netty] tcp 接入已启动，端口 29092
+2026-10-22T15:53:09.410+08:00  INFO 84524 --- [im-app] [           main] com.github.im.app.config.IngressConfig   : [ingress] 上行走本地直调（阶段 1 行为）
+2026-10-22T15:53:09.549+08:00  INFO 84524 --- [im-app] [           main] o.s.b.w.a.WelcomePageHandlerMapping      : Adding welcome page: class path resource [static/index.html]
+2026-10-22T15:53:09.955+08:00  INFO 84524 --- [im-app] [           main] o.s.b.a.e.web.EndpointLinksResolver      : Exposing 4 endpoints beneath base path '/actuator'
+2026-10-22T15:53:10.048+08:00  INFO 84524 --- [im-app] [           main] o.s.boot.tomcat.TomcatWebServer          : Tomcat started on port 28080 (http) with context path '/'
+2026-10-22T15:53:10.086+08:00  INFO 84524 --- [im-app] [           main] o.s.grpc.server.NettyGrpcServerFactory   : Registered gRPC service: im.push.v1.DownstreamPush
+2026-10-22T15:53:10.087+08:00  INFO 84524 --- [im-app] [           main] o.s.grpc.server.NettyGrpcServerFactory   : Registered gRPC service: im.ingress.v1.MessageIngress
+2026-10-22T15:53:10.087+08:00  INFO 84524 --- [im-app] [           main] o.s.grpc.server.NettyGrpcServerFactory   : Registered gRPC service: grpc.reflection.v1.ServerReflection
+2026-10-22T15:53:10.088+08:00  INFO 84524 --- [im-app] [           main] o.s.grpc.server.NettyGrpcServerFactory   : Registered gRPC service: grpc.health.v1.Health
+2026-10-22T15:53:10.170+08:00  INFO 84524 --- [im-app] [           main] o.s.g.s.lifecycle.GrpcServerLifecycle    : gRPC Server started, listening on address: [/[0:0:0:0:0:0:0:0]:29090], port: 29090
+2026-10-22T15:53:10.187+08:00  INFO 84524 --- [im-app] [           main] com.github.im.ImClusterApplication       : Started ImClusterApplication in 4.687 seconds (process running for 5.222)
+2026-10-22T15:53:28.750+08:00  INFO 84524 --- [im-app] [omcat-handler-0] o.a.c.c.C.[Tomcat].[localhost].[/]       : Initializing Spring DispatcherServlet 'dispatcherServlet'
+2026-10-22T15:53:28.752+08:00  INFO 84524 --- [im-app] [omcat-handler-0] o.s.web.servlet.DispatcherServlet        : Initializing Servlet 'dispatcherServlet'
+2026-10-22T15:53:28.754+08:00  INFO 84524 --- [im-app] [omcat-handler-0] o.s.web.servlet.DispatcherServlet        : Completed initialization in 1 ms

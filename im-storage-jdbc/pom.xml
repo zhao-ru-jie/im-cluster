@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.github</groupId>
+        <artifactId>im-cluster</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>im-storage-jdbc</artifactId>
+    <name>im-storage-jdbc</name>
+    <description>MessageRepository 的 MySQL 实现（im.storage=jdbc 时生效）</description>
+
+    <dependencies>
+        <!-- 只需要 IM 服务的存储端口（MessageRepository / StoredMessage） -->
+        <dependency>
+            <groupId>com.github</groupId>
+            <artifactId>im-server</artifactId>
+        </dependency>
+
+        <!-- 刻意不用 spring-boot-starter-jdbc：它会在没有 DSN 时触发 DataSource 自动装配并启动失败。
+             这里手工装配 HikariDataSource，只有显式配置 im.storage=jdbc 才创建连接池。 -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-jdbc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.zaxxer</groupId>
+            <artifactId>HikariCP</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+    </dependencies>
+</project>

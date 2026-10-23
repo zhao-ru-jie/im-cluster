@@ -11,86 +11,84 @@
         <relativePath/>
     </parent>
 
-    <groupId>com.example</groupId>
+    <groupId>com.github</groupId>
     <artifactId>im-cluster</artifactId>
     <version>1.0.0</version>
+    <packaging>pom</packaging>
     <name>im-cluster</name>
+    <description>IM 服务：按职责拆分为长连接服务(im-gateway)与 IM 业务服务(im-server)</description>
 
     <properties>
         <java.version>25</java.version>
     </properties>
 
-    <dependencies>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-web</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-websocket</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-redis</artifactId>
-        </dependency>
-        <!-- 显式引入 Jackson（WebSocket 消息体 JSON 解析用） -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-json</artifactId>
-        </dependency>
+    <!--
+      模块划分（与「长连接服务 / IM 服务」的职责边界一一对应）：
 
-        <!-- Spring Boot 4.1 官方 gRPC Starter：自动注册 @GrpcService，BOM 管理 grpc-java / protobuf-java 版本 -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-grpc-server</artifactId>
-        </dependency>
+        im-proto    两服务共享的契约层：protobuf/gRPC 定义 + 端口接口 + 消息信封。
+                    这是唯一的跨服务共享代码，禁止放业务实现。
+        im-gateway  长连接服务（库）：连接维护、心跳保活、消息收发通道、连接状态管理。
+                    自身不含任何消息持久化与业务逻辑。
+        im-server   IM 服务（库）：消息存储、会话管理、消息路由、业务逻辑。
+                    自身不感知 WebSocket / 连接 / 设备通道。
+        im-storage-jdbc  消息存储的 MySQL 实现 + DDL（im.storage=jdbc 时生效）。
+                    只依赖 im-server 的存储端口 MessageRepository，反向不依赖；
+                    默认 Redis 实现留在 im-server 内，两种形态同一份 jar 按配置切换。
+        im-rpc      gRPC 适配层（客户端侧）：RemoteMessageIngress（网关→IM）、
+                    RemoteGatewayPushPort（IM→网关）、在线路由只读、channel 复用。
+                    只被「部署入口」依赖，业务模块不依赖它（保持业务无传输细节）。
 
-        <!-- protobuf 运行时（grpc stub 已随 starter 传递引入） -->
-        <dependency>
-            <groupId>com.google.protobuf</groupId>
-            <artifactId>protobuf-java</artifactId>
-        </dependency>
+        im-app      单体装配器：同进程装配两个服务，行为与拆分前一致。
+                    通过 im.ingress.transport 支持 local / grpc / shadow 三档，
+                    shadow 即「同一上行同时走本地与远程，比对结果，只以本地为准」。
+        im-gateway-boot 长连接服务独立部署入口：只承载连接，上行全走 gRPC，
+                    并自带优雅摘流（session.migrate）与按连接数的 HPA 指标。
+        im-server-boot  IM 服务独立部署入口。
 
-        <!-- Nacos-Client SDK：仅做节点 gRPC 地址的「注册 + 动态发现」，不走 Spring Cloud Alibaba 全家桶 -->
-        <dependency>
-            <groupId>com.alibaba.nacos</groupId>
-            <artifactId>nacos-client</artifactId>
-            <version>3.2.4</version>
-        </dependency>
-    </dependencies>
+      依赖方向（编译期单向，禁止反向）：
+        im-app           -> im-gateway / im-server / im-rpc -> im-proto
+        im-gateway-boot  -> im-gateway / im-rpc             -> im-proto
+        im-server-boot   -> im-server  / im-rpc             -> im-proto
+        im-gateway 与 im-server 互不依赖；业务模块不依赖 im-rpc。
+    -->
+    <modules>
+        <module>im-proto</module>
+        <module>im-rpc</module>
+        <module>im-gateway</module>
+        <module>im-server</module>
+        <module>im-storage-jdbc</module>
+        <module>im-app</module>
+        <module>im-gateway-boot</module>
+        <module>im-server-boot</module>
+    </modules>
 
-    <build>
-        <extensions>
-            <extension>
-                <groupId>kr.motd.maven</groupId>
-                <artifactId>os-maven-plugin</artifactId>
-                <version>1.7.1</version>
-            </extension>
-        </extensions>
-        <plugins>
-            <plugin>
-                <groupId>org.springframework.boot</groupId>
-                <artifactId>spring-boot-maven-plugin</artifactId>
-            </plugin>
-            <plugin>
-                <groupId>org.xolstice.maven.plugins</groupId>
-                <artifactId>protobuf-maven-plugin</artifactId>
-                <version>0.6.1</version>
-                <configuration>
-                    <!-- 版本均取自 Boot 4.1 BOM 管理的 grpc-java / protobuf-java，避免自行覆盖导致不兼容 -->
-                    <protocArtifact>com.google.protobuf:protoc:${protobuf-java.version}:exe:${os.detected.classifier}</protocArtifact>
-                    <pluginId>grpc-java</pluginId>
-                    <pluginArtifact>io.grpc:protoc-gen-grpc-java:${grpc-java.version}:exe:${os.detected.classifier}</pluginArtifact>
-                </configuration>
-                <executions>
-                    <execution>
-                        <goals>
-                            <goal>compile</goal>
-                            <goal>compile-custom</goal>
-                        </goals>
-                    </execution>
-                </executions>
-            </plugin>
-        </plugins>
-    </build>
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>com.github</groupId>
+                <artifactId>im-proto</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.github</groupId>
+                <artifactId>im-rpc</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.github</groupId>
+                <artifactId>im-gateway</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.github</groupId>
+                <artifactId>im-server</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.github</groupId>
+                <artifactId>im-storage-jdbc</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 </project>

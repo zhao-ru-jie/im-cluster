@@ -1,0 +1,115 @@
+# IM 服务（im-server）独立部署清单
+#
+# 与网关的差异：
+#   1) 无长连接，任意时刻可被杀（未下发的消息已落库 + 落离线，客户端重连拉齐）；
+#   2) 扩容主指标是消息吞吐（SubmitMessage QPS / CPU），不是连接数；
+#   3) readiness 用 HTTP 端口探测即可（阶段 4 接入 actuator 后可换 QPS/延迟指标）。
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: im-server
+  labels:
+    app: im-server
+spec:
+  selector:
+    app: im-server
+  ports:
+    - name: http
+      port: 8088
+      targetPort: 8088
+    - name: grpc-ingress
+      port: 9091
+      targetPort: 9091
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: im-server
+  labels:
+    app: im-server
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: im-server
+  template:
+    metadata:
+      labels:
+        app: im-server
+    spec:
+      # 无长连接，30s 足够让在途 gRPC 请求收尾
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: im-server
+          image: your-registry/im-server:latest
+          ports:
+            - name: http
+              containerPort: 8088
+            - name: grpc-ingress
+              containerPort: 9091
+          env:
+            - name: IM_GRPC_PORT
+              value: "9091"
+            - name: SERVER_PORT
+              value: "8088"
+            - name: SPRING_DATA_REDIS_HOST
+              value: "redis"
+            # 下发到网关实例的超时：超时即落离线，不做无限重试
+            - name: IM_PUSH_TIMEOUT_MS
+              value: "800"
+          readinessProbe:
+            tcpSocket:
+              port: 8088
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 9091
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+---
+# HPA：按消息吞吐相关指标扩容（阶段 3 先用 CPU；阶段 4 接 Kafka lag / SubmitMessage QPS 后替换）
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: im-server
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: im-server
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          utilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60

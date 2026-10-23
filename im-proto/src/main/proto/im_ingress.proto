@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+package im.ingress.v1;
+
+option java_package = "com.github.im.proto.ingress.v1";
+option java_multiple_files = true;
+option java_outer_classname = "ImIngressProto";
+
+// ============================================================================
+// 上行契约：长连接服务(im-gateway) -> IM 业务服务(im-server)
+//
+// 设计要点：
+//  * 网关只负责「把客户端帧原样上报」，不理解 payload 里的业务语义；
+//  * 客户端幂等键 client_msg_id 是唯一去重依据，IM 服务负责判定重复并返回同一
+//    server_msg_id / seq，因此本接口天然可重试（至少一次投递）；
+//  * seq 由 IM 服务按 conversation_id 单调分配，网关不得自行生成或重排。
+// ============================================================================
+service MessageIngress {
+  // 单条上行（实时路径，延迟最低）
+  rpc SubmitMessage(SubmitMessageRequest) returns (SubmitMessageResponse);
+
+  // 批量上行（高吞吐路径：网关侧攒批后一次提交，减少 RPC 次数）
+  rpc BatchSubmit(BatchSubmitRequest) returns (BatchSubmitResponse);
+
+  // 连接建立时拉取该用户待补发的消息帧（离线消息 / 多端漫游缺口），
+  // 同时接收客户端上报的各会话消费水位（watermarks），供 seq 发号器兜底下界。
+  rpc PullPending(PullPendingRequest) returns (PullPendingResponse);
+}
+
+message SubmitMessageRequest {
+  string trace_id = 1;        // 全链路追踪 ID，网关生成
+  string client_msg_id = 2;   // 客户端幂等键（必填，重复提交返回同一结果）
+  string from_user_id = 3;    // 发送方
+  string device_id = 4;       // 发送设备（多端同步 / 已读合并用）
+  string conversation_id = 5; // 会话 ID；单聊缺省由服务端按 (from,to) 规范生成
+  string conv_type = 6;       // SINGLE / GROUP
+  string receiver_id = 7;     // 单聊接收方；群聊留空（群成员由 IM 服务解析）
+  string payload = 8;         // 业务消息体，网关不解析
+  int64 client_ts = 9;        // 客户端发送时间（毫秒），仅作参考
+  string gateway_instance = 10; // 上报方网关实例 ID，回推时优先走该实例
+}
+
+message SubmitMessageResponse {
+  int32 code = 1;             // 0=成功；4xx=可重试；5xx=拒收（不要重试）
+  string message = 2;         // 错误描述
+  string server_msg_id = 3;   // 服务端消息 ID（幂等：同一 client_msg_id 恒定）
+  int64 seq = 4;              // 会话内单调递增序号（保序与拉齐依据）
+  int64 server_ts = 5;        // 服务端接收时间
+  string client_msg_id = 6;   // 回显，供网关匹配 ACK
+  bool duplicate = 7;         // true=幂等命中（未重复落库）
+}
+
+message BatchSubmitRequest {
+  repeated SubmitMessageRequest messages = 1;
+}
+
+message BatchSubmitResponse {
+  repeated SubmitMessageResponse results = 1;
+}
+
+message PullPendingRequest {
+  string user_id = 1;
+  int32 max = 2;              // 单次最多拉取条数，0 表示默认值
+
+  // 客户端上报的「会话 -> 已见过的最大 seq」消费水位。
+  //
+  // 为什么服务端需要它：seq 发号器的下界取「已落库的最大 seq」。当消息存储与发号器
+  // 共用同一个 Redis 且整体丢失（无持久化 / FLUSH / 回滚到旧快照）时，这个下界会一起消失，
+  // seq 从 1 重新开始——此时客户端水位是**唯一还活着的证据**：它证明「这些 seq 已经被消费过」，
+  // 服务端据此把下界抬到水位之上，避免发出比客户端水位更小的 seq（否则新消息会被客户端
+  // 判定为历史重复而丢弃，表现为「消息永久不显示」）。
+  //
+  // 语义：可空、可只报部分会话、可重复上报（服务端按 conversation 取最大值）。
+  map<string, int64> watermarks = 3;
+}
+
+message PullPendingResponse {
+  repeated string frames = 1; // 已序列化的下行帧，网关原样透传给客户端
+  int32 remaining = 2;        // 仍滞留待拉取的条数（用于决定是否继续拉）
+}

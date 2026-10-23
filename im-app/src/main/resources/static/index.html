@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IM 节点测试客户端</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, "Segoe UI", Arial, sans-serif; margin: 0; padding: 16px;
+           background: #f7f8fa; color: #1f2937; }
+    h2 { margin: 0 0 12px; font-size: 16px; font-weight: 500; }
+    .row { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+    input { padding: 8px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 13px; }
+    button { padding: 8px 14px; border: 0; border-radius: 8px; background: #185fa5; color: #fff;
+             font-size: 13px; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    #log { margin-top: 12px; height: 320px; overflow: auto; background: #fff; border: 1px solid #e2e8f0;
+           border-radius: 8px; padding: 10px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+    .me { color: #185fa5; }
+    .sys { color: #64748b; }
+    .ack { color: #0f766e; }
+  </style>
+</head>
+<body>
+  <h2>IM 节点测试客户端（当前节点：<span id="nodeUrl"></span>）</h2>
+  <div class="row">
+    <input id="userId" placeholder="你的 userId，如 alice" style="width:200px">
+    <button id="connectBtn" onclick="connect()">连接</button>
+    <button id="disconnectBtn" onclick="disconnect()" disabled>断开</button>
+  </div>
+  <div class="row">
+    <input id="to" placeholder="接收方 userId，如 bob" style="width:200px">
+    <input id="body" placeholder="消息内容" style="width:260px">
+    <button id="sendBtn" onclick="send()" disabled>发送</button>
+  </div>
+  <div id="log"></div>
+
+  <script>
+    let ws = null;
+    let myUserId = '';
+    let lastSentTo = '';
+    // 各会话「已见过的最大 seq」。重连时上报给服务端，作为 seq 发号器的兜底下界：
+    // 万一 Redis 里的序号计数器整体丢失，服务端据此也不会发出比这里更小的 seq
+    // （否则新消息会被本端当成历史重复而丢弃）。
+    const watermarks = {};
+    // 长连接由 Netty 独立监听（默认 8081），与本页面的 HTTP 端口(8080)不同；
+    // 可用 ?wsPort=xxxx 覆盖，便于连到别的网关实例
+    const WS_PORT = new URLSearchParams(location.search).get('wsPort') || '8081';
+    const WS_PROTO = location.protocol === 'https:' ? 'wss' : 'ws';
+    const WS_URL_BASE = WS_PROTO + '://' + location.hostname + ':' + WS_PORT + '/ws';
+    document.getElementById('nodeUrl').textContent = location.hostname + ':' + WS_PORT;
+
+    function log(text, cls) {
+      const el = document.getElementById('log');
+      const div = document.createElement('div');
+      div.className = cls || '';
+      div.textContent = text;
+      el.appendChild(div);
+      el.scrollTop = el.scrollHeight;
+    }
+
+    // 与服务端 MessageEnvelope.singleConversationId 保持同一规则：两个 userId 排序后拼接
+    function conversationIdOf(to) {
+      if (!myUserId || !to) return null;
+      return myUserId <= to ? 's:' + myUserId + ':' + to : 's:' + to + ':' + myUserId;
+    }
+
+    function raiseWatermark(conversationId, seq) {
+      if (!conversationId || !seq) return;
+      watermarks[conversationId] = Math.max(watermarks[conversationId] || 0, seq);
+    }
+
+    // 上报水位；服务端会顺手补拉缺口，所以 sync 也是「主动对账」的入口
+    function syncWatermarks() {
+      if (!ws || ws.readyState !== 1) return;
+      const keys = Object.keys(watermarks);
+      if (keys.length === 0) return;
+      ws.send(JSON.stringify({ ver: 1, type: 'sync', watermarks: watermarks }));
+      log('已上报水位: ' + JSON.stringify(watermarks), 'sys');
+    }
+
+    function connect() {
+      const userId = document.getElementById('userId').value.trim();
+      if (!userId) { alert('请填写 userId'); return; }
+      myUserId = userId;
+      ws = new WebSocket(WS_URL_BASE + '?userId=' + encodeURIComponent(userId) + '&deviceId=web');
+      ws.onopen = () => {
+        log('已连接为 ' + userId, 'sys');
+        document.getElementById('connectBtn').disabled = true;
+        document.getElementById('disconnectBtn').disabled = false;
+        document.getElementById('sendBtn').disabled = false;
+        syncWatermarks();
+      };
+      ws.onmessage = (e) => {
+        let frame;
+        try { frame = JSON.parse(e.data); } catch (_) { log('收到: ' + e.data, 'me'); return; }
+        if (frame.type === 'msg.ack') {
+          raiseWatermark(conversationIdOf(lastSentTo), frame.seq);
+          log('已受理: seq=' + frame.seq + ' serverMsgId=' + frame.serverMsgId, 'ack');
+        } else if (frame.type === 'msg.push') {
+          raiseWatermark(frame.conversationId, frame.seq);
+          log('收到 [' + frame.conversationId + ' #' + frame.seq + '] ' + frame.from + ': ' + frame.body, 'me');
+        } else if (frame.type === 'error') {
+          log('错误 ' + frame.code + ': ' + frame.message, 'sys');
+        } else if (frame.type === 'ping') {
+          // 服务端心跳探测：必须回 pong，否则空闲超时后会被网关断开
+          ws.send(JSON.stringify({ ver: 1, type: 'pong' }));
+        } else if (frame.type === 'pong') {
+          // 我方主动 ping 的服务端应答，忽略
+        } else {
+          log('收到: ' + e.data, 'me');
+        }
+      };
+      ws.onclose = () => {
+        log('连接已关闭', 'sys');
+        document.getElementById('connectBtn').disabled = false;
+        document.getElementById('disconnectBtn').disabled = true;
+        document.getElementById('sendBtn').disabled = true;
+      };
+      ws.onerror = () => log('连接出错', 'sys');
+    }
+
+    function disconnect() { if (ws) ws.close(); }
+
+    function send() {
+      const to = document.getElementById('to').value.trim();
+      const body = document.getElementById('body').value.trim();
+      if (!ws || ws.readyState !== 1) { alert('未连接'); return; }
+      if (!to || !body) { alert('请填写接收方和消息'); return; }
+      // clientMsgId 是幂等键：客户端重连重发时保持同一个值，服务端据此去重
+      const clientMsgId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
+      lastSentTo = to;
+      ws.send(JSON.stringify({ ver: 1, type: 'msg.send', clientMsgId: clientMsgId, to: to, body: body }));
+      log('发送 -> ' + to + ': ' + body, 'sys');
+    }
+  </script>
+</body>
+</html>

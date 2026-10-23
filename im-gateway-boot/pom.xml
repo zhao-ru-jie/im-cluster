@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.github</groupId>
+        <artifactId>im-cluster</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>im-gateway-boot</artifactId>
+    <name>im-gateway-boot</name>
+    <description>长连接服务独立部署入口：只做连接接入，上行全部走 gRPC 到 IM 服务</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.github</groupId>
+            <artifactId>im-gateway</artifactId>
+        </dependency>
+
+        <!-- 上行通道（gRPC 到 im-server） -->
+        <dependency>
+            <groupId>com.github</groupId>
+            <artifactId>im-rpc</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.github</groupId>
+        <artifactId>im-cluster</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>im-server</artifactId>
+    <name>im-server</name>
+    <description>IM 业务服务：消息存储、会话管理、消息路由、业务逻辑处理</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.github</groupId>
+            <artifactId>im-proto</artifactId>
+        </dependency>
+
+        <!-- 客户端历史/会话 REST 接口 + Jackson（下行帧序列化） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <!-- 消息存储 / 会话状态（阶段 1 仍用 Redis 承载，后续替换为 DB） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+        <!-- 对网关暴露 MessageIngress（阶段 2 起由网关远程调用） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-grpc-server</artifactId>
+        </dependency>
+        <!-- grpc.health.v1.Health 的实现（HealthStatusManager）。Spring Boot 的
+             GrpcServerHealthAutoConfiguration 以「classpath 上有它」为生效条件：
+             有它才会把健康服务绑到 gRPC 服务端，网关的健康检查才有东西可订阅。 -->
+        <dependency>
+            <groupId>io.grpc</groupId>
+            <artifactId>grpc-services</artifactId>
+        </dependency>
+
+        <!-- 吞吐指标：IM 服务按消息 QPS 扩容（CPU 只是辅指标） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
+        <!-- 测试：JUnit 5 + Mockito（seq 发号器需要真实 Redis 验证 Lua 的原子性/下界保护） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>

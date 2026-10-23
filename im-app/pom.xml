@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.github</groupId>
+        <artifactId>im-cluster</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>im-app</artifactId>
+    <name>im-app</name>
+    <description>单体装配器：同进程装配长连接服务与 IM 服务；支持 local/grpc/shadow 三档上行通道</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.github</groupId>
+            <artifactId>im-gateway</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.github</groupId>
+            <artifactId>im-server</artifactId>
+        </dependency>
+        <!-- MySQL 版消息存储：im.storage=jdbc 时生效，默认（redis）时既不加载也不建连接池 -->
+        <dependency>
+            <groupId>com.github</groupId>
+            <artifactId>im-storage-jdbc</artifactId>
+        </dependency>
+        <!-- gRPC 客户端适配层：transport=grpc/shadow 时连接独立部署的 im-server -->
+        <dependency>
+            <groupId>com.github</groupId>
+            <artifactId>im-rpc</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- 只有可部署入口才打包成 fat jar；库模块不参与 repackage -->
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

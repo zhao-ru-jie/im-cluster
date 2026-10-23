@@ -1,0 +1,108 @@
+spring:
+  application:
+    name: im-gateway
+  threads:
+    virtual:
+      enabled: true
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:localhost}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+  # 优雅关闭：Tomcat 停止时先让存量请求收尾（真正的连接摘流由 GatewayDrainService 负责）
+  lifecycle:
+    timeout-per-shutdown-phase: 60s
+  grpc:
+    server:
+      port: ${IM_GRPC_PORT:9090}
+      # grpc.health.v1.Health：IM 服务推下行时订阅它，正在摘流/未就绪的网关会被摘出轮询。
+      # 生效前提：classpath 上有 io.grpc:grpc-services（见 im-gateway/pom.xml）。
+      health:
+        enabled: true
+        include-overall-health: true
+        schedule:
+          delay: ${IM_GRPC_HEALTH_DELAY:1s}
+          period: ${IM_GRPC_HEALTH_PERIOD:2s}
+
+server:
+  port: ${SERVER_PORT:8078}
+  shutdown: graceful
+
+# HPA 采集入口：/actuator/prometheus 暴露 gateway_connections_active
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true        # 提供 /actuator/health/readiness|liveness 供 K8s 探针使用
+      show-details: never
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+im:
+  # IM 服务地址（K8s 下填 im-server 的 Service 名，如 http:// 不需要 —— gRPC 用 host:port）
+  server:
+    # 降级地址：Nacos 关闭 / 初始化失败 / 拿不到健康实例时才用它；支持逗号分隔多地址，
+    # 多个地址同样参与 gRPC 的 round_robin 轮询
+    address: ${IM_SERVER_ADDR:127.0.0.1:9091}
+    timeout-ms: ${IM_SERVER_TIMEOUT_MS:300}
+    # 「暂时一个 READY 的 IM 实例都没有」时，排队等到 deadline 再失败，而不是立刻 503。
+    # 网关跑虚拟线程，等待几乎不占平台线程；让客户端少一次 1s+ 的退避重发。
+    wait-for-ready: ${IM_SERVER_WAIT_FOR_READY:true}
+  gateway:
+    # —— 长连接接入（Netty）——
+    # 两个端口并存：ws-port 给浏览器/小程序，tcp-port 给原生客户端（更省流量、可控心跳）
+    # 同一用户先 WS 后 TCP 重连时，旧连接会被新连接踢掉（单用户单连接）
+    transport:
+      ws-enabled: ${IM_WS_ENABLED:true}
+      ws-port: ${IM_WS_PORT:8081}
+      ws-path: ${IM_WS_PATH:/ws}
+      tcp-enabled: ${IM_TCP_ENABLED:true}
+      tcp-port: ${IM_TCP_PORT:9092}
+      # 单帧上限（1MB）：超过即视为异常流量，直接断链
+      max-frame-bytes: ${IM_MAX_FRAME_BYTES:1048576}
+      # TCP 首帧 connect 认证窗口：只建连不发身份的连接会被清掉，避免半开连接堆积
+      tcp-auth-timeout-ms: ${IM_TCP_AUTH_TIMEOUT_MS:10000}
+    drain:
+      # 优雅摘流：注销注册 -> 就绪翻红 -> 广播 session.migrate -> 等待 -> 强制关闭
+      enabled: ${IM_DRAIN_ENABLED:true}
+      # 必须小于 K8s 的 terminationGracePeriodSeconds
+      timeout-ms: ${IM_DRAIN_TIMEOUT_MS:45000}
+      # 建议客户端多久后重连（客户端需再加随机抖动，避免集中重连）
+      retry-after-ms: ${IM_DRAIN_RETRY_AFTER_MS:1500}
+    idle:
+      # 心跳（Netty IdleStateHandler 按连接计时，不再有全局巡检周期）：
+      #   ping-after-ms 内没有任何上行 -> 下发 {"type":"ping"}
+      #   之后 close-after-ms - ping-after-ms 内仍无应答 -> 断开连接并清路由（用户转离线）
+      # 客户端收到 ping 必须回 {"type":"pong"}（WebSocket 协议级 ping 不算，浏览器 JS 发不了）
+      enabled: ${IM_IDLE_ENABLED:true}
+      ping-after-ms: ${IM_IDLE_PING_AFTER_MS:45000}
+      close-after-ms: ${IM_IDLE_CLOSE_AFTER_MS:90000}
+      # 抖动上限：每条连接的 ping 时刻在 [ping-after, ping-after+jitter] 内随机，
+      # 避免「一批同时建立的连接」在同一毫秒集中发心跳（发版后集中重连时最明显）
+      jitter-ms: ${IM_IDLE_JITTER_MS:5000}
+  node:
+    # 实例 ID 自动探测（K8s: POD_IP / POD_NAME），与 gRPC 端口拼成 host:port
+    grpc-port: ${IM_GRPC_PORT:9090}
+    grpc-host: ${IM_GRPC_HOST:}
+    grpc:
+      # 客户端健康检查（本方向是网关 → IM 的上行）：排除「连着但 NOT_SERVING」的 IM 实例
+      # （启动未就绪、正在优雅关闭）。对端若还没实现 grpc.health.v1.Health（老版本），
+      # Watch 返回 UNIMPLEMENTED，gRPC 会保持该实例可用 —— 所以滚动升级没有硬顺序要求。
+      health-check-enabled: ${IM_GRPC_HEALTH_CHECK:true}
+      tls:
+        enabled: ${IM_GRPC_TLS:false}
+        trust-cert: ${IM_GRPC_TRUST:}
+  nacos:
+    enabled: ${IM_NACOS_ENABLED:true}
+    server-addr: ${IM_NACOS_ADDR:127.0.0.1:8848}
+    # 本网关实例注册成什么服务名（IM 服务据此回推下行帧）
+    service-name: ${IM_NACOS_SERVICE_NAME:im-gateway}
+    namespace: ${IM_NACOS_NAMESPACE:}
+    server:
+      # 上行目标：IM 服务在 Nacos 里的服务名。网关订阅它的健康实例并轮询调用，
+      # 这样起几个 im-server 就能分摊几个；订阅不到时回退到上面的 im.server.address。
+      service-name: ${IM_NACOS_SERVER_SERVICE:im-server}

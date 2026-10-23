@@ -18,6 +18,13 @@ spec:
     - name: http
       port: 8080
       targetPort: 8080
+    # Netty 长连接接入（单体装配下由同一个进程提供）
+    - name: ws
+      port: 8081
+      targetPort: 8081
+    - name: tcp
+      port: 9092
+      targetPort: 9092
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -41,6 +48,10 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+            - name: ws
+              containerPort: 8081
+            - name: tcp
+              containerPort: 9092
             - name: grpc
               containerPort: 9090
           env:
@@ -58,6 +69,11 @@ spec:
             # gRPC 端口：同 StatefulSet 内所有 pod 都用 9090（各自独立网络命名空间，不冲突）
             - name: IM_GRPC_PORT
               value: "9090"
+            # Netty 双通道（WS/TCP）与 Tomcat 的 8080 并存
+            - name: IM_WS_PORT
+              value: "8081"
+            - name: IM_TCP_PORT
+              value: "9092"
             # 指向上面的 Redis Service（覆盖 application.yml 里的 localhost）
             - name: SPRING_DATA_REDIS_HOST
               value: "redis"

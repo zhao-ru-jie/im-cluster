@@ -1,0 +1,176 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1490" height="1720" viewBox="0 0 1490 1720">
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#333333"/>
+  </marker>
+</defs>
+<rect x="0" y="0" width="1490" height="1720" fill="#FFFFFF"/>
+<g font-family="'Microsoft YaHei','Segoe UI',Consolas,sans-serif">
+<rect x="71.0" y="43" width="98" height="34" rx="3" fill="#ECECFF" stroke="#9370DB" stroke-width="1.2"/>
+<text x="120" y="65" font-size="13" font-weight="normal" text-anchor="middle" fill="#333333">客户端 a</text>
+<rect x="71.0" y="1681" width="98" height="34" rx="3" fill="#ECECFF" stroke="#9370DB" stroke-width="1.2"/>
+<text x="120" y="1703" font-size="13" font-weight="normal" text-anchor="middle" fill="#333333">客户端 a</text>
+<line x1="120" y1="77" x2="120" y2="1681" stroke="#9E9E9E" stroke-width="1" stroke-dasharray="5 4"/>
+<rect x="322.0" y="43" width="96" height="34" rx="3" fill="#ECECFF" stroke="#9370DB" stroke-width="1.2"/>
+<text x="370" y="65" font-size="13" font-weight="normal" text-anchor="middle" fill="#333333">网关1</text>
+<rect x="322.0" y="1681" width="96" height="34" rx="3" fill="#ECECFF" stroke="#9370DB" stroke-width="1.2"/>
+<text x="370" y="1703" font-size="13" font-weight="normal" text-anchor="middle" fill="#333333">网关1</text>
+<line x1="370" y1="77" x2="370" y2="1681" stroke="#9E9E9E" stroke-width="1" stroke-dasharray="5 4"/>
+<rect x="592.0" y="43" width="96" height="34" rx="3" fill="#ECECFF" stroke="#9370DB" stroke-width="1.2"/>
+<text x="640" y="65" font-size="13" font-weight="normal" text-anchor="middle" fill="#333333">IM 服务</text>
+<rect x="592.0" y="1681" width="96" height="34" rx="3" fill="#ECECFF" stroke="#9370DB" stroke-width="1.2"/>
+<text x="640" y="1703" font-size="13" font-weight="normal" text-anchor="middle" fill="#333333">IM 服务</text>
+<line x1="640" y1="77" x2="640" y2="1681" stroke="#9E9E9E" stroke-width="1" stroke-dasharray="5 4"/>
+<rect x="832.0" y="43" width="96" height="34" rx="3" fill="#ECECFF" stroke="#9370DB" stroke-width="1.2"/>
+<text x="880" y="65" font-size="13" font-weight="normal" text-anchor="middle" fill="#333333">Redis</text>
+<rect x="832.0" y="1681" width="96" height="34" rx="3" fill="#ECECFF" stroke="#9370DB" stroke-width="1.2"/>
+<text x="880" y="1703" font-size="13" font-weight="normal" text-anchor="middle" fill="#333333">Redis</text>
+<line x1="880" y1="77" x2="880" y2="1681" stroke="#9E9E9E" stroke-width="1" stroke-dasharray="5 4"/>
+<rect x="1072.0" y="43" width="96" height="34" rx="3" fill="#ECECFF" stroke="#9370DB" stroke-width="1.2"/>
+<text x="1120" y="65" font-size="13" font-weight="normal" text-anchor="middle" fill="#333333">网关2</text>
+<rect x="1072.0" y="1681" width="96" height="34" rx="3" fill="#ECECFF" stroke="#9370DB" stroke-width="1.2"/>
+<text x="1120" y="1703" font-size="13" font-weight="normal" text-anchor="middle" fill="#333333">网关2</text>
+<line x1="1120" y1="77" x2="1120" y2="1681" stroke="#9E9E9E" stroke-width="1" stroke-dasharray="5 4"/>
+<rect x="1321.0" y="43" width="98" height="34" rx="3" fill="#ECECFF" stroke="#9370DB" stroke-width="1.2"/>
+<text x="1370" y="65" font-size="13" font-weight="normal" text-anchor="middle" fill="#333333">客户端 b</text>
+<rect x="1321.0" y="1681" width="98" height="34" rx="3" fill="#ECECFF" stroke="#9370DB" stroke-width="1.2"/>
+<text x="1370" y="1703" font-size="13" font-weight="normal" text-anchor="middle" fill="#333333">客户端 b</text>
+<line x1="1370" y1="77" x2="1370" y2="1681" stroke="#9E9E9E" stroke-width="1" stroke-dasharray="5 4"/>
+<rect x="310" y="93.0" width="630" height="34" fill="#FFF5AD" stroke="#AAAA33" stroke-width="1"/>
+<text x="625.0" y="107.0" font-size="12" font-weight="normal" text-anchor="middle" fill="#444444">前置：连接建立（b 在 gw2 上同理）</text>
+<line x1="120" y1="168" x2="366" y2="168" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="245.0" y="160" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">WS 握手 / TCP connect 帧</text>
+<circle cx="134" cy="168" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="134" y="171.5" font-size="9" text-anchor="middle" fill="#333333">1</text>
+<path d="M 370 204 L 424 204 L 424 224 L 374 224" fill="none" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="432" y="199" font-size="11.5" font-weight="normal" text-anchor="start" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">ConnectionManager.add(a,</text>
+<text x="432" y="214" font-size="11.5" font-weight="normal" text-anchor="start" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">session)</text>
+<circle cx="384" cy="204" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="384" y="207.5" font-size="9" text-anchor="middle" fill="#333333">2</text>
+<line x1="370" y1="260" x2="876" y2="260" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="625.0" y="237" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">SET im:gw:user:a = gw1（TTL 30s，每 10s</text>
+<text x="625.0" y="252" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">心跳续期）</text>
+<circle cx="384" cy="260" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="384" y="263.5" font-size="9" text-anchor="middle" fill="#333333">3</text>
+<line x1="370" y1="308" x2="636" y2="308" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="505.0" y="300" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">pullPending(userId=a)</text>
+<circle cx="384" cy="308" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="384" y="311.5" font-size="9" text-anchor="middle" fill="#333333">4</text>
+<line x1="640" y1="356" x2="876" y2="356" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="760.0" y="348" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">LRANGE + LTRIM im:offline:a</text>
+<circle cx="654" cy="356" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="654" y="359.5" font-size="9" text-anchor="middle" fill="#333333">5</text>
+<line x1="640" y1="404" x2="374" y2="404" stroke="#333333" stroke-width="1.2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+<text x="505.0" y="396" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">待补发帧</text>
+<circle cx="626" cy="404" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="626" y="407.5" font-size="9" text-anchor="middle" fill="#333333">6</text>
+<line x1="370" y1="452" x2="124" y2="452" stroke="#333333" stroke-width="1.2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+<text x="245.0" y="444" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">逐帧下发</text>
+<circle cx="356" cy="452" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="356" y="455.5" font-size="9" text-anchor="middle" fill="#333333">7</text>
+<rect x="60" y="483.0" width="1370" height="34" fill="#FFF5AD" stroke="#AAAA33" stroke-width="1"/>
+<text x="745.0" y="497.0" font-size="12" font-weight="normal" text-anchor="middle" fill="#444444">发送：a 给 b 发一条消息</text>
+<line x1="120" y1="558" x2="366" y2="558" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="245.0" y="535" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">{"type":"msg.send","to":"b","body":"hi","clien</text>
+<text x="245.0" y="550" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">tMsgId":"c-1"}</text>
+<circle cx="134" cy="558" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="134" y="561.5" font-size="9" text-anchor="middle" fill="#333333">8</text>
+<path d="M 370 594 L 424 594 L 424 614 L 374 614" fill="none" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="432" y="559" font-size="11.5" font-weight="normal" text-anchor="start" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">SessionLifecycle.onFrame →</text>
+<text x="432" y="574" font-size="11.5" font-weight="normal" text-anchor="start" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">submit()　组装</text>
+<text x="432" y="589" font-size="11.5" font-weight="normal" text-anchor="start" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">MessageEnvelope(from=a,</text>
+<text x="432" y="604" font-size="11.5" font-weight="normal" text-anchor="start" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">conv=s:a:b)</text>
+<circle cx="384" cy="594" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="384" y="597.5" font-size="9" text-anchor="middle" fill="#333333">9</text>
+<line x1="370" y1="650" x2="636" y2="650" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="505.0" y="642" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">MessageIngress.submit(req)　[gRPC, 300ms]</text>
+<circle cx="384" cy="650" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="384" y="653.5" font-size="9" text-anchor="middle" fill="#333333">10</text>
+<line x1="640" y1="698" x2="876" y2="698" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="760.0" y="690" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">GET im:idem:a|c-1</text>
+<circle cx="654" cy="698" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="654" y="701.5" font-size="9" text-anchor="middle" fill="#333333">11</text>
+<rect x="58" y="732" width="1374" height="0" fill="none" stroke="#B0B0B0"/>
+<rect x="58" y="732" width="178" height="22" fill="#F5F5F5" stroke="#B0B0B0"/>
+<text x="68" y="748" font-size="11.5" font-weight="normal" text-anchor="start" fill="#333333">幂等命中（客户端重发）</text>
+<line x1="880" y1="776" x2="644" y2="776" stroke="#333333" stroke-width="1.2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+<text x="760.0" y="768" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">"{serverMsgId}|{seq}"</text>
+<circle cx="866" cy="776" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="866" y="779.5" font-size="9" text-anchor="middle" fill="#333333">12</text>
+<line x1="640" y1="824" x2="374" y2="824" stroke="#333333" stroke-width="1.2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+<text x="505.0" y="816" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">code=0, duplicate=true, 原 seq</text>
+<circle cx="626" cy="824" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="626" y="827.5" font-size="9" text-anchor="middle" fill="#333333">13</text>
+<line x1="74" y1="862" x2="1416" y2="862" stroke="#B0B0B0" stroke-dasharray="5 4"/>
+<text x="84" y="878" font-size="11.5" font-weight="normal" text-anchor="start" fill="#333333">首次受理</text>
+<line x1="640" y1="902" x2="876" y2="902" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="760.0" y="894" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">Lua INCR im:seq:s:a:b → seq=7</text>
+<circle cx="654" cy="902" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="654" y="905.5" font-size="9" text-anchor="middle" fill="#333333">14</text>
+<path d="M 640 938 L 694 938 L 694 958 L 644 958" fill="none" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="702" y="948" font-size="11.5" font-weight="normal" text-anchor="start" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">MessageIds.next() → UUIDv7</text>
+<circle cx="654" cy="938" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="654" y="941.5" font-size="9" text-anchor="middle" fill="#333333">15</text>
+<path d="M 640 982 L 694 982 L 694 1002 L 644 1002" fill="none" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="702" y="977" font-size="11.5" font-weight="normal" text-anchor="start" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">ClientFrames.pushFrame(seq=</text>
+<text x="702" y="992" font-size="11.5" font-weight="normal" text-anchor="start" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">7) → frame</text>
+<circle cx="654" cy="982" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="654" y="985.5" font-size="9" text-anchor="middle" fill="#333333">16</text>
+<line x1="640" y1="1038" x2="876" y2="1038" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="760.0" y="1015" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">append(StoredMessage{conv, seq=7, …})　←</text>
+<text x="760.0" y="1030" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">先落库</text>
+<circle cx="654" cy="1038" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="654" y="1041.5" font-size="9" text-anchor="middle" fill="#333333">17</text>
+<line x1="640" y1="1086" x2="876" y2="1086" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="760.0" y="1078" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">SET im:idem:a|c-1 = "msgId|7"（TTL 24h）</text>
+<circle cx="654" cy="1086" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="654" y="1089.5" font-size="9" text-anchor="middle" fill="#333333">18</text>
+<path d="M 640 1122 L 694 1122 L 694 1142 L 644 1142" fill="none" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="702" y="1117" font-size="11.5" font-weight="normal" text-anchor="start" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">MessageRouter.deliver →</text>
+<text x="702" y="1132" font-size="11.5" font-weight="normal" text-anchor="start" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">targets=[b]</text>
+<circle cx="654" cy="1122" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="654" y="1125.5" font-size="9" text-anchor="middle" fill="#333333">19</text>
+<line x1="640" y1="1178" x2="876" y2="1178" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="760.0" y="1170" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">GET im:gw:user:b → gw2</text>
+<circle cx="654" cy="1178" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="654" y="1181.5" font-size="9" text-anchor="middle" fill="#333333">20</text>
+<line x1="640" y1="1226" x2="1116" y2="1226" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="880.0" y="1203" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">DownstreamPush.Push(PushTask{targets:[b],</text>
+<text x="880.0" y="1218" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">frame})　[800ms]</text>
+<circle cx="654" cy="1226" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="654" y="1229.5" font-size="9" text-anchor="middle" fill="#333333">21</text>
+<path d="M 1120 1262 L 1174 1262 L 1174 1282 L 1124 1282" fill="none" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="1182" y="1242" font-size="11.5" font-weight="normal" text-anchor="start" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">LocalSessionPusher →</text>
+<text x="1182" y="1257" font-size="11.5" font-weight="normal" text-anchor="start" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">ConnectionManager.send(b,</text>
+<text x="1182" y="1272" font-size="11.5" font-weight="normal" text-anchor="start" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">frame)</text>
+<circle cx="1134" cy="1262" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="1134" y="1265.5" font-size="9" text-anchor="middle" fill="#333333">22</text>
+<line x1="1120" y1="1318" x2="1366" y2="1318" stroke="#333333" stroke-width="1.2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+<text x="1245.0" y="1310" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">{"type":"msg.push","seq":7,…}</text>
+<circle cx="1134" cy="1318" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="1134" y="1321.5" font-size="9" text-anchor="middle" fill="#333333">23</text>
+<line x1="1120" y1="1366" x2="644" y2="1366" stroke="#333333" stroke-width="1.2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+<text x="880.0" y="1358" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">PushResult(delivered=[b])</text>
+<circle cx="1106" cy="1366" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="1106" y="1369.5" font-size="9" text-anchor="middle" fill="#333333">24</text>
+<rect x="74" y="1400" width="1342" height="0" fill="none" stroke="#B0B0B0"/>
+<rect x="74" y="1400" width="367" height="22" fill="#F5F5F5" stroke="#B0B0B0"/>
+<text x="84" y="1416" font-size="11.5" font-weight="normal" text-anchor="start" fill="#333333">failed_user_ids 非空（b 实际不在线 / gw2 不可达）</text>
+<line x1="640" y1="1444" x2="876" y2="1444" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="760.0" y="1436" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">RPUSH im:offline:b frame</text>
+<circle cx="654" cy="1444" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="654" y="1447.5" font-size="9" text-anchor="middle" fill="#333333">25</text>
+<rect x="74" y="1400" width="1342" height="86" fill="none" stroke="#B0B0B0"/>
+<rect x="58" y="732" width="1374" height="780" fill="none" stroke="#B0B0B0"/>
+<line x1="640" y1="1544" x2="374" y2="1544" stroke="#333333" stroke-width="1.2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+<text x="505.0" y="1521" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">SubmitMessageResponse(code=0, seq=7,</text>
+<text x="505.0" y="1536" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">serverMsgId)</text>
+<circle cx="626" cy="1544" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="626" y="1547.5" font-size="9" text-anchor="middle" fill="#333333">26</text>
+<line x1="370" y1="1592" x2="124" y2="1592" stroke="#333333" stroke-width="1.2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+<text x="245.0" y="1584" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">{"type":"msg.ack","seq":7,"serverMsgId":…}</text>
+<circle cx="356" cy="1592" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
+<text x="356" y="1595.5" font-size="9" text-anchor="middle" fill="#333333">27</text>
+</g>
+</svg>

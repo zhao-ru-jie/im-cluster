@@ -1,0 +1,86 @@
+spring:
+  application:
+    name: im-server
+  threads:
+    virtual:
+      enabled: true
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:localhost}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+  # IM 服务对外暴露的 gRPC：
+  #   im.ingress.v1.MessageIngress -> SubmitMessage / BatchSubmit / PullPending（网关调用）
+  grpc:
+    server:
+      host: 0.0.0.0
+      port: ${IM_GRPC_PORT:9091}
+      # grpc.health.v1.Health：网关的健康检查订阅它，NOT_SERVING 的实例会被摘出 round_robin。
+      # 状态由 Actuator 健康聚合按 schedule.period 刷新（启动未就绪 → NOT_SERVING，就绪 → SERVING）。
+      # 生效前提：classpath 上有 io.grpc:grpc-services（见 im-server/pom.xml）。
+      health:
+        enabled: true
+        include-overall-health: true
+        schedule:
+          # 首次同步不要等默认的 5s：未同步前 HealthStatusManager 默认报 SERVING，
+          # 会把还没就绪的实例算成可用。这里 1s 内就翻成真实状态。
+          delay: ${IM_GRPC_HEALTH_DELAY:1s}
+          period: ${IM_GRPC_HEALTH_PERIOD:2s}
+
+# 独立部署时建议 8088：与网关的 8080 区分，便于同机联调时一眼看出进程角色
+server:
+  port: ${SERVER_PORT:8088}
+
+# 健康探针：优雅停机时 readiness 会转成 REFUSING_TRAFFIC，聚合健康随之变 OUT_OF_SERVICE，
+# 再经 spring.grpc.server.health 的默认映射变成 NOT_SERVING——网关在实例真正退出前就不再给它发消息。
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+
+im:
+  # —— 消息存储形态 ——
+  #   redis（默认）: Redis List，零外部数据库依赖，本地开发/联调
+  #   jdbc         : MySQL（im-storage-jdbc 模块），生产形态；需要配下面 im.db.*
+  storage: ${IM_STORAGE:redis}
+  db:
+    url: ${IM_DB_URL:}
+    username: ${IM_DB_USERNAME:root}
+    password: ${IM_DB_PASSWORD:root}
+    pool-size: ${IM_DB_POOL_SIZE:20}
+    # 首次启动自动建表；生产建议 false，交给 Flyway/Liquibase
+    init-schema: ${IM_DB_INIT_SCHEMA:true}
+  push:
+    # 下发到网关实例的超时：超时即视为失败 -> 落离线，不做无限重试
+    timeout-ms: ${IM_PUSH_TIMEOUT_MS:800}
+    # 下行不等待网关就绪：失败即落离线、客户端上线补发，比占着线程等更划算
+    wait-for-ready: ${IM_PUSH_WAIT_FOR_READY:false}
+  node:
+    # 本实例 gRPC 对外地址：注册到 Nacos 的就是 ip:grpc-port（网关调用的是 gRPC，不是 HTTP）
+    # grpc-host 留空则自动探测（POD_IP -> 本机首个非回环 IPv4 -> 127.0.0.1）
+    grpc-host: ${IM_GRPC_HOST:}
+    grpc-port: ${IM_GRPC_PORT:9091}
+    grpc:
+      # 客户端健康检查（本方向是 IM → 网关的下行推送）：排除「连得上但 NOT_SERVING」的网关，
+      # 典型场景是网关正在优雅摘流（drain）或还没就绪。要求对端已实现 grpc.health.v1.Health。
+      health-check-enabled: ${IM_GRPC_HEALTH_CHECK:true}
+      tls:
+        enabled: ${IM_GRPC_TLS:false}
+        trust-cert: ${IM_GRPC_TRUST:}
+  # —— 注册中心：让网关发现「有哪几个 IM 服务实例」——
+  # 关闭或注册失败时只影响多实例分摊，不影响本实例处理请求（网关会回退到静态 im.server.address）。
+  nacos:
+    enabled: ${IM_NACOS_ENABLED:true}
+    server-addr: ${IM_NACOS_ADDR:127.0.0.1:8848}
+    namespace: ${IM_NACOS_NAMESPACE:}
+    # 注册用的 IP，必须是对端可直连的地址；留空则自动探测
+    # （不能用 spring.grpc.server.host=0.0.0.0，那是监听地址不是可达地址）
+    register-ip: ${IM_NACOS_REGISTER_IP:}
+    server:
+      # 本实例注册成什么服务名；网关按同名订阅
+      service-name: ${IM_NACOS_SERVER_SERVICE:im-server}

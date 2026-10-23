@@ -1,0 +1,118 @@
+spring:
+  application:
+    name: im-app
+  # 开启虚拟线程（JDK 21+）
+  threads:
+    virtual:
+      enabled: true
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:localhost}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+      # password: xxx
+  # gRPC 服务端：同一进程内同时暴露
+  #   im.push.v1.DownstreamPush  （网关侧：供 IM 服务/其它网关实例推送下行帧）
+  #   im.ingress.v1.MessageIngress（IM 侧：供远程网关上行，transport=grpc 的拓扑下由 im-server-boot 承担）
+  # host 固定 0.0.0.0，pod 网络内可达；对外可达地址由 NodeAddressResolver 自动探测。
+  grpc:
+    server:
+      host: 0.0.0.0
+      port: ${IM_GRPC_PORT:9090}
+      # grpc.health.v1.Health：单体形态下同一进程既服务上行又服务下行，健康状态就是进程整体状态。
+      # 生效前提：classpath 上有 io.grpc:grpc-services（im-server / im-gateway 都已声明）。
+      health:
+        enabled: true
+        include-overall-health: true
+        schedule:
+          delay: ${IM_GRPC_HEALTH_DELAY:1s}
+          period: ${IM_GRPC_HEALTH_PERIOD:2s}
+
+server:
+  port: ${SERVER_PORT:8080}
+
+# 单体装配下也暴露网关指标，便于阶段 2 的切流前对比（生产以 im-gateway-boot 为准）
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+im:
+  # —— 消息存储形态 ——
+  #   redis（默认）: Redis List，零外部数据库依赖，本地开发/联调
+  #   jdbc         : MySQL（im-storage-jdbc 模块），生产形态；需要配下面 im.db.*
+  storage: ${IM_STORAGE:redis}
+  db:
+    # 仅 im.storage=jdbc 时才读取；留空且使用 redis 时不会创建任何连接池
+    url: ${IM_DB_URL:}
+    username: ${IM_DB_USERNAME:root}
+    password: ${IM_DB_PASSWORD:}
+    pool-size: ${IM_DB_POOL_SIZE:20}
+    # 首次启动自动建表；生产建议 false，交给 Flyway/Liquibase
+    init-schema: ${IM_DB_INIT_SCHEMA:true}
+  # —— 会话内序号（见 SeqAllocator）——
+  # 每条消息一次 Redis 原子 INCR（Lua），返回值即所有实例共同认可的会话内顺序，无可调参数。
+  # 发号下界取「已落库的最大 seq / 客户端水位 / 本进程已知」三者最大值，
+  # 所以 Redis 里的计数器被清空也不会回绕。DB 下界每 100 条校准一次（写在 SeqAllocator 里）。
+  # —— 上行通道三档（灰度上线用）——
+  #   local : 本地直调 IM 服务，行为与拆分前完全一致（默认）
+  #   grpc  : 走 gRPC 调独立部署的 im-server（阶段 2 切流）
+  #   shadow: 本地为准 + 远程异步双跑比对（切流前验证等价性，观测见 GET /shadow/stats）
+  ingress:
+    transport: ${IM_INGRESS_TRANSPORT:local}
+  # IM 服务地址（网关侧使用；K8s 下填 im-server 的 Service 名或 ClusterIP）
+  server:
+    address: ${IM_SERVER_ADDR:127.0.0.1:9091}
+    timeout-ms: ${IM_SERVER_TIMEOUT_MS:300}
+    # 仅 ingress.transport=grpc/shadow 时生效：没有 READY 实例时排队等而不是立刻失败
+    wait-for-ready: ${IM_SERVER_WAIT_FOR_READY:true}
+  shadow:
+    # 双跑采样率，1.0 = 全量；生产建议 0.01 ~ 0.1
+    sample-rate: ${IM_SHADOW_SAMPLE_RATE:1.0}
+  gateway:
+    # —— 长连接接入（Netty，WebSocket 与原生 TCP 双通道并存）——
+    # 注意：这两套端口由 Netty 自己监听，与上面 Tomcat 的 server.port 相互独立；
+    # 测试页面 index.html 默认连 ws-port，原生客户端连 tcp-port。
+    transport:
+      ws-enabled: ${IM_WS_ENABLED:true}
+      ws-port: ${IM_WS_PORT:8081}
+      ws-path: ${IM_WS_PATH:/ws}
+      tcp-enabled: ${IM_TCP_ENABLED:true}
+      tcp-port: ${IM_TCP_PORT:9092}
+      max-frame-bytes: ${IM_MAX_FRAME_BYTES:1048576}
+      tcp-auth-timeout-ms: ${IM_TCP_AUTH_TIMEOUT_MS:10000}
+    idle:
+      # 心跳（Netty IdleStateHandler 按连接计时）：
+      #   ping-after-ms 内无任何上行 -> 发 {"type":"ping"}；再等 close-after - ping-after 仍无应答 -> 断开
+      enabled: ${IM_IDLE_ENABLED:true}
+      ping-after-ms: ${IM_IDLE_PING_AFTER_MS:45000}
+      close-after-ms: ${IM_IDLE_CLOSE_AFTER_MS:90000}
+      # 抖动上限：每条连接的 ping 时刻随机落在 [ping-after, ping-after+jitter]，
+      # 避免集中重连后心跳同时爆发
+      jitter-ms: ${IM_IDLE_JITTER_MS:5000}
+  node:
+    # 网关实例 ID 不需要手动指定：自动 = 探测到的可达地址:grpc-port
+    # 探测优先级见 NodeAddressResolver：IM_GRPC_HOST -> K8s POD_IP -> POD_NAME -> 本机非回环 IP -> 127.0.0.1
+    grpc-port: ${IM_GRPC_PORT:9090}
+    grpc-host: ${IM_GRPC_HOST:}
+    grpc:
+      # 客户端健康检查：transport=grpc/shadow 时连远程 IM 服务，排除 NOT_SERVING 的实例
+      health-check-enabled: ${IM_GRPC_HEALTH_CHECK:true}
+      tls:
+        enabled: ${IM_GRPC_TLS:false}
+        trust-cert: ${IM_GRPC_TRUST:}
+  # —— Nacos-Client 网关实例发现（可选，默认关闭）——
+  # 只负责「网关实例 ID -> 实时可达 ip:port」；per-user 路由仍由 Redis(im:gw:user:{userId}) 持有。
+  # 关闭或不可用时，跨实例推送直接按实例 ID(host:port) dial，行为不变。
+  nacos:
+    enabled: ${IM_NACOS_ENABLED:false}
+    server-addr: ${IM_NACOS_ADDR:127.0.0.1:8848}
+    service-name: ${IM_NACOS_SERVICE_NAME:im-gateway}
+    namespace: ${IM_NACOS_NAMESPACE:}

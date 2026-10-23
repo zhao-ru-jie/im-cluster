@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.github</groupId>
+        <artifactId>im-cluster</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>im-server-boot</artifactId>
+    <name>im-server-boot</name>
+    <description>IM 服务独立部署入口：只承载业务与存储，不含任何 WebSocket 接入</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.github</groupId>
+            <artifactId>im-server</artifactId>
+        </dependency>
+
+        <!-- MySQL 版消息存储：im.storage=jdbc 时生效，默认（redis）时既不加载也不建连接池 -->
+        <dependency>
+            <groupId>com.github</groupId>
+            <artifactId>im-storage-jdbc</artifactId>
+        </dependency>
+
+        <!-- 下行推送通道（gRPC 到各网关实例） -->
+        <dependency>
+            <groupId>com.github</groupId>
+            <artifactId>im-rpc</artifactId>
+        </dependency>
+
+        <!-- Nacos-Client：把本实例的 gRPC 地址注册进去，供网关做上行负载分摊 -->
+        <dependency>
+            <groupId>com.alibaba.nacos</groupId>
+            <artifactId>nacos-client</artifactId>
+            <version>3.2.4</version>
+        </dependency>
+
+        <!-- 测试：健康检查端点的端到端验证需要起真实上下文（含 gRPC 服务端） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
