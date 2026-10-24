@@ -72,6 +72,9 @@ im:
   #   shadow: 本地为准 + 远程异步双跑比对（切流前验证等价性，观测见 GET /shadow/stats）
   ingress:
     transport: ${IM_INGRESS_TRANSPORT:local}
+  delivery:
+    # 单体形态同样「ack 先行 + 异步推送」：并发打满时退化成同步推送
+    max-inflight: ${IM_DELIVERY_MAX_INFLIGHT:1024}
   # IM 服务地址（网关侧使用；K8s 下填 im-server 的 Service 名或 ClusterIP）
   server:
     address: ${IM_SERVER_ADDR:127.0.0.1:9091}

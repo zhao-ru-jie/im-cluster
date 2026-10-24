@@ -9,6 +9,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 /**
  * 把「同一连接上的一串任务」串行化，但执行线程是虚拟线程而不是 Netty event loop。
@@ -59,6 +60,8 @@ public final class SerialExecutor {
 
     private volatile Runnable onPause = () -> { };
     private volatile Runnable onResume = () -> { };
+    /** 暂停/恢复的状态通知（供指标统计用），与 onPause/onResume 是两回事：后者操作 Channel */
+    private volatile Consumer<Boolean> onStateChange = paused -> { };
 
     SerialExecutor(String name, Executor delegate, int maxPending) {
         this.name = name;
@@ -77,6 +80,16 @@ public final class SerialExecutor {
     public void onBackpressure(Runnable onPause, Runnable onResume) {
         this.onPause = onPause == null ? () -> { } : onPause;
         this.onResume = onResume == null ? () -> { } : onResume;
+    }
+
+    /**
+     * 注册状态变化监听：{@code true} = 刚进入暂停，{@code false} = 刚从暂停恢复。
+     *
+     * <p>与 {@link #onBackpressure} 分开是为了让指标统计与 Channel 操作互不干扰：
+     * 前者由 {@code BusinessDispatcher} 统一安装，后者由每个连接的 handler 安装。
+     */
+    public void onStateChange(Consumer<Boolean> listener) {
+        this.onStateChange = listener == null ? paused -> { } : listener;
     }
 
     /**
@@ -165,6 +178,12 @@ public final class SerialExecutor {
             hook.run();
         } catch (RuntimeException e) {
             log.warn("[biz] {} {} 钩子执行异常: {}", name, action, e.getMessage());
+        }
+        // 指标统计放最后且单独 try：它出错绝不能连累 setAutoRead
+        try {
+            onStateChange.accept("pause".equals(action));
+        } catch (RuntimeException e) {
+            log.debug("[biz] {} 状态监听异常: {}", name, e.getMessage());
         }
     }
 

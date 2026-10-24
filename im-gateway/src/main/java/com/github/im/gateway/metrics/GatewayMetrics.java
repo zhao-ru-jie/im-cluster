@@ -8,6 +8,8 @@ import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
 /**
  * 长连接服务的扩容指标。
  *
@@ -28,6 +30,11 @@ import org.springframework.stereotype.Component;
  *       上行 gRPC 调用失败次数，按操作（submit / pull）和 gRPC 状态码拆分。
  *       排障时它能直接区分「连不上」（{@code UNAVAILABLE}）和「建连慢/服务端慢」
  *       （{@code DEADLINE_EXCEEDED}），比翻业务日志里那一行 warn 快得多。</li>
+ *   <li>{@code gateway_biz_backpressure_paused_active}（Gauge）+
+ *       {@code _paused_total} / {@code _resumed_total}（Counter）——
+ *       <b>上行背压</b>状态：当前有多少条连接因为处理不过来而暂停了读取，
+ *       以及累计暂停/恢复次数。持续有值说明下游（Redis/DB/IM 服务）跟不上，
+ *       是「该扩容还是该查下游」的第一手判断依据。</li>
  * </ul>
  *
  * <p>没有 {@link MeterRegistry}（未启用 actuator/metrics）时自动降级为空实现，不影响网关功能。
@@ -43,6 +50,16 @@ public class GatewayMetrics {
     private final Counter closed;
     private final Counter migrated;
     private final Counter idleClosed;
+    private final Counter bizPaused;
+    private final Counter bizResumed;
+
+    /**
+     * 当前处于「暂停读取」状态的连接数。
+     *
+     * <p>不依赖 MeterRegistry 也存在：{@code /admin/status} 直接读它，
+     * 这样即使没开 Prometheus 也能在本地看到背压有没有发生。
+     */
+    private final AtomicInteger bizPausedActive = new AtomicInteger();
 
     public GatewayMetrics(ObjectProvider<MeterRegistry> registryProvider, ConnectionManager connectionManager) {
         MeterRegistry registry = registryProvider.getIfAvailable();
@@ -52,6 +69,8 @@ public class GatewayMetrics {
             this.closed = null;
             this.migrated = null;
             this.idleClosed = null;
+            this.bizPaused = null;
+            this.bizResumed = null;
             return;
         }
         Gauge.builder("gateway.connections.active", connectionManager, ConnectionManager::connectionCount)
@@ -69,6 +88,13 @@ public class GatewayMetrics {
         this.closed = Counter.builder("gateway.sessions.closed").description("累计关闭连接数").register(registry);
         this.migrated = Counter.builder("gateway.sessions.migrated").description("摘流期间被主动迁移的连接数").register(registry);
         this.idleClosed = Counter.builder("gateway.sessions.idle.closed").description("心跳超时被清理的连接数").register(registry);
+        Gauge.builder("gateway.biz.backpressure.paused.active", bizPausedActive, AtomicInteger::get)
+                .description("当前因上行积压而暂停读取的连接数")
+                .register(registry);
+        this.bizPaused = Counter.builder("gateway.biz.backpressure.paused")
+                .description("累计触发上行背压（暂停读取）的次数").register(registry);
+        this.bizResumed = Counter.builder("gateway.biz.backpressure.resumed")
+                .description("累计从上行背压恢复（恢复读取）的次数").register(registry);
     }
 
     /**
@@ -110,6 +136,27 @@ public class GatewayMetrics {
         if (idleClosed != null) {
             idleClosed.increment(count);
         }
+    }
+
+    /** 某条连接进入「暂停读取」（上行积压超过高水位） */
+    public void bizBackpressurePaused() {
+        bizPausedActive.incrementAndGet();
+        if (bizPaused != null) {
+            bizPaused.increment();
+        }
+    }
+
+    /** 某条连接从背压恢复；用 max(0) 兜住，避免计数方法的调用顺序异常导致负数 */
+    public void bizBackpressureResumed() {
+        bizPausedActive.updateAndGet(active -> active > 0 ? active - 1 : 0);
+        if (bizResumed != null) {
+            bizResumed.increment();
+        }
+    }
+
+    /** 当前暂停读取的连接数（{@code /admin/status} 直接展示） */
+    public int bizBackpressurePausedActive() {
+        return bizPausedActive.get();
     }
 
     /**

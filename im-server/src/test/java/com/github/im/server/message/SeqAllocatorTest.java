@@ -1,5 +1,6 @@
 package com.github.im.server.message;
 
+import com.github.im.contract.RedisKeys;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -19,6 +20,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
@@ -39,19 +41,23 @@ import static org.mockito.Mockito.when;
 class SeqAllocatorTest {
 
     private final List<String> created = new ArrayList<>();
+    /** 只删本用例写的幂等键，不碰其它数据 */
+    private final List<String> createdIdemKeys = new ArrayList<>();
 
     @AfterEach
     void deleteOnlyOwnKeys() {
-        if (created.isEmpty()) {
+        if (created.isEmpty() && createdIdemKeys.isEmpty()) {
             return;
         }
         try {
             StringRedisTemplate redis = TestRedis.template();
             created.forEach(conversationId -> redis.delete(TestRedis.seqKey(conversationId)));
+            createdIdemKeys.forEach(redis::delete);
         } catch (RuntimeException ignored) {
             // Redis 不可用时用例本身已被标记 skipped，清理失败不该把 skip 变成 failure
         } finally {
             created.clear();
+            createdIdemKeys.clear();
         }
     }
 
@@ -201,12 +207,54 @@ class SeqAllocatorTest {
         assertTrue(queries <= 10, "DB 下界查询没有被摊薄，500 条查了 " + queries + " 次");
     }
 
+    @Test
+    @DisplayName("合并脚本：幂等命中直接回放旧值，且不推进 seq 计数器")
+    void allocateReplaysIdempotentKeyWithoutConsumingSeq() {
+        String conversationId = conversation();
+        String idemKey = idemKeyOf(conversationId);
+        SeqAllocator allocator = allocator(storageFixed(0L), new ClientWatermarkStore());
+
+        SeqAllocator.Allocation first = allocator.allocate(idemKey, conversationId);
+        assertFalse(first.duplicate(), "首次受理不应命中幂等");
+        assertEquals(1L, first.seq());
+
+        // 模拟「落库成功之后」才写入的幂等记录（{serverMsgId}|{seq}）
+        redis().opsForValue().set(idemKey, "msg-1|" + first.seq());
+
+        SeqAllocator.Allocation second = allocator.allocate(idemKey, conversationId);
+        assertTrue(second.duplicate(), "同一个 clientMsgId 必须命中幂等");
+        assertEquals("msg-1|1", second.idemValue());
+        assertEquals("1", redis().opsForValue().get(TestRedis.seqKey(conversationId)),
+                "重复消息不能推进 seq 计数器（分开写时这里会白白 +1）");
+    }
+
+    @Test
+    @DisplayName("合并脚本：计数器不存在时走冷启动，用已落库最大 seq 作起点")
+    void allocateColdStartUsesStorageFloor() {
+        String conversationId = conversation();
+        String idemKey = idemKeyOf(conversationId);
+        SeqAllocator allocator = allocator(storageFixed(100L), new ClientWatermarkStore());
+
+        SeqAllocator.Allocation allocation = allocator.allocate(idemKey, conversationId);
+
+        assertFalse(allocation.duplicate());
+        assertEquals(101L, allocation.seq());
+        assertEquals("101", redis().opsForValue().get(TestRedis.seqKey(conversationId)));
+    }
+
     // ==== 辅助 ====
 
     private String conversation() {
         String conversationId = TestRedis.conversationId();
         created.add(conversationId);
         return conversationId;
+    }
+
+    /** 幂等键必须逐用例唯一，否则会读到别的用例/线上残留的记录 */
+    private String idemKeyOf(String conversationId) {
+        String idemKey = RedisKeys.IDEM_PREFIX + "test-" + conversationId;
+        createdIdemKeys.add(idemKey);
+        return idemKey;
     }
 
     private static StringRedisTemplate redis() {

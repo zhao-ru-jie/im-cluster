@@ -23,10 +23,11 @@ import java.util.UUID;
  *
  * <p>处理顺序严格遵守「<b>先落库、后推送</b>」：
  * <ol>
- *   <li>幂等判定：{@code (from, clientMsgId)} 命中直接回放上次结果（seq + serverMsgId），不重复落库；</li>
- *   <li>分配会话内 seq（{@link SeqAllocator} 逐条 Redis 原子递增，保序的唯一依据）；</li>
+ *   <li>幂等判定 + 发号：<b>一次 Redis 往返</b>同时完成（{@link SeqAllocator#allocate}），命中就直接回放
+ *       上次结果（seq + serverMsgId），既不重复落库、也不白耗一个 seq；</li>
  *   <li>生成服务端消息 ID（{@link MessageIds}，UUIDv7，与 seq <b>解耦</b>）；</li>
  *   <li>写消息存储（write-ahead，经 {@link MessageRepository} 落结构化记录，失败即整体失败）；</li>
+ *   <li>写幂等记录——<b>必须在落库之后</b>，否则落库失败时客户端重试会命中一个实际不存在的 seq；</li>
  *   <li>通过 {@code PushPort} 尽力推送，失败的 userId 落离线队列。</li>
  * </ol>
  * 因此「推送失败」只影响实时性，不会丢消息；客户端上线后按 seq 拉齐。
@@ -59,7 +60,7 @@ public class MessageService implements MessageIngress {
     private final MessageRepository messageRepository;
     private final OfflineMessageStore offlineMessageStore;
     private final ClientFrames frames;
-    private final MessageRouter router;
+    private final DeliveryDispatcher delivery;
     private final SeqAllocator seqAllocator;
     private final ClientWatermarkStore watermarkStore;
 
@@ -67,14 +68,14 @@ public class MessageService implements MessageIngress {
                           MessageRepository messageRepository,
                           OfflineMessageStore offlineMessageStore,
                           ClientFrames frames,
-                          MessageRouter router,
+                          DeliveryDispatcher delivery,
                           SeqAllocator seqAllocator,
                           ClientWatermarkStore watermarkStore) {
         this.redis = redis;
         this.messageRepository = messageRepository;
         this.offlineMessageStore = offlineMessageStore;
         this.frames = frames;
-        this.router = router;
+        this.delivery = delivery;
         this.seqAllocator = seqAllocator;
         this.watermarkStore = watermarkStore;
     }
@@ -95,16 +96,18 @@ public class MessageService implements MessageIngress {
 
         try {
             String idemKey = RedisKeys.IDEM_PREFIX + envelope.idempotencyKey();
-            String cached = redis.opsForValue().get(idemKey);
-            if (cached != null) {
-                IdempotentHit hit = IdempotentHit.parse(envelope.conversationId(), cached);
+            // 幂等判定与发号合成一次 Redis 往返（见 SeqAllocator.allocate）：
+            // 重复消息连 seq 都不会白耗一个，新消息则省掉一次 GET。
+            SeqAllocator.Allocation allocation = seqAllocator.allocate(idemKey, envelope.conversationId());
+            if (allocation.duplicate()) {
+                IdempotentHit hit = IdempotentHit.parse(envelope.conversationId(), allocation.idemValue());
                 log.debug("duplicate message {} -> seq {}", envelope.idempotencyKey(), hit.seq());
                 return response(envelope, hit.serverMsgId(), hit.seq(), receivedAt, true);
             }
 
             // 只算一次：客户端没带 traceId 时这里会生成，多算一次就会「日志一个 ID、推送另一个 ID」
             String traceId = traceId(request);
-            long seq = seqAllocator.next(envelope.conversationId());
+            long seq = allocation.seq();
             String serverMsgId = MessageIds.next();
             String frame = frames.pushFrame(envelope, serverMsgId, seq, receivedAt);
 
@@ -116,13 +119,12 @@ public class MessageService implements MessageIngress {
                     envelope.clientMsgId(), envelope.body(), receivedAt));
             redis.opsForValue().set(idemKey, serverMsgId + IDEM_SEP + seq, IDEM_TTL);
 
-            List<String> failed = router.deliver(envelope, frame, traceId);
-            for (String userId : failed) {
-                offlineMessageStore.store(userId, frame);
-            }
-            log.info("message accepted: traceId={} conv={} seq={} msgId={} from={} to={} offline={}",
+            // ack 先行：落库 + 幂等记录都已完成就算受理成功，推送交给 DeliveryDispatcher 异步做。
+            // 推送失败仍由它落离线队列，所以「先 ack」不丢消息，只是让 ack 不再等最慢的接收者。
+            delivery.dispatch(envelope, frame, traceId, seq);
+            log.info("message accepted: traceId={} conv={} seq={} msgId={} from={} to={}",
                     traceId, envelope.conversationId(), seq, serverMsgId,
-                    envelope.from(), envelope.to(), failed.size());
+                    envelope.from(), envelope.to());
             return response(envelope, serverMsgId, seq, receivedAt, false);
         } catch (RuntimeException e) {
             // 竞态下的重复插入由唯一索引兜底（生产环境），这里按可重试返回

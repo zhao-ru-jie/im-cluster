@@ -88,7 +88,9 @@ class SerialExecutorTest {
         AtomicInteger paused = new AtomicInteger();
         AtomicInteger resumed = new AtomicInteger();
         AtomicInteger ran = new AtomicInteger();
+        AtomicInteger stateEvents = new AtomicInteger();
         serial.onBackpressure(paused::incrementAndGet, resumed::incrementAndGet);
+        serial.onStateChange(ignored -> stateEvents.incrementAndGet());
 
         for (int i = 0; i < 5; i++) {
             serial.offer(ran::incrementAndGet);
@@ -100,6 +102,7 @@ class SerialExecutorTest {
         holding.runAll();
         assertEquals(5, ran.get(), "背压是暂停读，不是丢帧：已入队的 5 帧都必须执行");
         assertEquals(1, resumed.get(), "消化到低水位后应恢复一次");
+        assertEquals(2, stateEvents.get(), "指标监听应该看到一次暂停 + 一次恢复");
         assertFalse(serial.isPaused());
     }
 

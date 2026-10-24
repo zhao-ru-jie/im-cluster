@@ -55,11 +55,18 @@ im:
     pool-size: ${IM_DB_POOL_SIZE:20}
     # 首次启动自动建表；生产建议 false，交给 Flyway/Liquibase
     init-schema: ${IM_DB_INIT_SCHEMA:true}
+    # group commit：并发到达的插入合并成一个事务提交，把每条一次的 fsync 摊薄成 1/N。
+    # 只在「已经有消息在排队」时合批，所以稀疏写入没有额外延迟；关掉可对照压测。
+    batch-enabled: ${IM_DB_BATCH_ENABLED:true}
   push:
     # 下发到网关实例的超时：超时即视为失败 -> 落离线，不做无限重试
     timeout-ms: ${IM_PUSH_TIMEOUT_MS:800}
     # 下行不等待网关就绪：失败即落离线、客户端上线补发，比占着线程等更划算
     wait-for-ready: ${IM_PUSH_WAIT_FOR_READY:false}
+  delivery:
+    # 下行推送与 ack 解耦：落库成功后立刻回 ack，推送在虚拟线程池里异步完成。
+    # 并发打满时退化成同步推送（宁可 ack 慢几十毫秒，也不让推送任务把堆内存堆穿）。
+    max-inflight: ${IM_DELIVERY_MAX_INFLIGHT:1024}
   node:
     # 本实例 gRPC 对外地址：注册到 Nacos 的就是 ip:grpc-port（网关调用的是 gRPC，不是 HTTP）
     # grpc-host 留空则自动探测（POD_IP -> 本机首个非回环 IPv4 -> 127.0.0.1）

@@ -31,6 +31,7 @@ import javax.sql.DataSource;
  * im.db.password=***
  * im.db.pool-size=20
  * im.db.init-schema=true    # 首次建表用；生产建议关掉，交给 Flyway/Liquibase
+ * im.db.batch-enabled=true  # group commit：把并发到达的插入合并成一个事务（默认开）
  * </pre>
  *
  * <p>本类同时提供两个存储端口的 MySQL 实现：{@code MessageRepository}（im_message）与
@@ -68,16 +69,17 @@ public class JdbcStorageConfig {
         return new JdbcTemplate(dataSource);
     }
 
-    @Bean
+    @Bean(destroyMethod = "close")
     public MessageRepository messageRepository(JdbcTemplate imJdbcTemplate,
                                                DataSource dataSource,
-                                               @Value("${im.db.init-schema:true}") boolean initSchema) {
+                                               @Value("${im.db.init-schema:true}") boolean initSchema,
+                                               @Value("${im.db.batch-enabled:true}") boolean batchEnabled) {
         if (initSchema) {
             ResourceDatabasePopulator populator = new ResourceDatabasePopulator(new ClassPathResource("db/schema.sql"));
             populator.execute(dataSource);
             log.info("[storage] 已执行 db/schema.sql（im.db.init-schema=false 可关闭）");
         }
-        return new JdbcMessageRepository(imJdbcTemplate);
+        return new JdbcMessageRepository(imJdbcTemplate, batchEnabled);
     }
 
     @Bean

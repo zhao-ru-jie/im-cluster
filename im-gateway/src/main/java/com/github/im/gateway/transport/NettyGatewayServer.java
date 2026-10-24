@@ -22,6 +22,7 @@ import io.netty.handler.codec.http.HttpServerCodec;
 import io.netty.handler.codec.http.websocketx.WebSocketServerProtocolHandler;
 import io.netty.handler.codec.string.StringDecoder;
 import io.netty.handler.codec.string.StringEncoder;
+import io.netty.handler.flush.FlushConsolidationHandler;
 import io.netty.handler.timeout.IdleStateHandler;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -84,6 +85,15 @@ public class NettyGatewayServer {
 
     /** ping 之后至少要等的关闭判定窗口，避免 close-after ≤ ping-after 配错时立刻掐连接 */
     private static final long MIN_CLOSE_DELAY_MS = 1_000L;
+
+    /**
+     * flush 合并阈值：同一次写循环里累计这么多次 flush 请求才真正落一次系统调用。
+     *
+     * <p>为什么需要：一条群消息要推给成百上千个连接，每个 {@code writeAndFlush} 都是一次
+     * epoll/kqueue 唤醒；合并后系统调用数大幅下降，event loop 的 CPU 时间更多留给编解码。
+     * 256 是 Netty 示例与压测里常见的折中值：太小收益不明显，太大让小流量场景多等一会。
+     */
+    private static final int FLUSH_CONSOLIDATE_EVERY = 256;
 
     /**
      * 常见中间设备的空闲超时下限（云 LB / Nginx 的 {@code proxy_read_timeout} 默认 60s 最常见）。
@@ -180,7 +190,7 @@ public class NettyGatewayServer {
         }
 
         if (wsEnabled) {
-            serverChannels.add(bind("websocket", wsPort, wsInitializer()));
+            serverChannels.add(bind("websocket", wsPort, websocketInitializer()));
         }
         if (tcpEnabled) {
             serverChannels.add(bind("tcp", tcpPort, tcpInitializer()));
@@ -289,13 +299,18 @@ public class NettyGatewayServer {
         pipeline.addLast(prefix + "-heartbeat", new HeartbeatHandler(frames, metrics, timing.closeDelayMs()));
     }
 
-    private ChannelInitializer<SocketChannel> wsInitializer() {
+    private ChannelInitializer<SocketChannel> websocketInitializer() {
         return new ChannelInitializer<>() {
             @Override
             protected void initChannel(SocketChannel ch) {
                 // 每条连接单独抽一次抖动值：这样一批同时建立的连接不会在同一毫秒发 ping
                 HeartbeatTiming heartbeat = heartbeatEnabled ? heartbeatTiming() : null;
                 ChannelPipeline pipeline = ch.pipeline();
+                // flush 合并放在最靠 head 的位置（出站方向最后经过它）：同一次写循环里的多次
+                // writeAndFlush 会合并成一次系统调用。consolidateWhenNoReadInProgress=true 保证
+                // 「没有读在进行」时立刻 flush，不引入额外延迟。
+                pipeline.addLast("ws-flush-consolidate",
+                        new FlushConsolidationHandler(FLUSH_CONSOLIDATE_EVERY, true));
                 pipeline.addLast("http-codec", new HttpServerCodec());
                 pipeline.addLast("http-aggregator", new HttpObjectAggregator(MAX_HTTP_HANDSHAKE_BYTES));
                 // 必须在协议处理器之前：握手一旦完成就没法再回 503/400 了
@@ -320,11 +335,19 @@ public class NettyGatewayServer {
             protected void initChannel(SocketChannel ch) {
                 HeartbeatTiming heartbeat = heartbeatEnabled ? heartbeatTiming() : null;
                 ChannelPipeline pipeline = ch.pipeline();
-                // 放在最前：按原始字节判定活跃，客户端发半帧也会重置空闲计时（不会误踢慢连接）
+                // 与 WS 同理：flush 合并最靠 head（纯出站行为，不影响入站解码顺序）
+                pipeline.addLast("tcp-flush-consolidate",
+                        new FlushConsolidationHandler(FLUSH_CONSOLIDATE_EVERY, true));
+                // 放在最前：按原始字节判定活跃，客户端发半帧也会重置空闲计数（不会误踢慢连接）
                 addIdleTimer(pipeline, "tcp", heartbeat);
                 // 帧格式：4 字节大端长度 + UTF-8 JSON；解码后首尾同一条 String 管线，避免粘包
                 pipeline.addLast("tcp-frame-decoder",
-                        new LengthFieldBasedFrameDecoder(maxFrameBytes, 0, 4, 0, 4));
+                        new LengthFieldBasedFrameDecoder(
+                                maxFrameBytes,
+                                0,
+                                4,
+                                0,
+                                4));
                 pipeline.addLast("tcp-frame-prepender", new LengthFieldPrepender(4));
                 pipeline.addLast("tcp-string-decoder", new StringDecoder(StandardCharsets.UTF_8));
                 pipeline.addLast("tcp-string-encoder", new StringEncoder(StandardCharsets.UTF_8));

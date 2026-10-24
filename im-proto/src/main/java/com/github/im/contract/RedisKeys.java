@@ -38,7 +38,11 @@ public final class RedisKeys {
      * {@code im_message} / 会话消息里的最大 seq（见 {@code SeqAllocator}）。
      */
     public static final String SEQ_PREFIX = "im:seq:";
-    /** 幂等表：{from}|{clientMsgId} -> seq */
+    /**
+     * 幂等表：{@code {from}|{clientMsgId} -> "{serverMsgId}|{seq}"}（24h TTL）。
+     *
+     * <p>写入时机是<b>落库成功之后</b>；读取则与 seq 发号合并在同一个 Lua 里（见 {@code SeqAllocator}）。
+     */
     public static final String IDEM_PREFIX = "im:idem:";
     /** 群成员集合（Set），im.storage=redis 时的群成员存储 */
     public static final String GROUP_MEMBERS_PREFIX = "im:group:members:";

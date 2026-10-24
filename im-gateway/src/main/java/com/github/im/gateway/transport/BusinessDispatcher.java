@@ -1,5 +1,6 @@
 package com.github.im.gateway.transport;
 
+import com.github.im.gateway.metrics.GatewayMetrics;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -8,6 +9,7 @@ import org.springframework.stereotype.Component;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 上行业务的执行器：虚拟线程池 + 每连接一个 {@link SerialExecutor}。
@@ -23,7 +25,8 @@ import java.util.concurrent.Executors;
  * 所以同一连接永远只有一个虚拟线程在干活。
  *
  * <p><b>生命周期</b>{@code NettyGatewayServer} 依赖本 Bean，Spring 会先销毁它、
- * 再销毁本 Bean，因此 {@code channelInactive} 触发的清理任务仍能正常执行。
+ * 再销毁本 Bean，因此 {@code channelInactive} 触发的清理任务仍能正常执行；
+ * 关闭时会短暂等待这些任务跑完，避免 Redis 路由残留（虽有 TTL 兜底，但没必要留着）。
  *
  * @author zhaorujie
  * @since 1.0.0
@@ -33,7 +36,11 @@ public class BusinessDispatcher {
 
     private static final Logger log = LoggerFactory.getLogger(BusinessDispatcher.class);
 
+    /** 关闭时等待清理任务的最长时间：这段时间内每条连接的 onClose 要跑完 Redis SREM */
+    private static final long SHUTDOWN_WAIT_SECONDS = 2L;
+
     private final ExecutorService virtualThreads = Executors.newVirtualThreadPerTaskExecutor();
+    private final GatewayMetrics metrics;
 
     /**
      * 单连接积压的<b>高水位</b>：超过它就暂停从该连接读取（真背压），降到一半自动恢复。
@@ -43,21 +50,44 @@ public class BusinessDispatcher {
      */
     private final int maxPendingFrames;
 
-    public BusinessDispatcher(@Value("${im.gateway.biz.max-pending-frames:1024}") int maxPendingFrames) {
+    public BusinessDispatcher(@Value("${im.gateway.biz.max-pending-frames:1024}") int maxPendingFrames,
+                              GatewayMetrics metrics) {
         // 至少 1：配成 0 会让「积压 1 帧就暂停读」，等于把连接掐死
         this.maxPendingFrames = Math.max(maxPendingFrames, 1);
+        this.metrics = metrics;
         log.info("[biz] 上行业务执行器就绪：虚拟线程池，单连接积压高水位 {} 帧（超过即暂停读取）", this.maxPendingFrames);
     }
 
-    /** 为一条连接创建串行执行器（每连接一个，随 Channel 一起被 GC） */
+    /**
+     * 为一条连接创建串行执行器（每连接一个，随 Channel 一起被 GC）。
+     *
+     * <p>指标在创建时统一安装：handler 只关心 {@code setAutoRead}，不需要知道 metrics 的存在。
+     */
     public SerialExecutor serial(String name) {
-        return new SerialExecutor(name, virtualThreads, maxPendingFrames);
+        SerialExecutor serial = new SerialExecutor(name, virtualThreads, maxPendingFrames);
+        serial.onStateChange(paused -> {
+            if (paused) {
+                metrics.bizBackpressurePaused();
+            } else {
+                metrics.bizBackpressureResumed();
+            }
+        });
+        return serial;
     }
 
     @PreDestroy
     public void shutdown() {
-        // 不等待：此刻所有连接已被 Netty 关闭，残留任务的结果也没人消费
+        // 已提交但未执行的清理任务要尽量跑完：丢掉它们会让 Redis 路由多留一个 TTL 周期的脏数据
         virtualThreads.shutdown();
+        try {
+            if (!virtualThreads.awaitTermination(SHUTDOWN_WAIT_SECONDS, TimeUnit.SECONDS)) {
+                log.warn("[biz] {}s 内仍有上行任务未完成，强制结束", SHUTDOWN_WAIT_SECONDS);
+                virtualThreads.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            virtualThreads.shutdownNow();
+        }
         log.info("[biz] 上行业务执行器已停止");
     }
 }

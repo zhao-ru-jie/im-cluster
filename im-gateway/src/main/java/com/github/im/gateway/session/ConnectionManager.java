@@ -73,7 +73,7 @@ public class ConnectionManager {
         String deviceKey = deviceKeyOf(session);
         for (; ; ) {
             ConcurrentHashMap<String, ClientSession> byDevice =
-                    devices.computeIfAbsent(userId, key -> new ConcurrentHashMap<>(2));
+                    devices.computeIfAbsent(userId, _ -> new ConcurrentHashMap<>(2));
             synchronized (byDevice) {
                 // 拿到锁之后复核：并发 remove 可能刚把这个空壳从外层摘掉了，
                 // 此时往里写会写进一个没人能看到的孤儿 map（表现为「明明连着却被判离线」）

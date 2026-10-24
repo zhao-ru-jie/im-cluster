@@ -27,9 +27,10 @@ import java.util.List;
  * @author zhaorujie
  * @since 1.0.0
  */
-public class JdbcMessageRepository implements MessageRepository {
+public class JdbcMessageRepository implements MessageRepository, AutoCloseable {
 
-    private static final String INSERT_SQL = """
+    /** 包内可见：{@link JdbcBatchAppender} 复用同一条 SQL */
+    static final String INSERT_SQL = """
             INSERT INTO im_message
                 (conversation_id, seq, server_msg_id, from_user, to_user, conv_type, client_msg_id, body, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -50,23 +51,27 @@ public class JdbcMessageRepository implements MessageRepository {
             """;
 
     private final JdbcTemplate jdbc;
+    private final JdbcBatchAppender appender;
 
-    public JdbcMessageRepository(JdbcTemplate jdbc) {
+    /**
+     * @param batchEnabled 是否启用 group commit（{@code im.db.batch-enabled}）。
+     *                     关掉后每条消息单独自动提交，便于对照压测与排障。
+     */
+    public JdbcMessageRepository(JdbcTemplate jdbc, boolean batchEnabled) {
         this.jdbc = jdbc;
+        this.appender = new JdbcBatchAppender(jdbc, batchEnabled);
     }
 
+    /** 落库并在返回前确认已提交（批处理时等本批 flush） */
     @Override
     public void append(StoredMessage message) {
-        jdbc.update(INSERT_SQL,
-                message.conversationId(),
-                message.seq(),
-                message.serverMsgId(),
-                message.from(),
-                message.to(),
-                message.convType(),
-                message.clientMsgId(),
-                message.body(),
-                message.createdAt());
+        appender.append(message);
+    }
+
+    /** 关闭时把队列里还没提交的消息刷完，避免「已回 ack 但没落库」 */
+    @Override
+    public void close() {
+        appender.close();
     }
 
     /** 走 {@code uk_msg_conv_seq} 的最后一段（索引下推取 MAX），一条索引查找即得 */

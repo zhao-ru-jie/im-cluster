@@ -3,6 +3,8 @@ package com.github.im.gateway.session;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.handler.codec.http.websocketx.CloseWebSocketFrame;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Netty Channel 上的会话实现。
@@ -22,6 +24,8 @@ import io.netty.handler.codec.http.websocketx.CloseWebSocketFrame;
  * @since 1.0.0
  */
 public final class NettyClientSession implements ClientSession {
+
+    private static final Logger log = LoggerFactory.getLogger(NettyClientSession.class);
 
     private final Channel channel;
     private final String transport;
@@ -86,7 +90,11 @@ public final class NettyClientSession implements ClientSession {
         }
         // 写是异步的，失败通过 listener 体现；这里不阻塞业务线程等结果，
         // 真正的「连接已死」由 isActive + 空闲巡检兜底。
-        channel.writeAndFlush(payload);
+        channel.writeAndFlush(payload).addListener(future -> {
+            if (!future.isSuccess()) {
+                log.error("[{}] writeAndFlush failed: ", id(), future.cause());
+            }
+        });
         return true;
     }
 

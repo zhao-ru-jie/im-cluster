@@ -102,17 +102,30 @@ im-server  ──读写──> Redis(im:conv:msgs / im:offline / im:seq / im:ide
 
 1. **接入**：alice 的帧走 WebSocket 文本帧或 TCP 长度帧到达网关 1，`SessionLifecycle` 解析出 `msg.send`；
 2. **上行**：网关经 `MessageIngress.submit()` 交给 IM 服务（同进程直调，或 gRPC 远程）；
-3. **幂等**：IM 服务以 `(from, clientMsgId)` 查/写幂等表，重复提交直接返回原 `seq`（`duplicate=true`）；
-4. **保序 + 标识**：按 `conversationId` 用**逐条 Redis 原子递增**（Lua `INCR`）分配单调 `seq`，
-   并**独立**生成 `serverMsgId`（UUIDv7）——两者解耦，seq 允许有洞、回绕也不会撞 ID；
+3. **幂等 + 保序（一次 Redis 往返）**：一个 Lua 脚本同时完成「查 `(from, clientMsgId)` 幂等表 +
+   按 `conversationId` 原子递增取 `seq`」。重复提交直接回放原 `seq` / `serverMsgId`（`duplicate=true`），
+   并且**不消耗序号**；新消息只需 1 次 RTT。幂等记录仍在**落库成功之后**才写——
+   提前写会让「落库失败 + 客户端重试」命中一个实际不存在的 seq，消息就真丢了；
+4. **标识**：`serverMsgId` 独立生成（UUIDv7），与 seq **解耦**——seq 允许有洞、回绕也不会撞 ID；
 5. **落库（write-ahead）**：经 `MessageRepository.append()` 写存储——先落库，再推送；
-6. **路由**：读 `im:gw:user:{bob}`（集合）得到 bob 所在的**所有**网关实例；Nacos 启用时再解析成健康 ip:port；
-7. **下发**：`PushPort.push()` → gRPC `DownstreamPush.Push` 到这些实例 → 各实例按 `userId` 找**本机全部设备** → 逐条写帧；
-8. **离线兜底**：网关 2 返回失败（不在线 / 推送异常）→ 该帧落 `im:offline:{bob}`，bob 重连时补发；
-9. **确认**：网关 1 收到结果后给 alice 回 `msg.ack`（含 `serverMsgId`、`seq`）。
+6. **ack 先行**：落库成功 + 幂等记录写入 = 受理成功，**立刻回 `msg.ack`**（含 `serverMsgId`、`seq`），不等推送；
+7. **异步投递**：`DeliveryDispatcher` 在虚拟线程池里做路由与下发——读 `im:gw:user:{bob}`（集合）得到
+   bob 所在的**所有**网关实例（Nacos 启用时解析成健康 ip:port），`PushPort.push()` 到这些实例
+   （**跨实例并行**，总耗时 ≈ 最慢的那个实例，而不是 RTT 相加），各实例再按 `userId` 找**本机全部设备**写帧；
+8. **离线兜底**：投递失败（不在线 / 推送异常 / 超时）→ 该帧落 `im:offline:{bob}`，bob 重连时补发。
 
 关键取舍：**先落库后推送**（宁可重复推送，不可丢消息）、**推送失败即转离线**（不做无限重试）、
+**ack 不等推送**（受理成功的判据只有落库，实时性交给异步投递 + 离线补发）、
 `frame` 由 IM 服务序列化后网关**原样透传不解析**（新增业务字段不需要动网关）。
+
+ack 先行换来「ack 延迟 = 落库延迟」的代价，三条约束必须一起成立：
+
+1. **客户端必须按 seq 排序**：异步投递会让实时到达顺序偶尔乱（`seq=2` 先到），这在 IM 里是常规约定，
+   业务侧不能假设「先收到的 seq 更小」；
+2. **进程在「已 ack、未推送」窗口崩溃时，这条消息只在库里**：不丢，但要等客户端重连后按 seq 拉历史；
+   所以关闭时会 drain 最多 5s，把这批推送做完或落离线；
+3. **推送并发有上限**（`im.delivery.max-inflight`，默认 1024）：打满时**退化成同步推送**——
+   宁可 ack 慢几十毫秒，也不让推送任务把堆内存堆穿（那时丢的是整条链路）。
 
 ### seq 发号与三道下界
 
@@ -199,6 +212,17 @@ event loop:  解码 → serial.offer(帧) → 立刻返回，继续服务其它�
 背压也实测过：把高水位临时配成 2、同一连接连发 5 帧，服务端日志出现
 `积压 3 帧超过高水位 2，暂停读取`，而 5 帧的 `msg.ack`（seq 1~5）**全部收到、连接未断**；
 「暂停只触发一次 / 降到低水位才恢复 / 一帧不丢」由 `SerialExecutorTest` 覆盖。
+
+配套的三件事：
+
+- **背压可观测**：`gateway_biz_backpressure_paused_total` / `resumed_total` / `paused_active`
+  三个指标（由 `BusinessDispatcher` 统一挂到每个连接，handler 只负责 `setAutoRead`），
+  以及 `/admin/status` 的 `backpressure.pausedConnections`——没开 Prometheus 也能在本地看到。
+- **关闭要收尾**：`BusinessDispatcher` 销毁时等 2s 让已入队的 `onClose` 跑完，
+  否则刚断开的那些用户会在 Redis 路由里多留一个 TTL 周期的脏数据。
+- **出站要合批**：两条 pipeline 都挂了 `FlushConsolidationHandler(256)`，
+  群聊扇出时成百上千次 `writeAndFlush` 合并成少量系统调用（`consolidateWhenNoReadInProgress`
+  保证没有读进行时立刻 flush，不引入额外延迟）。
 
 ### 双通道与端口
 
@@ -402,12 +426,37 @@ List<StoredMessage> recent(String conversationId, int limit);
 im:
   storage: jdbc            # redis（默认）| jdbc
   db:
-    url: jdbc:mysql://127.0.0.1:3306/im-cluster?useSSL=false&allowPublicKeyRetrieval=true
+    # rewriteBatchedStatements=true：驱动把批量插入压成一条多值 INSERT，省 round trip
+    url: jdbc:mysql://127.0.0.1:3306/im-cluster?useSSL=false&allowPublicKeyRetrieval=true&rewriteBatchedStatements=true
     username: root
     password: root
     pool-size: 20
     init-schema: true      # 首次启动执行 db/schema.sql；生产建议关掉交给 Flyway
+    batch-enabled: true    # group commit：并发到达的插入合并成一个事务
 ```
+
+### 写入吞吐：group commit
+
+单条 `INSERT` 自动提交 = **每条消息一次 fsync**。`innodb_flush_log_at_trx_commit=1` 下一次 fsync
+约 0.3~3ms，于是单个 MySQL 的写入天花板被压在**几百到三千 QPS，且与连接池大小无关**——
+多开连接只是让更多事务争抢同一个 redo 刷盘。
+
+`JdbcBatchAppender` 把「几乎同时到达的插入」合并进一个事务（最多 64 条），fsync 摊薄成 1/N。
+关键是它**没有固定攒批窗口**：只在「队列里已经有别的消息」时才合批，所以
+**稀疏写入的延迟与单条提交完全一样**，高负载时自然合并成大事务（Nagle 算法的同一个思路）。
+
+| 场景 | 行为 |
+|---|---|
+| 单条到达 | 后台线程立刻取走并提交（0 额外延迟） |
+| 并发到达 | 一次 `batchUpdate` 提交最多 64 条 |
+| 整批失败 | 整批异常抛回调用方 → 客户端重试 → 命中 Redis 幂等表直接回放（一条坏消息会拖累同批，但只是坏路径上的重试） |
+| 队列积压 / 已关闭 | 就地同步写，绝不丢消息 |
+
+再配合两个参数收益才完整：
+
+- 连接串 `rewriteBatchedStatements=true`：驱动把 N 条 INSERT 压成一条多值语句；
+- MySQL `innodb_flush_log_at_trx_commit=2`：用「崩溃可能丢 1s 事务」换掉大部分 fsync。
+  IM 场景通常可接受（幂等表 + 客户端重试兜底），但属于持久性取舍，要按业务容忍度决定。
 
 ### MySQL 表结构
 
@@ -590,6 +639,8 @@ Nacos 未启用或连不上时，`NacosNodeDiscovery.resolveTarget()` **自动�
 | `gateway_sessions_opened_total` / `closed_total` | Counter | 连接抖动检测 |
 | `gateway_sessions_migrated_total` | Counter | 摘流时主动迁走的连接数 |
 | `gateway_sessions_idle_closed_total` | Counter | 心跳超时清理的连接数 |
+| `gateway_biz_backpressure_paused_total` / `resumed_total` | Counter | 上行背压：累计暂停 / 恢复读取的次数。**两者基本相等**才正常 |
+| `gateway_biz_backpressure_paused_active` | Gauge | 当前因积压而暂停读取的连接数。持续 >0 说明下游（Redis/DB/IM 服务）跟不上 |
 
 > 空闲连接的 CPU≈0，**不能只用 CPU 扩网关**：夜间会被缩到 1 个实例，白天被重连风暴打穿。
 > 连接数与 CPU 组合使用。
@@ -600,7 +651,7 @@ Nacos 未启用或连不上时，`NacosNodeDiscovery.resolveTarget()` **自动�
 curl -X POST 'localhost:8080/admin/drain?reason=scale-in'   # 手动摘流（幂等）
 curl localhost:8080/admin/status
 # {"draining":false,"connections":2,"transports":{"websocket":":8081/ws","tcp":":9092"},
-#  "websocket":1,"tcp":1}
+#  "websocket":1,"tcp":1,"backpressure":{"pausedConnections":0}}
 ```
 
 K8s 清单：`k8s/im-gateway.yaml`（Deployment + 按连接数 HPA + preStop + 90s 宽限期）、
@@ -654,7 +705,7 @@ IM_GRPC_PORT=9090 IM_GRPC_HOST=127.0.0.1 \
 |---|---|---|
 | `im-server` | `SeqAllocatorTest`（冷启动 / 客户端水位 / Redis 回退到旧快照 / 多实例顺序 / 8 线程并发 / DB 下界查询摊薄）、`RedisMessageRepositoryTest`（落库乱序时 `maxSeq` 仍取真正最大值） | **真实 Redis** |
 | `im-rpc` | `GrpcChannelFactoryHealthTest`（NOT_SERVING 实例被摘出轮询、无健康服务的对端仍可用、waitForReady 等到 deadline、关开关回到旧行为） | 真实 gRPC 服务端（进程内起） |
-| `im-gateway` | `HmacTokenAuthenticatorTest`（越权冒用 / 过期 / 篡改过期时间 / 换密钥伪造 / 格式错误）、`AuthGuardTest`（off 全放行、warn 只记录不误伤、enforce 拒绝、缺 secret 启动失败）、`SerialExecutorTest`（串行 / 保序 / 积压上限拒新 / 控制任务不受背压 / 单任务异常不中断） | 无 |
+| `im-gateway` | `HmacTokenAuthenticatorTest`（越权冒用 / 过期 / 篡改过期时间 / 换密钥伪造 / 格式错误）、`AuthGuardTest`（off 全放行、warn 只记录不误伤、enforce 拒绝、缺 secret 启动失败）、`SerialExecutorTest`（串行 / 保序 / 高水位暂停只触发一次且不丢帧 / 低水位才恢复 / 未到阈值不触发 / 控制任务不参与背压 / 指标监听收到暂停+恢复 / 单任务异常不中断） | 无 |
 | `im-server-boot` | `GrpcHealthEndpointTest`（健康服务确实被绑定且最终 SERVING） | Spring 上下文 + Redis |
 
 Redis 相关用例默认连 `127.0.0.1:6379`（可用 `-Dim.test.redis.host=... -Dim.test.redis.port=...` 改），
@@ -737,6 +788,7 @@ kubectl apply -f k8s/im-node.yaml     # 或 im-gateway.yaml + im-server.yaml（�
 | `im.db.url` | `IM_DB_URL` | 空 | 仅 `jdbc` 时读取 |
 | `im.db.username` / `password` | `IM_DB_USERNAME` / `IM_DB_PASSWORD` | `root` / 空 | |
 | `im.db.pool-size` | `IM_DB_POOL_SIZE` | `20` | Hikari 连接池 |
+| `im.db.batch-enabled` | `IM_DB_BATCH_ENABLED` | `true` | group commit：并发到达的插入合并成一个事务 |
 | `im.db.init-schema` | `IM_DB_INIT_SCHEMA` | `true` | 首次启动执行 DDL |
 
 ### 长连接接入
@@ -768,6 +820,7 @@ kubectl apply -f k8s/im-node.yaml     # 或 im-gateway.yaml + im-server.yaml（�
 | `im.ingress.transport` | `IM_INGRESS_TRANSPORT` | `local` | `local` / `shadow` / `grpc`（仅单体装配入口） |
 | `im.server.address` / `timeout-ms` / `wait-for-ready` | `IM_SERVER_ADDR` / `IM_SERVER_TIMEOUT_MS` / `IM_SERVER_WAIT_FOR_READY` | `127.0.0.1:9091` / `300` / `true` | 网关 → IM |
 | `im.push.timeout-ms` / `wait-for-ready` | `IM_PUSH_TIMEOUT_MS` / `IM_PUSH_WAIT_FOR_READY` | `800` / `false` | IM → 网关，超时即落离线 |
+| `im.delivery.max-inflight` | `IM_DELIVERY_MAX_INFLIGHT` | `1024` | 异步推送并发上限，打满即退化为同步推送 |
 | `im.node.grpc-port` / `grpc-host` | `IM_GRPC_PORT` / `IM_GRPC_HOST` | `9090` / 自动探测 | 实例 ID |
 | `im.node.grpc.tls.enabled` / `trust-cert` | `IM_GRPC_TLS` / `IM_GRPC_TRUST` | `false` / 空 | gRPC TLS |
 | `im.node.grpc.health-check-enabled` | `IM_GRPC_HEALTH_CHECK` | `true` | 客户端健康检查（排除 NOT_SERVING 实例） |
@@ -842,7 +895,7 @@ im-cluster/
 │   ├── transport/tcp/*                       # TCP pipeline：长度帧 + 首帧 connect 认证
 │   ├── protocol/ClientFrames.java            # 控制帧编解码（ack/pong/ping/migrate/error/connected）
 │   ├── drain/GatewayDrainService.java        # 优雅摘流
-│   ├── metrics/GatewayMetrics.java           # 连接数 HPA 指标
+│   ├── metrics/GatewayMetrics.java           # 连接数 HPA 指标 + 上行背压指标
 │   ├── push/LocalSessionPusher.java          # 推给本实例会话
 │   ├── push/DownstreamPushService.java       # @GrpcService：接收下行推送
 │   ├── push/GatewayPushClient.java           # 跨实例 gRPC 客户端
@@ -850,7 +903,9 @@ im-cluster/
 │   └── controller/GatewayAdminController.java # POST /admin/drain、GET /admin/status
 │
 ├── im-server/                   # IM 服务
-│   ├── message/MessageService.java           # 幂等 + seq + 落库 + 推送 + 离线兜底
+│   ├── message/MessageService.java           # 受理主流程：幂等 + 取号 + 落库 + 立刻回 ack
+│   ├── message/DeliveryDispatcher.java       # 异步投递 + 失败落离线（把推送挪出 ack 关键路径）
+│   ├── message/SeqAllocator.java             # seq 发号：幂等查询与 INCR 合成一个 Lua（一次 RTT）
 │   ├── message/MessageRouter.java            # 投递目标决策（含群聊扇出），唯一依赖 PushPort
 │   ├── message/MessageRepository.java        # 存储端口
 │   ├── message/RedisMessageRepository.java   # 默认存储实现
@@ -864,6 +919,7 @@ im-cluster/
 ├── im-storage-jdbc/             # 存储实现插件（MySQL）
 │   ├── JdbcStorageConfig.java                # 条件装配：仅 im.storage=jdbc
 │   ├── JdbcMessageRepository.java
+│   ├── JdbcBatchAppender.java                # group commit：并发插入合并成一次事务提交
 │   ├── JdbcGroupMemberRepository.java
 │   └── resources/db/schema.sql               # DDL
 │

@@ -1,6 +1,7 @@
 package com.github.im.gateway.controller;
 
 import com.github.im.gateway.drain.GatewayDrainService;
+import com.github.im.gateway.metrics.GatewayMetrics;
 import com.github.im.gateway.session.ClientSession;
 import com.github.im.gateway.session.ConnectionManager;
 import com.github.im.gateway.transport.NettyGatewayServer;
@@ -18,7 +19,7 @@ import java.util.Map;
  *
  * <pre>
  * POST /admin/drain?reason=scale-in   触发优雅摘流（幂等，不退出进程）
- * GET  /admin/status                  查看当前连接数 / 是否在摘流
+ * GET  /admin/status                  查看当前连接数 / 是否在摘流 / 背压状态
  * </pre>
  *
  * <p><b>安全边界</b>：本入口不做鉴权，必须只在内网/集群内可达（K8s 用 NetworkPolicy
@@ -34,13 +35,16 @@ public class GatewayAdminController {
     private final GatewayDrainService drainService;
     private final ConnectionManager connectionManager;
     private final NettyGatewayServer nettyServer;
+    private final GatewayMetrics metrics;
 
     public GatewayAdminController(GatewayDrainService drainService,
                                   ConnectionManager connectionManager,
-                                  NettyGatewayServer nettyServer) {
+                                  NettyGatewayServer nettyServer,
+                                  GatewayMetrics metrics) {
         this.drainService = drainService;
         this.connectionManager = connectionManager;
         this.nettyServer = nettyServer;
+        this.metrics = metrics;
     }
 
     @PostMapping("/drain")
@@ -63,6 +67,10 @@ public class GatewayAdminController {
         // 双通道拆分看一眼占比：WS 客户端迁移到 TCP 的进度靠这两个数
         body.put(ClientSession.TRANSPORT_WS, connectionManager.connectionCount(ClientSession.TRANSPORT_WS));
         body.put(ClientSession.TRANSPORT_TCP, connectionManager.connectionCount(ClientSession.TRANSPORT_TCP));
+        // 背压只暴露「当前有多少连接被暂停读取」：累计次数看 Prometheus（计数器本地读没有意义）
+        Map<String, Object> backpressure = new LinkedHashMap<>();
+        backpressure.put("pausedConnections", metrics.bizBackpressurePausedActive());
+        body.put("backpressure", backpressure);
         return body;
     }
 }

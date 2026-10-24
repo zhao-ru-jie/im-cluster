@@ -16,6 +16,10 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -28,12 +32,17 @@ import java.util.concurrent.TimeUnit;
  * <ol>
  *   <li>读在线路由表，把 userId 按目标网关实例分组（一次任务可能跨多个实例，
  *       多端时同一个 userId 会进入多个实例的分组）；</li>
- *   <li>逐实例 gRPC 推送，收集 delivered；</li>
+ *   <li><b>并行</b>向各实例 gRPC 推送，收集 delivered；</li>
  *   <li>{@code failed = 目标 − delivered}（不能直接汇总各实例的 failed，否则多端下
  *       一个用户会同时出现在两份列表里，导致已收到消息的人被再排一份离线）；</li>
  *   <li>路由缺失、实例不可达、超时一律记 failed —— <b>本类永不抛异常</b>，
  *       由 IM 服务统一落离线，保证「可丢实时性、不可丢消息」。</li>
  * </ol>
+ *
+ * <p><b>为什么并行</b>：串行时一次群聊扇出要等「实例数 × gRPC RTT」，跨可用区（RTT 1ms 起）
+ * 或者有实例慢/超时时，延迟会按实例数累加（最坏 N × 800ms）。改成并行后总耗时 ≈ 最慢的那个实例，
+ * 而 {@code failed} 的语义完全不变。各实例的 {@code get()} 仍在所有任务都已提交之后才收集，
+ * 所以不会退化成串行。
  *
  * @author zhaorujie
  * @since 1.0.0
@@ -47,6 +56,12 @@ public class RemoteGatewayPushPort implements PushPort {
     private final AddressResolver addressResolver;
     private final long timeoutMs;
     private final boolean waitForReady;
+
+    /**
+     * 跨实例扇出的执行器。虚拟线程：这里全是阻塞等 gRPC 的活，一条任务一个虚拟线程最直白；
+     * 数量天然受「一次任务涉及的实例数」限制，不会无限膨胀。
+     */
+    private final ExecutorService fanout = Executors.newVirtualThreadPerTaskExecutor();
 
     /**
      * @param waitForReady 是否等待目标实例就绪（{@code im.push.wait-for-ready}，默认 {@code false}）。
@@ -83,25 +98,23 @@ public class RemoteGatewayPushPort implements PushPort {
             }
         }
 
+        // 先全部提交再收集结果：任何一个实例慢/超时都不该拖住其它实例的发起
+        List<Future<List<String>>> futures = new ArrayList<>(byInstance.size());
         for (Map.Entry<String, List<String>> entry : byInstance.entrySet()) {
-            String address = addressResolver.resolve(entry.getKey());
-            List<String> users = entry.getValue();
-            PushTask subTask = task.toBuilder()
-                    .clearTargetUserIds()
-                    .addAllTargetUserIds(users)
-                    .build();
+            String instance = entry.getKey();
+            List<String> users = List.copyOf(entry.getValue());
+            futures.add(fanout.submit(() -> pushOne(instance, users, task)));
+        }
+        for (Future<List<String>> future : futures) {
             try {
-                DownstreamPushGrpc.DownstreamPushBlockingStub stub =
-                        DownstreamPushGrpc.newBlockingStub(channels.channelFor(address))
-                                .withDeadlineAfter(timeoutMs, TimeUnit.MILLISECONDS);
-                if (waitForReady) {
-                    stub = stub.withWaitForReady();
-                }
-                PushResult result = stub.push(subTask);
-                delivered.addAll(result.getDeliveredUserIdsList());
-            } catch (Exception e) {
-                log.warn("push to gateway {} (address {}) failed, fallback to offline: {}",
-                        entry.getKey(), address, e.getMessage());
+                delivered.addAll(future.get());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.warn("push interrupted, remaining instances treated as offline");
+            } catch (ExecutionException e) {
+                // pushOne 自己已经 catch 了所有异常并返回空列表，走到这里说明是 Error
+                Throwable cause = e.getCause() == null ? e : e.getCause();
+                log.warn("push task failed: {}", cause.getMessage());
             }
         }
 
@@ -118,6 +131,28 @@ public class RemoteGatewayPushPort implements PushPort {
                 .addAllDeliveredUserIds(delivered)
                 .addAllFailedUserIds(failed)
                 .build();
+    }
+
+    /** 推给一个实例；<b>永不抛异常</b>，失败返回空列表（由调用方算作 failed） */
+    private List<String> pushOne(String instanceId, List<String> users, PushTask task) {
+        String address = addressResolver.resolve(instanceId);
+        PushTask subTask = task.toBuilder()
+                .clearTargetUserIds()
+                .addAllTargetUserIds(users)
+                .build();
+        try {
+            DownstreamPushGrpc.DownstreamPushBlockingStub stub =
+                    DownstreamPushGrpc.newBlockingStub(channels.channelFor(address))
+                            .withDeadlineAfter(timeoutMs, TimeUnit.MILLISECONDS);
+            if (waitForReady) {
+                stub = stub.withWaitForReady();
+            }
+            return stub.push(subTask).getDeliveredUserIdsList();
+        } catch (Exception e) {
+            log.warn("push to gateway {} (address {}) failed, fallback to offline: {}",
+                    instanceId, address, e.getMessage());
+            return List.of();
+        }
     }
 
     /** 实例顺序稳定一下：便于排障时对照日志，也让子任务顺序可复现 */

@@ -67,9 +67,9 @@ public class NodeAddressResolver {
                 if (ni.isLoopback() || !ni.isUp()) {
                     continue;
                 }
-                Enumeration<InetAddress> addrs = ni.getInetAddresses();
-                while (addrs.hasMoreElements()) {
-                    InetAddress a = addrs.nextElement();
+                Enumeration<InetAddress> address = ni.getInetAddresses();
+                while (address.hasMoreElements()) {
+                    InetAddress a = address.nextElement();
                     if (a instanceof Inet4Address && !a.isLoopbackAddress()) {
                         return a.getHostAddress();
                     }

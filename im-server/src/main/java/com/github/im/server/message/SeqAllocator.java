@@ -59,6 +59,10 @@ public class SeqAllocator {
     /** 每多少条消息重新查一次「已落库最大 seq」来校准下界（摊薄成 1/100 次 DB 查询） */
     private static final int FLOOR_REFRESH_EVERY = 100;
 
+    /** 合并脚本的三种返回状态：幂等命中 / 计数器不存在 / 拿到新号 */
+    private static final String ALLOC_HIT = "hit";
+    private static final String ALLOC_COLD = "cold";
+
     /**
      * 稳态取号。
      *
@@ -87,6 +91,38 @@ public class SeqAllocator {
             end
             return redis.call('INCR', KEYS[1])
             """, Long.class);
+
+    /**
+     * <b>幂等查询 + 发号</b>合并成一次往返（上行受理路径用它）。
+     *
+     * <p>{@code KEYS[1]} = {@code im:idem:{from}|{clientMsgId}}，{@code KEYS[2]} = {@code im:seq:{conv}}，
+     * {@code ARGV[1]} = 下界 floor。返回三元组 {@code {status, idemValue, seq}}：
+     * <ul>
+     *   <li>{@code hit}：幂等命中，直接回放 {@code idemValue}，<b>连 seq 都不消耗</b>
+     *       （分开写时重复消息仍会白白 INCR 一次）；</li>
+     *   <li>{@code cold}：seq 计数器不存在，调用方走冷启动（要查库才能算出下界）；</li>
+     *   <li>{@code new}：拿到了新号。</li>
+     * </ul>
+     *
+     * <p>为什么能把两个 key 放进同一个脚本：Redis 单实例/主从下多 key 脚本是原子的。
+     * <b>若将来切 Redis Cluster</b>，这两个 key 需要落在同一 slot（给 key 加统一 hash tag），
+     * 否则会报 {@code CROSSSLOT}——那时应该退化成两条命令而不是各自加 tag 硬凑。
+     */
+    private static final DefaultRedisScript<List> ALLOCATE_WITH_IDEM = new DefaultRedisScript<>("""
+            local cached = redis.call('GET', KEYS[1])
+            if cached then
+                return {'hit', cached, '0'}
+            end
+            local cur = redis.call('GET', KEYS[2])
+            if cur == false then
+                return {'cold', '', '0'}
+            end
+            local floor = tonumber(ARGV[1])
+            if floor > 0 and tonumber(cur) < floor then
+                redis.call('SET', KEYS[2], floor)
+            end
+            return {'new', '', tostring(redis.call('INCR', KEYS[2]))}
+            """, List.class);
 
     private final StringRedisTemplate redis;
     private final MessageRepository messageRepository;
@@ -122,6 +158,57 @@ public class SeqAllocator {
         return coldStart(conversationId, state, key);
     }
 
+    /**
+     * 受理一条新消息时的取号：<b>一次 Redis 往返同时判定幂等与取号</b>。
+     *
+     * <p>相比「先 GET 幂等键、再 next()」的老路径：
+     * <ul>
+     *   <li>新消息：Redis 往返 3 次 → 2 次（这里 1 次 + 落库后写幂等 1 次）；</li>
+     *   <li>重复消息：2 次 → <b>1 次</b>，而且不再白白消耗一个 seq。</li>
+     * </ul>
+     *
+     * <p>为什么幂等写入没有一起并进来：幂等记录必须在<b>落库成功之后</b>才写。
+     * 提前写会让「落库失败但客户端重试」命中幂等，返回一个实际上并不存在的 seq，
+     * 消息就真丢了。宁可多一次往返，也不能把失败路径的语义改坏。
+     *
+     * @param idemKey        幂等键（{@link RedisKeys#IDEM_PREFIX} + {@code from|clientMsgId}）
+     * @param conversationId 会话 ID
+     */
+    public Allocation allocate(String idemKey, String conversationId) {
+        ConversationSeq state = conversations.computeIfAbsent(conversationId, _ -> new ConversationSeq());
+        if (state.needsFloorRefresh()) {
+            state.raiseFloor(storageFloor(conversationId));
+        }
+        String seqKey = RedisKeys.SEQ_PREFIX + conversationId;
+        List<String> raw;
+        try {
+            raw = executeAllocate(idemKey, seqKey, String.valueOf(state.floor()));
+        } catch (RuntimeException e) {
+            // 脚本被禁用 / 集群 slot 不匹配等：退回老路径，宁可多一次往返也不让消息失败
+            log.warn("[seq] 合并脚本执行失败，退回逐条取号：conv={} err={}", conversationId, e.getMessage());
+            return Allocation.fresh(next(conversationId));
+        }
+        if (raw == null || raw.size() < 3) {
+            log.warn("[seq] 合并脚本返回异常结果 {}，退回逐条取号：conv={}", raw, conversationId);
+            return Allocation.fresh(next(conversationId));
+        }
+        String status = raw.get(0);
+        if (ALLOC_HIT.equals(status)) {
+            return Allocation.replay(raw.get(1));
+        }
+        if (ALLOC_COLD.equals(status)) {
+            return Allocation.fresh(coldStart(conversationId, state, seqKey));
+        }
+        long seq = Long.parseLong(raw.get(2));
+        state.raiseFloor(seq);
+        return Allocation.fresh(seq);
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<String> executeAllocate(String idemKey, String seqKey, String floor) {
+        return (List<String>) redis.execute(ALLOCATE_WITH_IDEM, List.of(idemKey, seqKey), floor);
+    }
+
     /** 计数器不存在：用「已落库最大 seq + 客户端水位 + 本地已知」三者取大作为起点 */
     private long coldStart(String conversationId, ConversationSeq state, String key) {
         long floor = Math.max(state.floor(), watermarkStore.maxSeqOf(conversationId));
@@ -145,6 +232,24 @@ public class SeqAllocator {
             log.warn("[seq] 读取会话 {} 的已落库最大 seq 失败，本次下界仅用本地记录: {}",
                     conversationId, e.getMessage());
             return 0L;
+        }
+    }
+
+    /**
+     * {@link #allocate} 的结果。
+     *
+     * @param duplicate 幂等命中：直接回放 {@code idemValue}，本次没有消耗 seq
+     * @param idemValue 幂等表里存的原值（{@code "{serverMsgId}|{seq}"}），命中时才非空
+     * @param seq       新分配的序号，未命中时有效
+     */
+    public record Allocation(boolean duplicate, String idemValue, long seq) {
+
+        static Allocation replay(String idemValue) {
+            return new Allocation(true, idemValue, 0L);
+        }
+
+        static Allocation fresh(long seq) {
+            return new Allocation(false, null, seq);
         }
     }
 
