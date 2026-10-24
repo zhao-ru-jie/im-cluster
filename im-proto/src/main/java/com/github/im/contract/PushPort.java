@@ -12,6 +12,9 @@ import com.github.im.proto.push.v1.PushTask;
  *
  * <p>返回值里的 {@code failed_user_ids} 是 IM 服务判定「需要转离线存储」的唯一依据，
  * 因此实现必须如实上报失败，不能吞掉。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public interface PushPort {
 

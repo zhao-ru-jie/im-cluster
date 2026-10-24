@@ -21,6 +21,9 @@ import org.springframework.grpc.server.service.GrpcService;
  * <p>依赖注入刻意用具体类型 {@link MessageService} 而不是 {@code MessageIngress} 接口：
  * 服务端永远只把请求交给本地业务实现，绝不可能是「客户端适配器」，
  * 这样单体装配下也不会因为同类型多 bean 而歧义。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @GrpcService
 public class MessageIngressGrpcService extends MessageIngressGrpc.MessageIngressImplBase {

@@ -17,6 +17,9 @@ import java.util.Map;
  *
  * <p>它直接复用 {@link MessageService#dispatch} 的完整流程（幂等 + seq + 落库 + 推送 + 离线兜底），
  * 因此「测试通路」不会绕过业务逻辑，这也是拆分后把该入口从连接层搬到业务层的原因。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @RestController
 public class TestSendController {

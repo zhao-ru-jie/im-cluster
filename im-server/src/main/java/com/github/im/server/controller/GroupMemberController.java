@@ -24,6 +24,9 @@ import java.util.Map;
  *
  * <p>定位与 {@link TestSendController} 相同：demo 阶段的可验证入口，鉴权/群主校验等留给接入层。
  * 写入的介质跟随 {@code im.storage}——Redis Set 或 {@code im_group_member} 表。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @RestController
 @RequestMapping("/group")

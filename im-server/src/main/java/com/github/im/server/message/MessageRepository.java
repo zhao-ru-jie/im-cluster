@@ -12,6 +12,9 @@ import java.util.List;
  *
  * <p><b>一致性约定</b>：{@code append} 必须先于下发（write-ahead）。
  * 实现抛异常 = 整条消息受理失败（返回可重试错误码），绝不允许「推成功但没落库」。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public interface MessageRepository {
 

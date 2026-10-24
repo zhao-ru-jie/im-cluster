@@ -12,6 +12,9 @@ import java.util.List;
  *
  * <p><b>为什么不缓存</b>：群成员是扇出的权威来源，缓存与库不一致会直接表现为「有人收不到消息」。
  * 需要降延迟时先按群维度加短 TTL 缓存 + 成员变更时主动失效，而不是把缓存当唯一来源。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public interface GroupMemberRepository {
 

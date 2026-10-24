@@ -14,6 +14,9 @@ import java.util.Set;
  *
  * <p>多端语义：同一用户可能同时连在多个网关实例上（手机在 A、网页在 C），
  * 所以这里返回的是<b>集合</b>，调用方必须每个实例都推一次；只取一个会让部分设备收不到实时消息。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public class GatewayRouteReader {
 

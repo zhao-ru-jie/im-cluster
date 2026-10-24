@@ -13,6 +13,9 @@ import java.util.Map;
  *
  * <p>灰度切流前的判断依据：{@code matchRate} 应稳定为 1.0 且 {@code shadowErrors} 不增长，
  * 否则说明新传输通道（序列化/超时/幂等键透传）存在偏差，不能进入下一步。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @RestController
 public class ShadowReportController {

@@ -22,6 +22,9 @@ import java.util.Map;
  * <p>实时下发与历史拉取必须产出<b>同一个结构</b>（都从 {@link StoredMessage} 这一份数据渲染），
  * 否则客户端要写两套解析。因此 {@link #pushFrame} 只是「受理时先算出帧」的便捷入口，
  * 真正的模板在 {@link #frameOf}。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 // 显式命名：im-gateway 里也有一个同名类（网关只产出控制帧），避免阶段 1 同进程装配冲突
 @Component("serverClientFrames")

@@ -8,6 +8,9 @@ import com.github.im.proto.ingress.v1.SubmitMessageResponse;
  *
  * <p>放在契约层的原因：网关要用它「信封 → 请求」，IM 服务要用它「请求 → 信封」，
  * 两侧必须用同一套转换规则，否则 conversationId / 幂等键的语义会在跨服务边界处漂移。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public final class MessageEnvelopes {
 

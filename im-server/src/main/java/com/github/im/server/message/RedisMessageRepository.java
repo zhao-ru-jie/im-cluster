@@ -17,6 +17,9 @@ import java.util.List;
  * <p>定位：本地开发 / 联调 / 小规模。生产用 {@code com.github.im.storage.jdbc.JdbcMessageRepository}
  * （`im.storage=jdbc`，位于 im-storage-jdbc 模块）——
  * Redis List 无法做按时间分区、无法跨会话检索、容量受内存限制。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Component
 @ConditionalOnProperty(name = "im.storage", havingValue = "redis", matchIfMissing = true)

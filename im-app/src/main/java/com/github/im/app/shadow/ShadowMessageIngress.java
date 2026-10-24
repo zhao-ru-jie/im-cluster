@@ -32,6 +32,9 @@ import java.util.concurrent.atomic.LongAdder;
  *   <li>shadow 在<b>虚拟线程池异步</b>执行，不阻塞主路径、不影响返回值、失败只记指标；</li>
  *   <li>{@code pullPending} <b>绝不做 shadow</b>：拉取有消费语义，双跑会把离线消息消费两次。</li>
  * </ul>
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public class ShadowMessageIngress implements MessageIngress {
 

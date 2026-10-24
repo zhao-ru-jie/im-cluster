@@ -25,6 +25,9 @@ import java.util.UUID;
  * @param conversationId      会话 ID
  * @param convType    {@link #CONV_SINGLE} / {@link #CONV_GROUP}
  * @param clientTs    客户端发送时间戳（毫秒）
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public record MessageEnvelope(String from,
                               String to,

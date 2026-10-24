@@ -34,6 +34,9 @@ import java.util.concurrent.TimeUnit;
  *   <li>路由缺失、实例不可达、超时一律记 failed —— <b>本类永不抛异常</b>，
  *       由 IM 服务统一落离线，保证「可丢实时性、不可丢消息」。</li>
  * </ol>
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public class RemoteGatewayPushPort implements PushPort {
 

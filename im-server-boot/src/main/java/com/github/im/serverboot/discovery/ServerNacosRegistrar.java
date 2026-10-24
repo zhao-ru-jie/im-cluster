@@ -39,6 +39,9 @@ import java.util.Properties;
  * <p>健康检查用 Nacos 客户端心跳（{@code ephemeral=true}）：进程一挂，心跳断，实例被摘。
  * 因此不需要额外的 HTTP 健康端点——IM 服务的 HTTP 端口和 gRPC 端口是两条独立链路，
  * 用 HTTP 探活去代表 gRPC 可用性反而不准。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Component
 public class ServerNacosRegistrar {

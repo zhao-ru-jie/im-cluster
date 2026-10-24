@@ -16,6 +16,9 @@ import java.util.List;
  *
  * <p>与 Redis 版的行为差异：这里第一版统一写 {@code role=MEMBER}。角色（OWNER/ADMIN）留给
  * 群管理接口引入，不在此处凭空发明默认群主——扇出只关心「谁在群里」。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public class JdbcGroupMemberRepository implements GroupMemberRepository {
 

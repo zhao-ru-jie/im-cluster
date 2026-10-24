@@ -20,6 +20,9 @@ import java.util.List;
  * 「目标连在哪个网关、本机有没有会话、要不要 gRPC」全部下沉到网关模块。
  *
  * <p>返回值是投递失败的用户列表——IM 服务据此决定谁需要落离线存储。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Component
 public class MessageRouter {

@@ -18,6 +18,9 @@ import java.util.Set;
  * <p>用 Set 而不是 List：加/删成员天然幂等，扇出也只需要「是不是成员」而不关心顺序。
  * 生产形态用 {@code im.storage=jdbc} 切到 {@code im_group_member} 表——那时才能支持
  * 「查某用户加入了哪些群」「按角色做权限」，Redis Set 做不到。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Component
 @ConditionalOnProperty(name = "im.storage", havingValue = "redis", matchIfMissing = true)

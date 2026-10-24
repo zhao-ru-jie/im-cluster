@@ -15,6 +15,9 @@ import org.springframework.data.redis.core.StringRedisTemplate;
  *
  * <p>业务模块（im-server）只依赖 {@link PushPort} 接口，不知道 gRPC、channel、路由表的存在，
  * 所以这一层装配是整个拆分里唯一需要「决定用哪种传输」的地方。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Configuration
 public class ServerWiring {

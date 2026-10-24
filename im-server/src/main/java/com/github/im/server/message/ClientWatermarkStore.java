@@ -28,6 +28,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * 也就是说它是**兜底增益**而非强一致保证——真正的强一致要求 seq 分配落在持久存储里
  * （见 {@code SeqAllocator} 类注释）。进程内保存还有一个好处：上报路径不依赖 Redis，
  * 恰恰在 Redis 不可用的场景下仍然有效。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Component
 public class ClientWatermarkStore {

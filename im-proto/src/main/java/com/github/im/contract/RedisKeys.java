@@ -14,6 +14,9 @@ package com.github.im.contract;
  *   <tr><td>{@link #IDEM_PREFIX}{from}|{clientMsgId}</td><td>IM 服务</td><td>IM 服务</td></tr>
  *   <tr><td>{@link #GROUP_MEMBERS_PREFIX}{groupId}</td><td>IM 服务</td><td>IM 服务（群聊扇出）</td></tr>
  * </table>
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public final class RedisKeys {
 

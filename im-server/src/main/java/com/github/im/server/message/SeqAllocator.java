@@ -47,6 +47,9 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>为什么用 Lua 而不是「先 GET 再 INCR」：两者之间会被其它实例插入，导致写回旧值；
  * Lua 在 Redis 内串行执行，天然原子。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Component
 public class SeqAllocator {

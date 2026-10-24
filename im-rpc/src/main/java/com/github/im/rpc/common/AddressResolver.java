@@ -7,6 +7,9 @@ package com.github.im.rpc.common;
  * {@code host:port}（见 {@code NodeAddressResolver}）。当实例 ID 不再是可达地址
  * （例如改用 StatefulSet 的 POD_NAME 作实例 ID）时，可在部署入口注入一个
  * Nacos/服务发现实现，替换本接口即可，推送逻辑无需改动。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @FunctionalInterface
 public interface AddressResolver {

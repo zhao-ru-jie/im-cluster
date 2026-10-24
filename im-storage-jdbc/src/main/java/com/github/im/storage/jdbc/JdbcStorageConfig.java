@@ -36,6 +36,9 @@ import javax.sql.DataSource;
  * <p>本类同时提供两个存储端口的 MySQL 实现：{@code MessageRepository}（im_message）与
  * {@code GroupMemberRepository}（im_group_member）。两者共用同一个连接池，
  * 保证「消息落库 + 群成员变更」在同一个事务边界内可用。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Configuration
 @ConditionalOnProperty(name = "im.storage", havingValue = "jdbc")

@@ -17,6 +17,9 @@ package com.github.im.server.message;
  * @param clientMsgId 客户端幂等键
  * @param body        业务消息体
  * @param createdAt   服务端受理时间（毫秒）
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public record StoredMessage(String conversationId,
                             long seq,

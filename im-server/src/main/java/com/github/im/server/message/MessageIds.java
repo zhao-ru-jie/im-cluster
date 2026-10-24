@@ -23,6 +23,9 @@ import java.util.concurrent.ThreadLocalRandom;
  *
  * <p>单调性：同一毫秒内用 12 位 {@code rand_a} 递增计数，保证<b>单实例内</b>严格递增；
  * 时间戳回拨（NTP 校时、虚拟机漂移）时冻结时间戳继续递增计数，绝不回退。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public final class MessageIds {
 

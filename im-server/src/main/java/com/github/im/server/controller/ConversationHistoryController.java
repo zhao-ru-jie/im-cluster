@@ -24,6 +24,9 @@ import java.util.Map;
  *
  * <p>读的就是 {@code MessageRepository.recent}，因此 {@code im.storage} 切到 jdbc 后
  * 这里自动走 {@code im_message} 的 {@code uk_msg_conv_seq} 索引，Redis 形态下走 List 尾部范围读。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @RestController
 @RequestMapping("/conv")

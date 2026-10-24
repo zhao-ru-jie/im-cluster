@@ -23,6 +23,9 @@ import java.util.List;
  * 因此即使 Redis 里的序号计数器被清空，新号也从历史之后接着发，不会撞
  * {@code uk_msg_conv_seq}；唯一索引退化为「兜底断言」而非「常态错误源」。
  * {@code server_msg_id} 由 {@code MessageIds}（UUIDv7）独立生成，与 seq 无关，不受回绕影响。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public class JdbcMessageRepository implements MessageRepository {
 

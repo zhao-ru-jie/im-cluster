@@ -12,6 +12,9 @@ import com.github.im.proto.ingress.v1.*;
  *       （{@code MessageIngressGrpcService}）+ 网关内的 gRPC 客户端实现。</li>
  * </ul>
  * 网关侧只依赖本接口，因此「换成本地调用还是远程 gRPC」对网关代码不可见。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 public interface MessageIngress {
 

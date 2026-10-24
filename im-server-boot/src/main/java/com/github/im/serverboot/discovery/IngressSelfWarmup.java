@@ -32,6 +32,9 @@ import java.util.concurrent.TimeUnit;
  * <h2>失败不影响启动</h2>
  *
  * <p>自测失败只意味着「首条消息可能慢」，不该让实例起不来，所以全部异常都吞掉并打日志。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Component
 public class IngressSelfWarmup {

@@ -14,6 +14,9 @@ import java.util.List;
  * （{@code failed_user_ids}）时才落这里，网关侧不再有写离线队列的代码路径。
  *
  * <pre>im:offline:{userId}   Redis List，FIFO</pre>
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Component
 public class OfflineMessageStore {

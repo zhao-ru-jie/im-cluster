@@ -28,6 +28,9 @@ import org.springframework.context.annotation.Primary;
  *
  * <p>{@code @Primary} 让 {@code ObjectProvider<MessageIngress>} 在「本地实现 / 远程实现 / Shadow 包装」
  * 三个同类型 bean 并存时仍能唯一解析——这是单体装配下必须显式表达的语义。
+ *
+ * @author zhaorujie
+ * @since 1.0.0
  */
 @Configuration
 public class IngressConfig {
