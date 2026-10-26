@@ -74,7 +74,7 @@ spec:
             - name: grpc-push
               containerPort: 9090
           env:
-            # 实例 ID = POD_IP:19090（gRPC 端口），写进 Redis 在线路由表 im:gw:user:{userId}
+            # 实例 ID = POD_IP:19090（gRPC 端口），写进 Redis 在线路由表 im:gateway:user:{userId}
             - name: POD_IP
               valueFrom:
                 fieldRef:

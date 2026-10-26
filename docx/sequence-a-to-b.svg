@@ -49,7 +49,7 @@
 <circle cx="384" cy="204" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
 <text x="384" y="207.5" font-size="9" text-anchor="middle" fill="#333333">2</text>
 <line x1="370" y1="260" x2="876" y2="260" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
-<text x="625.0" y="237" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">SET im:gw:user:a = gw1（TTL 30s，每 10s</text>
+<text x="625.0" y="237" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">SET im:gateway:user:a = gw1（TTL 30s，每 10s</text>
 <text x="625.0" y="252" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">心跳续期）</text>
 <circle cx="384" cy="260" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
 <text x="384" y="263.5" font-size="9" text-anchor="middle" fill="#333333">3</text>
@@ -132,7 +132,7 @@
 <circle cx="654" cy="1122" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
 <text x="654" y="1125.5" font-size="9" text-anchor="middle" fill="#333333">19</text>
 <line x1="640" y1="1178" x2="876" y2="1178" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>
-<text x="760.0" y="1170" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">GET im:gw:user:b → gw2</text>
+<text x="760.0" y="1170" font-size="11.5" font-weight="normal" text-anchor="middle" fill="#222222" stroke="#FFFFFF" stroke-width="3.5" paint-order="stroke">GET im:gateway:user:b → gw2</text>
 <circle cx="654" cy="1178" r="7.5" fill="#FFFFFF" stroke="#333333" stroke-width="1"/>
 <text x="654" y="1181.5" font-size="9" text-anchor="middle" fill="#333333">20</text>
 <line x1="640" y1="1226" x2="1116" y2="1226" stroke="#333333" stroke-width="1.2" marker-end="url(#arrow)"/>

@@ -8,7 +8,8 @@ package com.github.im.contract;
  *   <caption>key 归属</caption>
  *   <tr><th>key</th><th>写方</th><th>读方</th></tr>
  *   <tr><td>{@link #GATEWAY_USER_PREFIX}{userId}</td><td>长连接服务</td><td>IM 服务（下行路由，SET 集合：多端可能同时在多个实例上）</td></tr>
- *   <tr><td>{@link #OFFLINE_PREFIX}{userId}</td><td>IM 服务</td><td>IM 服务</td></tr>
+ *   <tr><td>{@link #OFFLINE_PREFIX}{userId}</td><td>IM 服务</td><td>IM 服务（单聊离线帧队列，带 TTL/上限）</td></tr>
+ *   <tr><td>{@link #OFFLINE_PTR_PREFIX}{userId}</td><td>IM 服务</td><td>IM 服务（群聊补发指针，带 TTL）</td></tr>
  *   <tr><td>{@link #CONV_MESSAGES_PREFIX}{conversationId}</td><td>IM 服务</td><td>IM 服务</td></tr>
  *   <tr><td>{@link #SEQ_PREFIX}{conversationId}</td><td>IM 服务</td><td>IM 服务</td></tr>
  *   <tr><td>{@link #IDEM_PREFIX}{from}|{clientMsgId}</td><td>IM 服务</td><td>IM 服务</td></tr>
@@ -26,9 +27,26 @@ public final class RedisKeys {
      * <p>是集合而不是单值：多端时同一用户可能同时连在多个网关实例上，
      * 下行必须逐个实例推送，再由各实例分发给本机上的设备。
      */
-    public static final String GATEWAY_USER_PREFIX = "im:gw:user:";
-    /** 离线消息帧队列（List） */
+    public static final String GATEWAY_USER_PREFIX = "im:gateway:user:";
+    /**
+     * 单聊离线消息帧队列（List，带 TTL 与长度上限）。
+     *
+     * <p>只放「一条消息只有一个收件人」的场景；群聊走 {@link #OFFLINE_PTR_PREFIX}。
+     */
     public static final String OFFLINE_PREFIX = "im:offline:";
+    /**
+     * 群聊离线补发指针（Hash：{@code conversationId -> 待补发的 seq}，带 TTL）。
+     *
+     * <p>为什么不给群聊存帧：一条群消息要写给所有不在线成员，500 人群 9 成不在线时，
+     * 存帧就是每条消息 450 份相同内容，且随消息数线性增长。改成指针后，每个
+     * 「用户 × 会话」只占一个 field，后续消息只把同一个 field 往前推，
+     * <b>占用不随消息数增长</b>——补发时再按 seq 从会话历史重建帧。
+     *
+     * <p><b>注意前缀包含关系</b>：本前缀以 {@link #OFFLINE_PREFIX} 开头，所以任何
+     * {@code im:offline:*} 的批量扫描/迁移/清理都会把指针 key 一起算进来。
+     * 需要批量处理时请显式区分这两种 key，不要图省事直接用外层前缀。
+     */
+    public static final String OFFLINE_PTR_PREFIX = "im:offline:ptr:";
     /** 会话消息存储（List，按 seq 追加） */
     public static final String CONV_MESSAGES_PREFIX = "im:conv:msgs:";
     /**

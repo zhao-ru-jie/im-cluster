@@ -10,7 +10,7 @@ import org.springframework.scheduling.annotation.EnableScheduling;
  * <p>本进程只做「连接」这一件事：
  * <ul>
  *   <li>维护长连接会话（Netty 双通道：WebSocket + 原生 TCP）、心跳续期、空闲清理、优雅摘流；</li>
- *   <li>写在线路由表 {@code im:gw:user:{userId}}；</li>
+ *   <li>写在线路由表 {@code im:gateway:user:{userId}}；</li>
  *   <li>上行：gRPC {@code MessageIngress} 交给 IM 服务；下行：暴露 {@code DownstreamPush} 供 IM 服务回推。</li>
  * </ul>
  * 不含消息存储、会话业务、数据库访问——所以它的扩缩容只跟「连接数」有关，
