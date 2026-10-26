@@ -8,6 +8,7 @@ import com.github.im.gateway.protocol.ClientFrames;
 import com.github.im.gateway.session.ClientSession;
 import com.github.im.gateway.session.ConnectionManager;
 import com.github.im.gateway.session.GatewayRegistry;
+import com.github.im.proto.ingress.v1.AckPendingRequest;
 import com.github.im.proto.ingress.v1.PullPendingRequest;
 import com.github.im.proto.ingress.v1.PullPendingResponse;
 import com.github.im.proto.ingress.v1.SubmitMessageRequest;
@@ -84,7 +85,7 @@ public class SessionLifecycle {
         log.info("user {} connected on gateway {} via {} device={} devices={}", userId,
                 registry.localInstanceId(), session.transport(), session.deviceId(),
                 connectionManager.deviceCount(userId));
-        pullPending(userId, Map.of());
+        pullPending(session, Map.of());
     }
 
     /** 收到一帧上行报文（WS 的 TextMessage / TCP 的长度帧解码后的 String） */
@@ -114,7 +115,7 @@ public class SessionLifecycle {
         }
         if (ClientFrames.TYPE_SYNC.equals(type)) {
             // 上报消费水位 + 顺带补拉缺口。放在 send 之前处理：它不改消息流，只更新服务端视图。
-            pullPending(userId, watermarksOf(node));
+            pullPending(session, watermarksOf(node));
             return;
         }
         if (type != null && !ClientFrames.TYPE_SEND.equals(type)) {
@@ -194,24 +195,49 @@ public class SessionLifecycle {
      * <p>补发和「登记水位」共用一次 RPC：两者都是「连接建立/客户端主动 sync」时的必然动作，
      * 分成两个接口只会多一次往返，且容易出现「只调了补发、忘了登记水位」的漏调。
      */
-    private void pullPending(String userId, Map<String, Long> watermarks) {
+    /**
+     * 拉取并补发该设备的离线/漫游缺口，<b>全部写成功之后才回确认</b>。
+     *
+     * <p>这里是「离线补发至少一次」的关键一环：服务端 {@code pullPending} 只读不删，
+     * 它返回的帧必须真的写进连接才算消费掉。所以顺序是
+     * <b>读 → 逐帧写 → 全成功才 ack</b>，任何一帧写失败就停在原地（不 ack），
+     * 下次重连从同一位置重读——客户端按 {@code seq} 去重，重复无害，丢掉才是不可恢复的。
+     *
+     * <p>反过来（先 ack 再写、或服务端读即删）在网络抖动下的表现是：
+     * 用户看到「有离线消息」的提示，重连后却永远收不到那一批——这正是之前 at-most-once 的来源。
+     *
+     * @param session 补发所属连接，deviceId 决定用哪一套游标（手机/网页各自补、互不干扰）
+     */
+    private void pullPending(ClientSession session, Map<String, Long> watermarks) {
+        String userId = session.userId();
         MessageIngress ingress = ingressProvider.getIfAvailable();
         if (ingress == null) {
             return;
         }
+        String deviceId = deviceKeyOf(session);
         try {
             PullPendingRequest.Builder request = PullPendingRequest.newBuilder()
                     .setUserId(userId)
+                    .setDeviceId(deviceId)
                     .setMax(DEFAULT_PULL_MAX);
             if (!watermarks.isEmpty()) {
                 request.putAllWatermarks(watermarks);
             }
             // 通过grpc调用RemoteMessageIngress这个类，grpc服务端MessageIngressGrpcService接收到请求，会调用MessageService这个类进行业务处理
             PullPendingResponse pending = ingress.pullPending(request.build());
+            boolean allSent = true;
             for (String frame : pending.getFramesList()) {
                 if (!connectionManager.send(userId, frame)) {
+                    allSent = false;
                     break;
                 }
+            }
+            if (allSent) {
+                ackPending(ingress, userId, deviceId, pending);
+            } else {
+                // 不 ack = 服务端游标不动，下次重连重发同一批。绝不「先确认再写」。
+                log.warn("[offline] 补发中途写失败，保留原位置待下次重连重发 user={} device={} delivered={}/{}",
+                        userId, deviceId, pending.getFramesCount() - 1, pending.getFramesCount());
             }
             if (pending.getRemaining() > 0) {
                 log.info("user {} still has {} pending messages", userId, pending.getRemaining());
@@ -220,6 +246,41 @@ public class SessionLifecycle {
             metrics.ingressFailed("pull", e);
             log.warn("pull pending for {} failed: {}", userId, e.getMessage());
         }
+    }
+
+    /**
+     * 把「这批帧已经写进连接」告诉 IM 服务，让它推进该设备的游标。
+     *
+     * <p>失败只记日志不回抛：确认丢了最坏就是下次重连重复补发（客户端按 seq 去重），
+     * 把补发失败升级成连接层错误反而会伤害真正稀缺的东西。
+     */
+    private void ackPending(MessageIngress ingress, String userId, String deviceId, PullPendingResponse pending) {
+        if (pending.getAckSingleSeq() <= 0 && pending.getAckGroupSeqsCount() == 0) {
+            return;
+        }
+        try {
+            ingress.ackPending(AckPendingRequest.newBuilder()
+                    .setUserId(userId)
+                    .setDeviceId(deviceId)
+                    .setAckSingleSeq(pending.getAckSingleSeq())
+                    .putAllAckGroupSeqs(pending.getAckGroupSeqsMap())
+                    .build());
+        } catch (RuntimeException e) {
+            metrics.ingressFailed("ack", e);
+            log.warn("[offline] 补发确认失败（下次重连会重发同一批，客户端按 seq 去重）user={} device={} err={}",
+                    userId, deviceId, e.getMessage());
+        }
+    }
+
+    /**
+     * 补发游标用的设备键：与 {@code ConnectionManager} 的 default 槽位对齐。
+     *
+     * <p>归一化必须和那里一致，否则「不带 deviceId 的客户端」会被当成另一个设备，
+     * 各写一套游标，两边都补不到对方已经确认过的消息。
+     */
+    private static String deviceKeyOf(ClientSession session) {
+        String deviceId = session.deviceId();
+        return deviceId == null || deviceId.isBlank() ? "default" : deviceId;
     }
 
     /**

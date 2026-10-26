@@ -29,7 +29,19 @@ service MessageIngress {
   // 群聊离线不按人存帧（一条群消息 = 全体不在线成员份相同内容，会随消息数线性膨胀），
   // 只按「用户 × 会话」记一个待补发 seq；帧由本接口按该 seq 区间从会话历史重建，
   // 结构与实时推送的 msg.push 完全一致。
+  //
+  // 关键语义：本接口 **只读不移除**。返回的帧要等网关真的写进连接之后，再调 AckPending
+  // 推进游标；网关写失败/进程崩溃则不 ack，下次重连从原位置重读（客户端按 seq 去重）。
+  // 这就是「离线补发至少一次」的实现方式——在此之前 drain 是破坏性读，写失败即丢。
   rpc PullPending(PullPendingRequest) returns (PullPendingResponse);
+
+  // 确认一批补发帧已经写进客户端连接（至少一次投递的「确认」半程）。
+  //
+  // 为什么确认放在网关而不是 IM 服务：只有网关知道 writeAndFlush 是否成功、连接是否还活着。
+  // 为什么不做成「每条帧一个 ACK」：补发天然是一批（一次 PullPending 的产物），
+  // 逐帧确认会把 RPC 次数放大到帧数级别；而客户端本身已有「按 seq 去重」的硬约定，
+  // 批量确认最多导致重复补发，不会丢。
+  rpc AckPending(AckPendingRequest) returns (AckPendingResponse);
 }
 
 message SubmitMessageRequest {
@@ -77,10 +89,36 @@ message PullPendingRequest {
   //
   // 语义：可空、可只报部分会话、可重复上报（服务端按 conversation 取最大值）。
   map<string, int64> watermarks = 3;
+
+  // 补发所属设备（WS 的 deviceId / TCP connect 帧的 deviceId；缺省按 "default"）。
+  //
+  // 为什么补发必须知道设备：离线队列现在是「读不删 + 按游标确认」，
+  // 游标必须是 per-device 的——手机和网页各自补到哪互不相干。用用户级单一游标时，
+  // 先上线的设备一确认，另一个设备就永远补不到那段消息（这正是之前的 at-most-once 来源之一）。
+  string device_id = 4;
 }
 
 message PullPendingResponse {
   repeated string frames = 1; // 已序列化的下行帧，网关原样透传给客户端
   int32 remaining = 2;        // 仍滞留待拉取的数量（用于决定是否继续拉）：
                               // 单聊按帧计，群聊按「还有待补消息的会话数」计（不逐条数历史）
+
+  // —— 以下两个字段是「本批帧的确认位置」，网关在全部写成功后原样回传给 AckPending ——
+  //
+  // 0 / 空 map 表示本批没有需要确认的东西（没有帧、或全部来自旧结构的一次性迁移读）。
+  int64 ack_single_seq = 3;               // 单聊：本批覆盖到的最大 seq
+  map<string, int64> ack_group_seqs = 4;  // 群聊：conversation_id -> 本批补到哪（下一条待补的 seq）
+}
+
+message AckPendingRequest {
+  string user_id = 1;
+  string device_id = 2;                     // 与 PullPendingRequest.device_id 一致，定位游标
+  int64 ack_single_seq = 3;                 // 原样回传 PullPendingResponse.ack_single_seq
+  map<string, int64> ack_group_seqs = 4;    // 原样回传 PullPendingResponse.ack_group_seqs
+}
+
+message AckPendingResponse {
+  int32 code = 1;            // 0=已推进；其它值仅用于观测（确认失败不影响正确性，最多重复补发）
+  string message = 2;
+  int64 single_cursor = 3;   // 推进后的单聊游标，便于网关日志对账
 }

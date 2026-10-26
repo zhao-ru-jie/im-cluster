@@ -1,6 +1,8 @@
 package com.github.im.rpc.ingress;
 
 import com.github.im.contract.MessageIngress;
+import com.github.im.proto.ingress.v1.AckPendingRequest;
+import com.github.im.proto.ingress.v1.AckPendingResponse;
 import com.github.im.proto.ingress.v1.BatchSubmitRequest;
 import com.github.im.proto.ingress.v1.BatchSubmitResponse;
 import com.github.im.proto.ingress.v1.MessageIngressGrpc;
@@ -79,6 +81,20 @@ public class RemoteMessageIngress implements MessageIngress {
     @Override
     public PullPendingResponse pullPending(PullPendingRequest request) {
         return invoke(stub -> stub.pullPending(request));
+    }
+
+    /**
+     * 确认一批补发帧已写进连接。
+     *
+     * <p>与 {@link #submit} / {@link #pullPending} 的差别：<b>不走 waitForReady</b>。
+     * 确认失败最坏的结果是「下次重连把同一批消息再发一遍」，客户端按 seq 去重即可；
+     * 而 waitForReady 会让一个没有意义的确认占住虚拟线程直到 deadline，把补发路径一起拖慢。
+     */
+    @Override
+    public AckPendingResponse ackPending(AckPendingRequest request) {
+        return MessageIngressGrpc.newBlockingStub(channels.channelFor(target))
+                .withDeadlineAfter(timeoutMs, TimeUnit.MILLISECONDS)
+                .ackPending(request);
     }
 
     private <T> T invoke(Function<MessageIngressGrpc.MessageIngressBlockingStub, T> call) {

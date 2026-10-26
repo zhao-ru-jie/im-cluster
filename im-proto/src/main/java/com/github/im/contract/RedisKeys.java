@@ -8,8 +8,11 @@ package com.github.im.contract;
  *   <caption>key 归属</caption>
  *   <tr><th>key</th><th>写方</th><th>读方</th></tr>
  *   <tr><td>{@link #GATEWAY_USER_PREFIX}{userId}</td><td>长连接服务</td><td>IM 服务（下行路由，SET 集合：多端可能同时在多个实例上）</td></tr>
- *   <tr><td>{@link #OFFLINE_PREFIX}{userId}</td><td>IM 服务</td><td>IM 服务（单聊离线帧队列，带 TTL/上限）</td></tr>
- *   <tr><td>{@link #OFFLINE_PTR_PREFIX}{userId}</td><td>IM 服务</td><td>IM 服务（群聊补发指针，带 TTL）</td></tr>
+ *   <tr><td>{@link #OFFLINE_PREFIX}{userId}</td><td>IM 服务</td><td>IM 服务（<b>已废弃</b>的 List 队列，仅升级窗口内读一次）</td></tr>
+ *   <tr><td>{@link #OFFLINE_QUEUE_PREFIX}{userId}</td><td>IM 服务</td><td>IM 服务（单聊离线 ZSet，score=seq，读不删）</td></tr>
+ *   <tr><td>{@link #OFFLINE_CURSOR_PREFIX}{userId}:{deviceId}</td><td>IM 服务（网关 ack 驱动）</td><td>IM 服务（每设备已确认补发到的 seq）</td></tr>
+ *   <tr><td>{@link #CLIENT_WATERMARK_PREFIX}{userId}:{deviceId}</td><td>IM 服务</td><td>IM 服务（客户端亲口确认的已见 seq，delivered 口径）</td></tr>
+ *   <tr><td>{@link #OFFLINE_PTR_PREFIX}{userId}</td><td>IM 服务（网关 ack 驱动）</td><td>IM 服务（群聊补发指针，带 TTL）</td></tr>
  *   <tr><td>{@link #CONV_MESSAGES_PREFIX}{conversationId}</td><td>IM 服务</td><td>IM 服务</td></tr>
  *   <tr><td>{@link #SEQ_PREFIX}{conversationId}</td><td>IM 服务</td><td>IM 服务</td></tr>
  *   <tr><td>{@link #IDEM_PREFIX}{from}|{clientMsgId}</td><td>IM 服务</td><td>IM 服务</td></tr>
@@ -32,8 +35,53 @@ public final class RedisKeys {
      * 单聊离线消息帧队列（List，带 TTL 与长度上限）。
      *
      * <p>只放「一条消息只有一个收件人」的场景；群聊走 {@link #OFFLINE_PTR_PREFIX}。
+     *
+     * @deprecated 已被 {@link #OFFLINE_QUEUE_PREFIX}（ZSet）取代。本结构的问题是
+     *         「读即消费」（{@code LRANGE + LTRIM} 原子移走），网关拿到帧后写失败就丢，
+     *         属于 at-most-once。新队列按 seq 建索引 + per-device 游标，可以读不删、确认后再推进。
+     *         旧 key 仍被读取一次（升级窗口内把积压的帧发掉），之后自然过期。
      */
+    @Deprecated
     public static final String OFFLINE_PREFIX = "im:offline:";
+    /**
+     * 单聊离线消息队列（<b>ZSet</b>：{@code score = seq}，{@code member = 完整下行帧}）。
+     *
+     * <p>用 ZSet 而不是 List 的三个理由：
+     * <ol>
+     *   <li><b>能按 seq 定位</b>：补发起点是「该设备已确认到的 seq」，{@code ZRANGEBYSCORE key (cursor +inf}
+     *       是 O(log N + M)，List 只能按下标读，而 {@code LTRIM} 一裁下标就漂移；</li>
+     *   <li><b>读不删</b>：读的时候不动数据，由 {@link #OFFLINE_CURSOR_PREFIX} 的游标表达「谁读到哪了」，
+     *       于是「读到了但没发出去」不会丢；</li>
+     *   <li><b>天然有序</b>：按 seq 升序补发，不再依赖入队顺序（旧 List 的补发顺序是到达顺序，可能乱序）。</li>
+     * </ol>
+     *
+     * <p>裁剪仍按条数：写入时 {@code ZREMRANGEBYRANK 0 -(max+1)} 保留最新 {@code max} 条，
+     * 语义与旧 List 的 {@code LTRIM} 一致——超期/超量的用户放弃补发，历史仍在消息存储里。
+     *
+     * <p>前缀刻意与 {@link #OFFLINE_PREFIX} 不同（多一段 {@code q:}）：ZSet 与 List 同 key 会触发
+     * WRONGTYPE，换名字比「删掉重建」更安全（重建会把升级前积压的离线消息丢掉）。
+     */
+    public static final String OFFLINE_QUEUE_PREFIX = "im:offline:q:";
+    /**
+     * 单聊离线补发的<b>设备级游标</b>（String：该设备已确认收到的最大 seq）。
+     *
+     * <p>per-device 而不是 per-user：手机和网页各自补到哪互不相干。用户级单一游标的后果是
+     * 「先上线的设备一确认，另一个设备就永远补不到那段」——多端场景下等于丢消息。
+     *
+     * <p>游标<b>只前进</b>（{@code CAS}：只有新旧值都大于当前值才写），回退会导致重复补发死循环。
+     */
+    public static final String OFFLINE_CURSOR_PREFIX = "im:offline:cur:";
+    /**
+     * 客户端消费水位（Hash：{@code conversationId -> 客户端已确认收到的最大 seq}，per user+device）。
+     *
+     * <p>与 {@link #OFFLINE_CURSOR_PREFIX} 的区别：游标是「网关写进 socket 成功」，
+     * 水位是「客户端亲口说收到了」（{@code sync} 帧上报）。前者是<b>至少一次</b>的保证，
+     * 后者是<b>delivered</b> 的唯一可信口径——两者都需要，不能互相替代。
+     *
+     * <p>落 Redis 而不是只留进程内：进程重启就清空的表撑不起「已送达」这个语义，
+     * 而它同时还是 seq 发号器在「消息存储与计数器一起丢」时唯一的下界来源（见 {@code SeqAllocator}）。
+     */
+    public static final String CLIENT_WATERMARK_PREFIX = "im:wm:";
     /**
      * 群聊离线补发指针（Hash：{@code conversationId -> 待补发的 seq}，带 TTL）。
      *

@@ -502,8 +502,10 @@ CREATE TABLE im_group_member (
 
 | 场景 | key | 结构 | 为什么 |
 |------|-----|------|--------|
-| 单聊 | `im:offline:{userId}` | List（帧） | 一条消息只有一个收件人，存一份完整帧就是最省的形态 |
+| 单聊 | `im:offline:q:{userId}` | ZSet（score = 入队序号，member = 帧） | 一条消息只有一个收件人，存一份完整帧就是最省的形态 |
 | 群聊 | `im:offline:ptr:{userId}` | Hash `conversationId -> 待补发 seq` | 群消息收件人是全体成员，按人存帧会「一条消息 = 不在线人数份」 |
+
+> 旧的单聊 List 队列 `im:offline:{userId}` 已废弃，升级窗口内仍会读一次把积压帧发掉（读完即删）。
 
 **群聊为什么不存帧**：500 人群、450 人不在线、50 人各发 5 条 = 250 条消息 × 450 人 =
 112,500 份相同帧（~30MB），并且随消息数线性增长；每条群消息写入都是 450 次 RPUSH。
@@ -513,20 +515,61 @@ CREATE TABLE im_group_member (
 写路径都用 `HSETNX` 语义：字段已存在就保留**更小的**那个 seq（最早的未补发位置），
 否则中间那段会永远补不回来。
 
-补发（`MessageIngress.pullPending()`）：
+#### 补发是「至少一次」，不是「读即消费」
 
-1. 先 `drain` 单聊帧队列（同时覆盖升级前写下的群聊整帧，滚动升级不丢消息）；
-2. 再按指针逐会话补拉：起点 = `max(指针, 客户端上报水位 + 1)`，从会话历史取
+这是整条离线链路最容易出错的地方。**旧实现是 at-most-once**：单聊 `LRANGE + LTRIM` 在一个 Lua 里
+把帧原子移走，网关拿到之后才逐帧写 socket，一帧写失败就 `break` —— **已经移走但没发出的帧永远消失**，
+而单聊没有「从历史重建」的兜底路径；群聊更直接，指针在**读的时候**就推进了。
+
+现在的顺序是 **读 → 写进连接 → 确认 → 下次从确认处继续**：
+
+1. `pullPending` **只读不删、不推进任何游标**，同时返回两个确认位置：
+   `ack_single_seq`（单聊本批覆盖到的位置）和 `ack_group_seqs`（群聊每会话补到哪）；
+2. 网关把帧全部写进客户端连接；
+3. **全部成功才**调 `MessageIngress.ackPending` → 服务端推进游标；
+4. 中途失败 / 进程崩溃 = 不确认 = 游标不动，下次重连从原位置重读（客户端按 seq 去重）。
+
+**为什么单聊队列从 List 换成 ZSet**：补发起点是「这台设备已确认到的位置」，需要能按位置定位读
+（`ZRANGEBYSCORE key (cursor +inf LIMIT n`）。List 只能按下标读，而 `LTRIM` 一裁下标就整体漂移。
+用 score 索引还顺带修了旧 List 的另一个问题：补发顺序是「入队（到达）顺序」，本来可能乱序。
+
+> **score 不是消息的 seq**。seq 是**会话内**单调的，同一用户在不同会话里会出现相同的 seq
+> （`s:a:b` 的 5 和 `s:a:c` 的 5），拿它当 score 会让「游标推进到 5」直接吃掉另一个会话的 5。
+> 所以 score 用 per-user 的入队序号（`im:offline:q:{userId}` 旁边的 `:pos` 计数器，
+> 计数器丢了会从队列最大位置续上，不会从 1 重来导致顺序错乱）。
+
+**游标按设备隔离**：`im:offline:cur:{userId}:{deviceId}`。手机和网页各自补到哪互不相干——
+用户级单一游标的后果是「先上线的设备一确认，另一个设备就永远补不到那段」。
+删数据仍只按「总条数超上限」裁，不按游标裁（按游标裁会让先确认的设备删掉另一个设备还没读的消息）。
+
+#### 群聊补发的起点与上限
+
+1. 按指针逐会话补拉：起点 = `max(指针, 客户端上报水位 + 1)`，从会话历史取
    `seq > 起点` 的消息、用 `ClientFrames.frameOf()` 重建帧（与实时推送**同构**）；
-3. 补完更新指针：追平则清理字段，没补完则前进到最后一条 +1；单轮最多 20 个会话、
-   单次最多 200 帧，`remaining` 告诉客户端还有没有（单聊按帧计、群聊按会话计）。
+2. 单轮最多 20 个会话、单次最多 200 帧，`remaining` 告诉客户端还有没有
+   （单聊按**未确认**帧数计、群聊按会话数计）；
+3. 只有「确实一条历史都查不到」时才清掉指针——那是唯一可以安全删除的时机。
 
-三条硬约定：
+四条硬约定：
 
+- **拉取不推进游标**：推进只发生在 `ackPending` 里，即帧真的写进连接之后；
 - **历史查询失败绝不推进指针**：宁可下次重复补（客户端按 seq 去重），也不能把指针推过去——那等于永久丢一段消息；
-- **指针只前进不回退**：并发 pull（多端同时上线）读到同一个旧指针只会重复补发，回退会造成死循环；
+- **游标只前进不回退**：并发 pull（多端同时上线）读到同一个旧游标只会重复补发，回退会造成死循环；
 - **两条通道都有 TTL**：帧队列另有长度上限（`im.offline.max-frames`，默认 500）。
   长期不上线的用户不该让队列无界增长；超期未上线则放弃补发，历史仍在消息存储里，客户端可主动拉历史。
+
+#### 客户端水位：delivered 的唯一可信口径
+
+网关 `writeAndFlush` 成功只代表「进了 socket 缓冲区」，客户端可能早就断网了；只有客户端自己
+通过 `sync` 帧上报的水位才算「真的收到了」。这张表按 `im:wm:{userId}:{deviceId}` 落 Redis
+（Hash `conversationId -> seq`，只前进，默认 30 天 TTL），有两个用途：
+
+1. **delivered / 已读的对账数据**：排查「用户说没收到消息」时，这是唯一能证明「端侧收到了哪一条」的记录；
+2. **seq 发号器的第三道下界**：进程内那份副本（`ClientWatermarkStore` 的内存 map）在
+   「消息存储与计数器一起丢」时仍然有效，因为客户端水位是唯一不依赖 Redis 的证据。
+
+> 注意粒度是「会话级最大 seq」，不是逐条 ACK。逐条确认会把 RPC 次数放大到帧数级别，
+> 而 IM 的既有约定是「客户端按 seq 去重 + 补洞」，会话级水位已经够用——主流实现也是这么做的。
 
 ### 群聊与群成员
 
@@ -676,6 +719,8 @@ Nacos 未启用或连不上时，`NacosNodeDiscovery.resolveTarget()` **自动�
 | **重复投递** | `(from, clientMsgId)` 幂等：Redis 幂等表（带 TTL）+ MySQL 唯一索引兜底；重复提交返回原 `seq` |
 | **消息乱序** | `seq` 按 `conversationId` 用 `INCR` 单调分配；客户端按 `seq` 排序、拉齐空洞 |
 | **丢消息** | 先落库后推送；推送失败落离线队列；「可丢实时性，不可丢消息」 |
+| **离线补发丢消息** | 补发是 at-least-once：`pullPending` 读不删，网关全部写成功才 `ackPending` 推进游标；失败重连重复补，客户端按 seq 去重 |
+| **补发"已送达"不可判定** | 客户端 `sync` 上报的水位按 `im:wm:{userId}:{deviceId}` 落 Redis（30d TTL），是 delivered 的唯一可信口径 |
 | **网关宕机** | 路由 TTL 过期 + Nacos 健康剔除；残留路由由其他健康节点清理；消息转离线 |
 | **IM 服务不可用** | 网关**保住连接**，回 `error 503` 让客户端退避重发，不主动断连（连接比单条消息的实时性稀缺） |
 | **死连接** | Netty 心跳两段式探测，超时断开并清路由 |
@@ -878,9 +923,10 @@ kubectl apply -f k8s/im-node.yaml     # 或 im-gateway.yaml + im-server.yaml（�
 | `im.server.address` / `timeout-ms` / `wait-for-ready` | `IM_SERVER_ADDR` / `IM_SERVER_TIMEOUT_MS` / `IM_SERVER_WAIT_FOR_READY` | `127.0.0.1:9091` / `300` / `true` | 网关 → IM |
 | `im.push.timeout-ms` / `wait-for-ready` | `IM_PUSH_TIMEOUT_MS` / `IM_PUSH_WAIT_FOR_READY` | `800` / `false` | IM → 网关，超时即落离线 |
 | `im.delivery.max-inflight` | `IM_DELIVERY_MAX_INFLIGHT` | `1024` | 异步推送并发上限，打满即退化为同步推送 |
-| `im.offline.frame-ttl` | `IM_OFFLINE_FRAME_TTL` | `7d` | 单聊离线帧队列过期时间 |
-| `im.offline.max-frames` | `IM_OFFLINE_MAX_FRAMES` | `500` | 单聊离线帧队列每人上限（超出丢最旧） |
+| `im.offline.frame-ttl` | `IM_OFFLINE_FRAME_TTL` | `7d` | 单聊离线队列与设备游标的过期时间 |
+| `im.offline.max-frames` | `IM_OFFLINE_MAX_FRAMES` | `500` | 单聊离线队列每人上限（超出丢最旧） |
 | `im.offline.pointer-ttl` | `IM_OFFLINE_POINTER_TTL` | `7d` | 群聊补发指针过期时间（超期放弃补发，历史仍可主动拉） |
+| `im.watermark.ttl` | `IM_WATERMARK_TTL` | `30d` | 客户端消费水位保留时长（delivered 对账数据） |
 | `im.node.grpc-port` / `grpc-host` | `IM_GRPC_PORT` / `IM_GRPC_HOST` | `9090` / 自动探测 | 实例 ID |
 | `im.node.grpc.tls.enabled` / `trust-cert` | `IM_GRPC_TLS` / `IM_GRPC_TRUST` | `false` / 空 | gRPC TLS |
 | `im.node.grpc.health-check-enabled` | `IM_GRPC_HEALTH_CHECK` | `true` | 客户端健康检查（排除 NOT_SERVING 实例） |
@@ -892,8 +938,11 @@ kubectl apply -f k8s/im-node.yaml     # 或 im-gateway.yaml + im-server.yaml（�
 | key | 写方 | 读方 |
 |-----|------|------|
 | `im:gateway:user:{userId}` (SET) | 网关（TTL 续期） | IM 服务（下行路由：用户 → 网关实例集合） |
-| `im:offline:{userId}` (List) | IM 服务 | IM 服务（单聊离线帧队列，TTL + 长度上限） |
-| `im:offline:ptr:{userId}` (Hash) | IM 服务 | IM 服务（群聊补发指针：会话 → 待补发 seq，TTL） |
+| `im:offline:q:{userId}` (ZSet) + `:pos` (String) | IM 服务 | IM 服务（单聊离线队列，score = 入队序号；读不删，TTL + 长度上限） |
+| `im:offline:cur:{userId}:{deviceId}` (String) | IM 服务（网关 ack 驱动） | IM 服务（每设备已确认补发到的位置） |
+| `im:offline:ptr:{userId}` (Hash) | IM 服务（网关 ack 驱动） | IM 服务（群聊补发指针：会话 → 待补发 seq，TTL） |
+| `im:wm:{userId}:{deviceId}` (Hash) | IM 服务 | IM 服务（客户端亲口确认的已见 seq，delivered 口径，30d TTL） |
+| `im:offline:{userId}` (List) | — | **已废弃**，升级窗口内读一次把积压帧发掉 |
 | `im:conv:msgs:{conversationId}` | IM 服务（`im.storage=redis`） | IM 服务 |
 | `im:seq:{conversationId}` | IM 服务 | IM 服务 |
 | `im:idem:{from}\|{clientMsgId}` | IM 服务 | IM 服务 |
@@ -918,7 +967,7 @@ im-cluster/
 │   └── redis.yaml
 │
 ├── im-proto/                    # 契约层：两个服务唯一共享物
-│   ├── src/main/proto/im_ingress.proto       # 上行 SubmitMessage / BatchSubmit / PullPending
+│   ├── src/main/proto/im_ingress.proto       # 上行 SubmitMessage / BatchSubmit / PullPending / AckPending
 │   ├── src/main/proto/im_push.proto          # 下行 DownstreamPush.Push
 │   └── contract/
 │       ├── MessageEnvelope.java              # 消息信封（clientMsgId 幂等键 / conversationId 保序键）
@@ -1011,9 +1060,10 @@ im-cluster/
 - **多端靠 deviceId 区分**：`ConnectionManager` 的 key 是 `userId → deviceId → 会话`。
   同一 deviceId 重连踢旧连接；**不带 deviceId 的客户端全部落到 `default` 槽位**，
   等价于旧的「单用户单连接」——想多端必须带 deviceId。
-- **离线队列是「用户级」的**：`im:offline:{userId}` 会被**第一个**重连的设备一次性取走（`LTRIM` 语义），
-  其它设备拿不到同一批帧，需要按 seq 拉历史补齐。要真正做到「每设备独立水位」得把队列按
-  `userId+deviceId` 分片，那是下一步的事。
+- **离线队列共享、游标按设备分开**：队列还是「用户级」的一份（写入时不知道用户有哪些设备，
+  按设备写扩散代价太大），但**确认游标是 per-device** 的，所以先上线的设备不会把后上线的
+  那份吃掉——各自从自己的位置往后读，重复的那部分由客户端按 seq 去重。
+  仍然没有解决的是「一次 pull 的结果会扇出给该用户所有在线设备」，那一层留给多端同步。
 - **断连必须按会话移除**：见「可靠性设计」里的快速重连条目。
 - **客户端必须回 `pong`**：服务端发的应用层 `{"type":"ping"}` 需要应答，否则空闲超时后会被断开。
 - **鉴权只在建连时校验一次**：连接建立后 token 过期不会主动断连（长连接可能远活过 token 的 TTL）。

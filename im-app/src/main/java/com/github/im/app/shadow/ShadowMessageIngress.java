@@ -1,6 +1,8 @@
 package com.github.im.app.shadow;
 
 import com.github.im.contract.MessageIngress;
+import com.github.im.proto.ingress.v1.AckPendingRequest;
+import com.github.im.proto.ingress.v1.AckPendingResponse;
 import com.github.im.proto.ingress.v1.BatchSubmitRequest;
 import com.github.im.proto.ingress.v1.BatchSubmitResponse;
 import com.github.im.proto.ingress.v1.PullPendingRequest;
@@ -95,10 +97,28 @@ public class ShadowMessageIngress implements MessageIngress {
         return primaryResult;
     }
 
-    /** 拉取不双跑：离线消息是「读即消费」，双跑会重复消费 */
+    /**
+     * 拉取不双跑。
+     *
+     * <p>即使现在 `pullPending` 已经改成「读不删 + 确认后推进」，双跑仍然是错的：
+     * 两条链路会各自算出一份「补到哪」，而 ack 只回传给 primary，shadow 侧那份永远停在原地，
+     * 白白占着补发预算。
+     */
     @Override
     public PullPendingResponse pullPending(PullPendingRequest request) {
         return primary.pullPending(request);
+    }
+
+    /**
+     * 确认同样不双跑，且必须显式转发。
+     *
+     * <p>{@link MessageIngress#ackPending} 的默认实现是空操作——如果这里不覆盖，
+     * shadow 模式下就真的「没人推进游标」，表现为每次重连都把同一批离线消息重发一遍
+     * （不丢，但会持续重复）。默认实现存在的意义是给单测替身留余地，不是给装饰器偷懒的。
+     */
+    @Override
+    public AckPendingResponse ackPending(AckPendingRequest request) {
+        return primary.ackPending(request);
     }
 
     private void compareOne(SubmitMessageRequest request, SubmitMessageResponse primaryResult) {

@@ -41,6 +41,21 @@ public interface MessageIngress {
      * 实现侧必须把它并入 seq 发号器的下界——当消息存储与发号器共用同一个 Redis 且整体丢失时，
      * 客户端水位是唯一还活着的「这些 seq 已被消费过」的证据；缺了它，新消息会被客户端
      * 当历史重复丢弃，表现为「消息永久不显示」。
+     *
+     * <p><b>本方法只读不移除</b>：返回的帧不会因为被读走而从离线存储里消失，必须由调用方
+     * 在真的写进连接之后再调 {@link #ackPending}。这样「网关写到一半失败 / 进程崩溃」不会丢消息，
+     * 只是下次重连重复补发一遍（客户端按 seq 去重）。
      */
     PullPendingResponse pullPending(PullPendingRequest request);
+
+    /**
+     * 确认一批补发帧已经写进客户端连接。
+     *
+     * <p>默认实现是空操作（返回成功）：让只需要读路径的实现（如测试替身、或暂时不关心
+     * at-least-once 的本地实现）不用被迫实现它。真实实现必须覆盖，否则离线游标永不前进，
+     * 表现为「每次重连都把同一批消息重发一遍」。
+     */
+    default AckPendingResponse ackPending(AckPendingRequest request) {
+        return AckPendingResponse.newBuilder().setCode(0).setMessage("ok").build();
+    }
 }

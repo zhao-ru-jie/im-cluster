@@ -4,7 +4,10 @@ import com.github.im.contract.RedisKeys;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.Range;
+import org.springframework.data.redis.connection.Limit;
 import org.springframework.data.redis.connection.ReturnType;
+import org.springframework.data.redis.connection.zset.Tuple;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
@@ -17,14 +20,15 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 离线存储（归属 IM 服务，不再放在连接层）。
  *
  * <h2>两条通道，对应两种「放大倍数」</h2>
  *
- * <p><b>单聊 —— 帧队列</b>{@code im:offline:{userId}}（List）：一条消息只有一个收件人，
- * 存一份完整帧就是最省的形态，直接存，上线按 FIFO 补发。
+ * <p><b>单聊 —— 帧队列</b>{@code im:offline:q:{userId}}（ZSet）：一条消息只有一个收件人，
+ * 存一份完整帧就是最省的形态。
  *
  * <p><b>群聊 —— 补发指针</b>{@code im:offline:ptr:{userId}}（Hash，{@code conversationId -> 待补发 seq}）：
  * 群消息的收件人是全体成员，若也按人存帧，一条消息的存储量 = 不在线人数。
@@ -33,17 +37,43 @@ import java.util.Map;
  * 后续消息只把同一个 field 往前推——<b>占用不随消息数增长</b>，帧在补发时由
  * {@link ClientFrames#frameOf} 从 {@code im:conv:msgs:{conv}} / {@code im_message} 重建。
  *
- * <h2>为什么两种都带 TTL 与上限</h2>
+ * <h2>补发是「至少一次」，不是「读即消费」</h2>
+ *
+ * <p>这是本类最重要的一条约定。旧实现用 {@code LRANGE + LTRIM} 在一个 Lua 里把帧原子移走，
+ * 网关拿到之后才逐帧写 socket——只要有一帧写失败就 {@code break}，<b>已经移走但没发出的帧
+ * 永远消失</b>，而单聊没有「从历史重建」的兜底路径，属于 at-most-once。
+ *
+ * <p>现在的顺序是：<b>读 → 写进连接 → 确认 → 下次从确认处继续</b>：
+ * <ol>
+ *   <li>{@link #peek} 只读不删，返回帧和「本批覆盖到的位置」；</li>
+ *   <li>网关把这些帧全部写进客户端连接；</li>
+ *   <li>全部成功才调 {@code MessageIngress.ackPending} → {@link #ackFrames} 推进游标；</li>
+ *   <li>中途失败 / 进程崩溃 = 游标不动，下次重连从原位置重读（客户端按 seq 去重）。</li>
+ * </ol>
+ *
+ * <h2>为什么是 ZSet 而不是 List</h2>
+ *
+ * <p>补发起点是「这台设备已经确认到的<b>位置</b>」，需要能按位置定位读：
+ * {@code ZRANGEBYSCORE key (cursor +inf} 是 O(log N + M)。List 只能按下标读，而
+ * {@code LTRIM} 一裁下标就整体漂移，游标立刻失效。
+ *
+ * <p>score <b>不是</b>消息的 seq——seq 是<b>会话内</b>单调的，同一个用户在不同会话里会出现
+ * 相同的 seq（{@code s:a:b} 的 5 和 {@code s:a:c} 的 5），拿它当 score 会让「游标推进到 5」
+ * 直接吃掉另一个会话的 5。所以 score 用 per-user 的入队序号（{@link #PUSH_FRAME} 里的
+ * {@code INCR}），跨会话单调且唯一。
+ *
+ * <h2>多设备</h2>
+ *
+ * <p>游标是 per-device 的（{@code im:offline:cur:{userId}:{deviceId}}）：手机和网页各自补到哪
+ * 互不相干。删数据只按「总条数超上限」裁，不按游标裁——按游标裁会让先确认的设备把另一个
+ * 设备还没读的消息删掉。
+ *
+ * <h2>为什么两种通道都带 TTL 与上限</h2>
  *
  * <p>离线队列的写方是「消息」，读方却是「用户上线」——两者完全解耦，一个长期不上线的用户
  * 会让队列无界增长。所以两条通道都必须有兜底：帧队列有长度上限（{@code im.offline.max-frames}）
  * 与过期时间（{@code im.offline.frame-ttl}），指针有过期时间（{@code im.offline.pointer-ttl}）。
  * 超期未上线 = 放弃补发，历史仍在消息存储里，客户端可以主动拉历史。
- *
- * <h2>写路径全部是原子的</h2>
- *
- * <p>「追加 + 截断 + 续期」「HSETNX + 续期」「推进/清理指针」各自是一个 Lua 脚本：
- * 分成多条命令时，进程崩在中间会留下没有 TTL 的 key（永久泄漏），或把指针推过一个还没发出的 seq。
  *
  * @author zhaorujie
  * @since 1.0.0
@@ -56,25 +86,83 @@ public class OfflineMessageStore {
     /**
      * 每个 pipeline 装多少条命令。
      *
-     * <p>RPUSH / HSETNX 都很轻（不返回数据），单片控制在毫秒级即可，避免一条大群消息把 Redis 顶住。
+     * <p>ZADD / HSETNX 都很轻（不返回数据），单片控制在毫秒级即可，避免一条大群消息把 Redis 顶住。
      */
     private static final int PIPELINE_BATCH = 500;
 
-    /** 帧队列：追加 + 截断到上限 + 续期，一把原子完成（详见类注释） */
+    /** 没带 deviceId 的客户端共用这个槽位，与网关的 ConnectionManager 保持一致 */
+    private static final String DEFAULT_DEVICE = "default";
+
+    /**
+     * 单聊落帧：取位置 → 写入 → 按条数裁剪 → 续期，一把原子完成。
+     *
+     * <pre>
+     * KEYS[1] = im:offline:q:{userId}         (ZSet，score = 入队序号)
+     * KEYS[2] = im:offline:q:{userId}:pos     (String 计数器)
+     * ARGV[1] = 帧
+     * ARGV[2] = 上限条数
+     * ARGV[3] = TTL 毫秒
+     * </pre>
+     *
+     * <p>计数器丢了（过期 / Redis 重启）时<b>从当前 ZSet 的最后一个 score 续上</b>，
+     * 而不是从 1 重来——否则新帧的 score 会小于队列里已有帧，补发顺序直接错乱。
+     *
+     * <p>两个 key 共用 {@code {userId}} 这个 hash tag，保证 Cluster 下同 slot（Lua 跨 key）。
+     */
     private static final byte[] PUSH_FRAME = """
-            redis.call('RPUSH', KEYS[1], ARGV[1])
-            redis.call('LTRIM', KEYS[1], -tonumber(ARGV[2]), -1)
+            local base
+            local counter = redis.call('GET', KEYS[2])
+            if counter == false then
+                local top = redis.call('ZRANGE', KEYS[1], -1, -1, 'WITHSCORES')
+                if top[2] ~= nil then
+                    base = tonumber(top[2])
+                else
+                    base = 0
+                end
+            else
+                base = tonumber(counter)
+            end
+            local pos = base + 1
+            redis.call('SET', KEYS[2], pos, 'PX', ARGV[3])
+            redis.call('ZADD', KEYS[1], pos, ARGV[1])
+            redis.call('ZREMRANGEBYRANK', KEYS[1], 0, -tonumber(ARGV[2]) - 1)
             redis.call('PEXPIRE', KEYS[1], ARGV[3])
-            return 1
+            return pos
             """.getBytes(StandardCharsets.UTF_8);
 
-    /** 取走最多 N 条：LRANGE + LTRIM 必须在同一脚本里，否则并发 pull 会重复取走并二次截断（丢消息） */
-    private static final byte[] DRAIN_FRAMES = """
+    /**
+     * 旧版 List 队列的一次性读取（升级兼容）。
+     *
+     * <p>旧结构无法参与「按位置确认」（它本来就没有位置语义），但里面可能压着升级前的离线消息，
+     * 所以仍然整体读出来发一次，读完即删。属于过渡逻辑，可以随下一个大版本删除。
+     */
+    private static final byte[] DRAIN_LEGACY = """
             local frames = redis.call('LRANGE', KEYS[1], 0, tonumber(ARGV[1]) - 1)
             if #frames > 0 then
                 redis.call('LTRIM', KEYS[1], #frames, -1)
             end
             return frames
+            """.getBytes(StandardCharsets.UTF_8);
+
+    /**
+     * 推进某台设备的补发游标：<b>只前进</b>，并且顺带续期。
+     *
+     * <p>为什么不能回退：两台设备并发补发、或客户端快速重连时，旧连接携带的较小 ack 会晚到；
+     * 允许回退就是「永远在原地重复补发」的死循环。
+     *
+     * <pre>KEYS[1] = im:offline:cur:{userId}:{deviceId}；ARGV[1] = 新位置；ARGV[2] = TTL 毫秒</pre>
+     *
+     * @return 推进后的游标
+     */
+    private static final byte[] ADVANCE_CURSOR = """
+            local cur = tonumber(redis.call('GET', KEYS[1]) or '0')
+            local next = tonumber(ARGV[1])
+            if next > cur then
+                redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+                return next
+            end
+            redis.call('PEXPIRE', KEYS[1], ARGV[2])
+            return cur
             """.getBytes(StandardCharsets.UTF_8);
 
     /**
@@ -90,37 +178,38 @@ public class OfflineMessageStore {
             """.getBytes(StandardCharsets.UTF_8);
 
     /**
-     * 推进或清理补发指针（原子）。
+     * 群聊补发确认：把指针推到「已经写进连接」的位置。
+     *
+     * <p>与旧实现的区别：旧版在<b>读取时</b>就把指针推过去（帧还没下发），一旦网关写失败，
+     * 那段消息就永久跳过了；现在推进只发生在 {@code AckPending} 里，失败则指针不动。
+     *
+     * <p>这里不再做「追平就删 field」——ack 路径不知道自己是否真的追平了（网关只回传位置）。
+     * 清理由 {@link #clearPending} 在读路径完成，且只在「确实一条都查不到」时执行，
+     * 那种情况下没有任何数据可丢。
      *
      * <pre>
-     * KEYS[1] = im:offline:ptr:{userId}
-     * ARGV[1] = conversationId
-     * ARGV[2] = 本次读到的旧指针（期望值）
-     * ARGV[3] = 新指针（已补到的最后一条 seq + 1）
-     * ARGV[4] = '1' 表示本次已追平（历史里没有更多了）
+     * KEYS[1] = im:offline:ptr:{userId}；ARGV[1] = conversationId；ARGV[2] = 新位置；ARGV[3] = TTL 毫秒
      * </pre>
      *
-     * <p>三种结果，都不能丢消息：
-     * <ul>
-     *   <li>追平且期间没有新消息（值仍是期望值）→ 删掉 field，key 空则自然消失；</li>
-     *   <li>追平但期间又落了新消息（值被改小以外的写改过）→ 只前进不删除，
-     *       下一轮 pull 会把多出来的补上；</li>
-     *   <li>没追平 → 单调前进，<b>绝不回退</b>（回退会导致重复补发甚至死循环）。</li>
-     * </ul>
+     * @return 1 = 真的前进了；0 = 字段不存在或已经更靠前
      */
     private static final byte[] ADVANCE_PENDING = """
             local cur = redis.call('HGET', KEYS[1], ARGV[1])
             if cur == false then
                 return 0
             end
-            if ARGV[4] == '1' and cur == ARGV[2] then
-                return redis.call('HDEL', KEYS[1], ARGV[1])
-            end
-            if tonumber(ARGV[3]) > tonumber(cur) then
-                redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
+            if tonumber(ARGV[2]) > tonumber(cur) then
+                redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+                redis.call('PEXPIRE', KEYS[1], ARGV[3])
                 return 1
             end
             return 0
+            """.getBytes(StandardCharsets.UTF_8);
+
+    /** 确实没有待补数据时清掉该会话的指针（读路径上执行，安全） */
+    private static final byte[] CLEAR_PENDING = """
+            redis.call('HDEL', KEYS[1], ARGV[1])
+            return 1
             """.getBytes(StandardCharsets.UTF_8);
 
     private final StringRedisTemplate redis;
@@ -136,16 +225,33 @@ public class OfflineMessageStore {
         this.frameTtl = frameTtl;
         this.maxFramesPerUser = Math.max(maxFramesPerUser, 1);
         this.pointerTtl = pointerTtl;
-        log.info("[offline] 单聊帧队列上限 {} 条/人、TTL {}；群聊补发指针 TTL {}",
+        log.info("[offline] 单聊离线队列上限 {} 条/人、TTL {}（读不删 + 按设备游标确认）；群聊补发指针 TTL {}",
                 this.maxFramesPerUser, frameTtl, pointerTtl);
+    }
+
+    /**
+     * 一次补发读到的内容。
+     *
+     * @param frames       待下发的帧（按入队位置升序）
+     * @param ackSeq       本批覆盖到的位置（0 = 没有需要确认的东西）
+     * @param legacyFrames 旧 List 队列里迁出来的帧；没有位置语义，不参与确认
+     */
+    public record FrameBatch(List<String> frames, long ackSeq, List<String> legacyFrames) {
+
+        public static final FrameBatch EMPTY = new FrameBatch(List.of(), 0L, List.of());
+
+        public boolean isEmpty() {
+            return frames.isEmpty() && legacyFrames.isEmpty();
+        }
     }
 
     // ==== 单聊：帧队列 ====
 
     public void store(String userId, String frame) {
         redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
-                PUSH_FRAME, ReturnType.INTEGER, 1,
-                key(RedisKeys.OFFLINE_PREFIX + userId),
+                PUSH_FRAME, ReturnType.INTEGER, 2,
+                queueKey(userId),
+                positionKey(userId),
                 frame.getBytes(StandardCharsets.UTF_8),
                 String.valueOf(maxFramesPerUser).getBytes(StandardCharsets.UTF_8),
                 String.valueOf(frameTtl.toMillis()).getBytes(StandardCharsets.UTF_8)));
@@ -173,14 +279,14 @@ public class OfflineMessageStore {
             try {
                 redis.executePipelined((RedisCallback<Object>) connection -> {
                     for (String userId : batch) {
-                        connection.scriptingCommands().eval(PUSH_FRAME, ReturnType.INTEGER, 1,
-                                key(RedisKeys.OFFLINE_PREFIX + userId), payload, maxFrames, ttlMillis);
+                        connection.scriptingCommands().eval(PUSH_FRAME, ReturnType.INTEGER, 2,
+                                queueKey(userId), positionKey(userId), payload, maxFrames, ttlMillis);
                     }
                     return null;
                 });
                 stored += batch.size();
             } catch (RuntimeException e) {
-                // Cluster 跨 slot（每个用户一个 key，必然不同 slot）或 Redis 瞬时故障：
+                // Cluster 跨 slot（每个用户一个 hash tag，必然不同 slot）或 Redis 瞬时故障：
                 // 退化为逐条写，慢但保证这批人不会静默丢消息
                 log.warn("[offline] 批量落离线失败（{} 人），退化为逐条写入: {}", batch.size(), e.getMessage());
                 for (String userId : batch) {
@@ -197,32 +303,123 @@ public class OfflineMessageStore {
     }
 
     /**
-     * 取走最多 {@code max} 条离线帧（单聊 + 升级前遗留的群聊帧）。
+     * 读一批待补发的帧，<b>不删除任何数据</b>。
      *
-     * <p>{@code LRANGE} 与 {@code LTRIM} 在一个 Lua 里完成：分成两条命令时，
-     * 两个并发 pull（重连风暴、多端同时上线）会各自读到同一批、再各自截断一次，直接丢消息。
+     * <p>起点是该设备上一次确认到的位置（{@code (cursor +inf}），所以：
+     * <ul>
+     *   <li>上次写成功并确认过 → 从下一个位置继续，不重复；</li>
+     *   <li>上次写失败 / 进程崩溃（没确认）→ 从同一位置重读，重复但不丢；</li>
+     *   <li>游标已过期 → 从 0 开始整队重读，仍然不丢（只是重复，客户端按 seq 去重）。</li>
+     * </ul>
+     *
+     * <p>顺带把旧 List 队列的残留读出来（一次性迁移），它没有位置语义所以不参与确认。
      */
-    public List<String> drain(String userId, int max) {
+    public FrameBatch peek(String userId, String deviceId, int max) {
         if (max <= 0) {
-            return List.of();
+            return FrameBatch.EMPTY;
         }
-        List<byte[]> raw = redis.execute((RedisCallback<List<byte[]>>) connection ->
-                connection.scriptingCommands().eval(DRAIN_FRAMES, ReturnType.MULTI, 1,
-                        key(RedisKeys.OFFLINE_PREFIX + userId),
-                        String.valueOf(max).getBytes(StandardCharsets.UTF_8)));
-        if (raw == null || raw.isEmpty()) {
-            return List.of();
+        List<String> legacy = legacyDrain(userId, max);
+        int budget = max - legacy.size();
+        if (budget <= 0) {
+            return new FrameBatch(List.of(), 0L, legacy);
         }
-        List<String> frames = new ArrayList<>(raw.size());
-        for (byte[] frame : raw) {
-            frames.add(new String(frame, StandardCharsets.UTF_8));
+        long cursor = cursorOf(userId, deviceId);
+        // score 是 per-user 入队序号（从 1 起），超过 2^53 才会丢精度，实际不可达
+        Range<Double> range = Range.of(Range.Bound.exclusive((double) cursor), Range.Bound.unbounded());
+        Set<Tuple> tuples = readFrames(queueKey(userId), range, Limit.limit().count(budget));
+        if (tuples == null || tuples.isEmpty()) {
+            return new FrameBatch(List.of(), 0L, legacy);
         }
-        return frames;
+        List<String> frames = new ArrayList<>(tuples.size());
+        long ackSeq = 0L;
+        for (Tuple tuple : tuples) {
+            byte[] member = tuple.getValue();
+            if (member == null) {
+                continue;
+            }
+            frames.add(new String(member, StandardCharsets.UTF_8));
+            Double score = tuple.getScore();
+            if (score != null && (long) (double) score > ackSeq) {
+                ackSeq = (long) (double) score;
+            }
+        }
+        return new FrameBatch(frames, ackSeq, legacy);
     }
 
-    public long size(String userId) {
-        Long size = redis.opsForList().size(RedisKeys.OFFLINE_PREFIX + userId);
-        return size == null ? 0L : size;
+    /**
+     * 确认本批帧已经写进客户端连接：把该设备的游标推到 {@code ackSeq}。
+     *
+     * @return 推进后的游标（调用方只用于日志对账）
+     */
+    public long ackFrames(String userId, String deviceId, long ackSeq) {
+        if (ackSeq <= 0) {
+            return cursorOf(userId, deviceId);
+        }
+        Long cursor = redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
+                ADVANCE_CURSOR, ReturnType.INTEGER, 1,
+                key(cursorKey(userId, deviceId)),
+                String.valueOf(ackSeq).getBytes(StandardCharsets.UTF_8),
+                String.valueOf(frameTtl.toMillis()).getBytes(StandardCharsets.UTF_8)));
+        return cursor == null ? 0L : cursor;
+    }
+
+    /** 某台设备已确认到的位置（0 = 从未确认过） */
+    public long cursorOf(String userId, String deviceId) {
+        String raw = redis.opsForValue().get(cursorKey(userId, deviceId));
+        if (raw == null || raw.isBlank()) {
+            return 0L;
+        }
+        try {
+            return Long.parseLong(raw.trim());
+        } catch (NumberFormatException e) {
+            return 0L;
+        }
+    }
+
+    /**
+     * 还有多少条<b>该设备尚未确认</b>的帧。
+     *
+     * <p>不能用 {@code zCard}（队列总条数）当 {@code remaining}：已经确认过的帧要等到被裁剪
+     * 才消失，用总数会让客户端永远看到「还剩一堆」，从而无限重拉。这里是按游标数区间。
+     */
+    @SuppressWarnings("deprecation")
+    public long pendingFrames(String userId, String deviceId) {
+        long cursor = cursorOf(userId, deviceId);
+        Range<Double> range = Range.of(Range.Bound.exclusive((double) cursor), Range.Bound.unbounded());
+        Long queued = redis.execute((RedisCallback<Long>) connection ->
+                connection.zSetCommands().zCount(queueKey(userId), range));
+        Long legacy = redis.opsForList().size(RedisKeys.OFFLINE_PREFIX + userId);
+        return (queued == null ? 0L : queued) + (legacy == null ? 0L : legacy);
+    }
+
+    /**
+     * 旧 List 队列的一次性读取，读完即删。
+     *
+     * <p>只用于升级兼容：旧结构是「读即消费」，没有位置概念，无法纳入新的确认协议。
+     * 读出来发一次就够——写失败也只是重复补发不到（本来它就没有这个保证），
+     * 不会比升级前更差。
+     */
+    @SuppressWarnings("deprecation")
+    private List<String> legacyDrain(String userId, int max) {
+        String key = RedisKeys.OFFLINE_PREFIX + userId;
+        try {
+            List<byte[]> raw = redis.execute((RedisCallback<List<byte[]>>) connection ->
+                    connection.scriptingCommands().eval(DRAIN_LEGACY, ReturnType.MULTI, 1,
+                            key(key), String.valueOf(max).getBytes(StandardCharsets.UTF_8)));
+            if (raw == null || raw.isEmpty()) {
+                return List.of();
+            }
+            List<String> frames = new ArrayList<>(raw.size());
+            for (byte[] frame : raw) {
+                frames.add(new String(frame, StandardCharsets.UTF_8));
+            }
+            log.info("[offline] 从旧 List 队列迁出 {} 条离线帧 user={}", frames.size(), userId);
+            return frames;
+        } catch (RuntimeException e) {
+            // 新结构是 ZSet、旧结构是 List：同前缀不同 key 不会撞类型，这里只是兜 Redis 故障
+            log.warn("[offline] 读取旧离线队列失败（忽略）user={} err={}", userId, e.getMessage());
+            return List.of();
+        }
     }
 
     // ==== 群聊：补发指针 ====
@@ -276,7 +473,7 @@ public class OfflineMessageStore {
     /**
      * 当前待补发的会话指针（按会话 ID 字典序取前 {@code limit} 个）。
      *
-     * <p>排序是为了多次 pull 之间能稳定推进：每次只处理前 N 个，处理完的会被推进或删除，
+     * <p>排序是为了多次 pull 之间能稳定推进：每次只处理前 N 个，处理完的会被确认推进或清理，
      * 保证不会永远卡在同一批会话上。
      *
      * @return conversationId → 待补发 seq（最早的未补发位置）
@@ -314,23 +511,83 @@ public class OfflineMessageStore {
     }
 
     /**
-     * 推进（或清理）补发指针，语义见 {@link #ADVANCE_PENDING}。
+     * 推进补发指针（由 {@code AckPending} 调用，即「帧已经写进连接」之后）。
      *
-     * @param expectedFrom 本次拉取开始前读到的指针值（用于判断期间是否又被写入）
-     * @param nextSeq      补到哪了（已补发最后一条的 seq + 1）
-     * @param caughtUp     本次是否已经把历史补完
+     * @param nextSeq 补到哪了（已下发最后一条的 seq + 1）
+     * @return true = 真的前进了
      */
-    public void advancePending(String userId, String conversationId, long expectedFrom, long nextSeq, boolean caughtUp) {
-        redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
+    public boolean ackGroupPending(String userId, String conversationId, long nextSeq) {
+        if (conversationId == null || conversationId.isBlank() || nextSeq <= 0) {
+            return false;
+        }
+        Long moved = redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
                 ADVANCE_PENDING, ReturnType.INTEGER, 1,
                 key(RedisKeys.OFFLINE_PTR_PREFIX + userId),
                 conversationId.getBytes(StandardCharsets.UTF_8),
-                String.valueOf(expectedFrom).getBytes(StandardCharsets.UTF_8),
                 String.valueOf(nextSeq).getBytes(StandardCharsets.UTF_8),
-                (caughtUp ? "1" : "0").getBytes(StandardCharsets.UTF_8)));
+                String.valueOf(pointerTtl.toMillis()).getBytes(StandardCharsets.UTF_8)));
+        return moved != null && moved > 0;
+    }
+
+    /**
+     * 清掉某个会话的补发指针。
+     *
+     * <p><b>只允许在读路径上、且确实一条历史都查不到时调用</b>——那种情况下指针指向的位置之后
+     * 已经没有消息，删掉它不会漏掉任何东西。反过来在 ack 路径上删就是不安全的：
+     * 网关只回传「本批补到哪」，并不知道历史是否已经追平，期间若有新消息写入，
+     * 删掉指针等于把那段永久标记成已补发。
+     */
+    public void clearPending(String userId, String conversationId) {
+        redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
+                CLEAR_PENDING, ReturnType.INTEGER, 1,
+                key(RedisKeys.OFFLINE_PTR_PREFIX + userId),
+                conversationId.getBytes(StandardCharsets.UTF_8)));
     }
 
     // ==== 内部 ====
+
+    /**
+     * 按位置区间读帧（只读命令，不删除任何数据）。
+     *
+     * <p>用 low-level 的 {@code zRangeByScoreWithScores} 而不是 {@code opsForZSet()}：
+     * 只有前者同时支持「开区间下界」和「LIMIT」，而开区间正是「游标之后」的语义
+     * （闭区间会把上一次已经确认过的那一条再读一遍）。
+     */
+    private Set<Tuple> readFrames(byte[] queueKey, Range<Double> range, Limit limit) {
+        return redis.execute((RedisCallback<Set<Tuple>>) connection ->
+                connection.zSetCommands().zRangeByScoreWithScores(queueKey, range, limit));
+    }
+
+    /**
+     * 队列 key 带 {@code {userId}} hash tag：同一个用户的两个 key（队列 + 位置计数器）
+     * 必须落在同一个 slot，否则 Cluster 下 {@link #PUSH_FRAME} 会报 CROSSSLOT。
+     */
+    private static byte[] queueKey(String userId) {
+        return key(queueKeyOf(userId));
+    }
+
+    /** key 的单一来源：测试清理也用它构造，避免 key 格式改了以后测试静默失效 */
+    static String queueKeyOf(String userId) {
+        return RedisKeys.OFFLINE_QUEUE_PREFIX + "{" + userId + "}";
+    }
+
+    private static byte[] positionKey(String userId) {
+        return key(RedisKeys.OFFLINE_QUEUE_PREFIX + "{" + userId + "}:pos");
+    }
+
+    private static String cursorKey(String userId, String deviceId) {
+        return RedisKeys.OFFLINE_CURSOR_PREFIX + "{" + userId + "}:" + normalizeDevice(deviceId);
+    }
+
+    /** 包级可见：供测试清理游标 key */
+    static String cursorKeyOf(String userId, String deviceId) {
+        return cursorKey(userId, deviceId);
+    }
+
+    /** 空 deviceId 与网关的 default 槽位对齐，避免同一台「无 deviceId 客户端」产生两套游标 */
+    public static String normalizeDevice(String deviceId) {
+        return deviceId == null || deviceId.isBlank() ? DEFAULT_DEVICE : deviceId;
+    }
 
     private static byte[] key(String redisKey) {
         return redisKey.getBytes(StandardCharsets.UTF_8);

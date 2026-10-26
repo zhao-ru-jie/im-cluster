@@ -1,5 +1,7 @@
 package com.github.im.server.grpc;
 
+import com.github.im.proto.ingress.v1.AckPendingRequest;
+import com.github.im.proto.ingress.v1.AckPendingResponse;
 import com.github.im.proto.ingress.v1.BatchSubmitRequest;
 import com.github.im.proto.ingress.v1.BatchSubmitResponse;
 import com.github.im.proto.ingress.v1.MessageIngressGrpc;
@@ -52,6 +54,13 @@ public class MessageIngressGrpcService extends MessageIngressGrpc.MessageIngress
     public void pullPending(PullPendingRequest request,
                             StreamObserver<PullPendingResponse> responseObserver) {
         responseObserver.onNext(messageIngress.pullPending(request));
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void ackPending(AckPendingRequest request,
+                           StreamObserver<AckPendingResponse> responseObserver) {
+        responseObserver.onNext(messageIngress.ackPending(request));
         responseObserver.onCompleted();
     }
 }

@@ -4,6 +4,8 @@ import com.github.im.contract.MessageEnvelope;
 import com.github.im.contract.MessageEnvelopes;
 import com.github.im.contract.MessageIngress;
 import com.github.im.contract.RedisKeys;
+import com.github.im.proto.ingress.v1.AckPendingRequest;
+import com.github.im.proto.ingress.v1.AckPendingResponse;
 import com.github.im.proto.ingress.v1.PullPendingRequest;
 import com.github.im.proto.ingress.v1.PullPendingResponse;
 import com.github.im.proto.ingress.v1.SubmitMessageRequest;
@@ -16,6 +18,7 @@ import org.springframework.util.StringUtils;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -153,10 +156,14 @@ public class MessageService implements MessageIngress {
      * 补发离线消息：两条通道，对应两种放大倍数（详见 {@link OfflineMessageStore} 类注释）。
      *
      * <ol>
-     *   <li><b>单聊帧队列</b>：直接 {@code drain} 出来，顺带把升级前写下的群聊整帧也带出去；</li>
+     *   <li><b>单聊帧队列</b>：按「该设备已确认的位置」往后读，<b>读完不删</b>；</li>
      *   <li><b>群聊指针</b>：离线期间只记了「这个人在这个会话上补到哪」，这里按 seq 区间
      *       从会话历史取消息、用 {@link ClientFrames#frameOf} 重建帧。</li>
      * </ol>
+     *
+     * <p><b>本方法只读不移除，也不推进任何游标</b>。这是「至少一次」的实现方式：
+     * 返回的帧等网关真的写进客户端连接之后，由它调 {@link #ackPending} 推进。
+     * 写失败 / 进程崩溃 = 游标不动，下次重连从原位置重读（客户端按 seq 去重）。
      *
      * <p>为什么要用客户端上报的水位兜一层：用户离线时记下指针后，可能又连着收了一段时间的
      * 实时推送（指针不会因为实时推送而前移，少一次每条消息的写）。补发时从
@@ -168,38 +175,90 @@ public class MessageService implements MessageIngress {
         if (!StringUtils.hasText(userId)) {
             return PullPendingResponse.getDefaultInstance();
         }
-        // 先登记客户端上报的消费水位，再补发离线帧：这个接口顺带承担「上报水位」的职责，
-        // 让发号器多一道与 Redis 无关的下界（见 ClientWatermarkStore 的说明）。
-        watermarkStore.observe(request.getWatermarksMap());
+        String deviceId = OfflineMessageStore.normalizeDevice(request.getDeviceId());
+        // 先登记客户端上报的消费水位，再补发离线帧：这个接口顺带承担「上报水位」的职责。
+        // 双写：进程内那份给发号器当 Redis 丢失时的下界，Redis 那份是「已送达」的可查询口径。
+        watermarkStore.observe(userId, deviceId, request.getWatermarksMap());
         int max = request.getMax() > 0 ? request.getMax() : DEFAULT_PULL_MAX;
 
         List<String> out = new ArrayList<>(max);
-        out.addAll(offlineMessageStore.drain(userId, max));
+        OfflineMessageStore.FrameBatch batch = offlineMessageStore.peek(userId, deviceId, max);
+        out.addAll(batch.legacyFrames());
+        out.addAll(batch.frames());
+
+        Map<String, Long> groupAcks = new LinkedHashMap<>();
         int pendingConversations = 0;
         if (out.size() < max) {
-            pendingConversations = pullGroupPending(userId, request.getWatermarksMap(), max - out.size(), out);
+            pendingConversations = pullGroupPending(userId, request.getWatermarksMap(),
+                    max - out.size(), out, groupAcks);
         }
         return PullPendingResponse.newBuilder()
                 .addAllFrames(out)
-                .setRemaining((int) (offlineMessageStore.size(userId) + pendingConversations))
+                // 只数「该设备还没确认的」，不能数队列总条数：已确认的帧要等裁剪才消失，
+                // 用总数会让客户端永远看到「还剩一堆」而无限重拉
+                .setRemaining((int) (offlineMessageStore.pendingFrames(userId, deviceId) + pendingConversations))
+                .setAckSingleSeq(batch.ackSeq())
+                .putAllAckGroupSeqs(groupAcks)
                 .build();
+    }
+
+    /**
+     * 确认一批补发帧已经写进客户端连接，推进对应游标。
+     *
+     * <p>幂等且只前进：同一批重复确认、或旧连接的确认晚到，都只是空操作。
+     * 确认失败不影响正确性（最多重复补发），所以这里把异常转成非 0 code 而不是抛出去——
+     * 网关不该因为一次确认失败就把连接搞坏。
+     */
+    @Override
+    public AckPendingResponse ackPending(AckPendingRequest request) {
+        String userId = request.getUserId();
+        if (!StringUtils.hasText(userId)) {
+            return AckPendingResponse.newBuilder().setCode(CODE_BAD_REQUEST).setMessage("user_id is required").build();
+        }
+        String deviceId = OfflineMessageStore.normalizeDevice(request.getDeviceId());
+        try {
+            long cursor = offlineMessageStore.ackFrames(userId, deviceId, request.getAckSingleSeq());
+            int advanced = 0;
+            for (Map.Entry<String, Long> entry : request.getAckGroupSeqsMap().entrySet()) {
+                if (offlineMessageStore.ackGroupPending(userId, entry.getKey(), entry.getValue())) {
+                    advanced++;
+                }
+            }
+            log.debug("[offline] 补发确认 user={} device={} singleCursor={} groupAdvanced={}",
+                    userId, deviceId, cursor, advanced);
+            return AckPendingResponse.newBuilder()
+                    .setCode(CODE_OK)
+                    .setMessage("ok")
+                    .setSingleCursor(cursor)
+                    .build();
+        } catch (RuntimeException e) {
+            log.error("[offline] 补发确认失败（最多导致重复补发，不影响不丢）user={} device={} err={}",
+                    userId, deviceId, e.getMessage());
+            return AckPendingResponse.newBuilder()
+                    .setCode(CODE_UNAVAILABLE)
+                    .setMessage("ack failed: " + e.getMessage())
+                    .build();
+        }
     }
 
     /**
      * 群聊补发：按会话指针从历史里取 {@code seq > 起点} 的消息并重建帧。
      *
-     * <p>两条硬约定：
+     * <p>三条硬约定：
      * <ul>
      *   <li><b>历史查询失败绝不推进指针</b>：宁可下次多补一遍（客户端按 seq 去重），
      *       也不能把指针推过去，那等于永久丢一段消息；</li>
-     *   <li><b>指针只前进</b>：并发 pull（多端同时上线、重连风暴）可能读到同一个旧指针，
-     *       各自补发一遍是重复但无害的，回退才会造成死循环。</li>
+     *   <li><b>这里不推进指针</b>：只把「本批补到哪」登记进 {@code acks}，由网关写成功后再确认。
+     *       以前在读路径直接推进，网关写失败那段消息就永久跳过了；</li>
+     *   <li><b>确实查不到数据才清指针</b>：那是唯一可以安全删除的时机——指针之后没有消息了。</li>
      * </ul>
      *
      * @param budget 本次还能补多少帧（全局上限，避免一个用户把整轮 pull 撑爆）
+     * @param acks   输出参数：本次待确认的「会话 → 下一条待补的 seq」
      * @return 本次之后仍有待补消息的会话数
      */
-    private int pullGroupPending(String userId, Map<String, Long> watermarks, int budget, List<String> out) {
+    private int pullGroupPending(String userId, Map<String, Long> watermarks, int budget,
+                                 List<String> out, Map<String, Long> acks) {
         Map<String, Long> pending = offlineMessageStore.pendingConversations(userId, MAX_PULL_CONVERSATIONS);
         if (pending.isEmpty()) {
             return 0;
@@ -224,14 +283,19 @@ public class MessageService implements MessageIngress {
                 remaining++;
                 continue;
             }
+            if (messages.isEmpty()) {
+                // 指针之后确实没有消息了（或已被裁剪）：清掉指针是安全的，没有数据可丢
+                offlineMessageStore.clearPending(userId, conversationId);
+                continue;
+            }
             for (StoredMessage message : messages) {
                 out.add(frames.frameOf(message));
             }
             budget -= messages.size();
-            boolean caughtUp = messages.size() < limit;
-            long nextSeq = messages.isEmpty() ? pendingFrom : messages.get(messages.size() - 1).seq() + 1;
-            offlineMessageStore.advancePending(userId, conversationId, pendingFrom, nextSeq, caughtUp);
-            if (!caughtUp) {
+            // 只登记待确认位置，不推进：网关写成功后会带着它回调 ackPending
+            acks.put(conversationId, messages.get(messages.size() - 1).seq() + 1);
+            if (messages.size() >= limit) {
+                // 本次预算被这个会话吃满，很可能还有更多
                 remaining++;
             }
         }
