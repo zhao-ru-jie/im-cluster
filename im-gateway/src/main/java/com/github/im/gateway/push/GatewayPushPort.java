@@ -65,13 +65,15 @@ public class GatewayPushPort implements PushPort {
         List<String> targets = task.getTargetUserIdsList();
         Set<String> delivered = new LinkedHashSet<>();
 
-        // 按「目标网关实例」分组：同一次任务可能涉及多个实例（群聊扇出、多端跨实例）
+        // 批量查路由：群聊扇出按人逐个查是 N 次串行往返（5000 人 = 1~2.5s），
+        // 这里一次分片 pipeline 查完，随后按「目标网关实例」分组。
+        Map<String, Set<String>> routes = registry.instancesOfAll(targets);
         Map<String, List<String>> byInstance = new LinkedHashMap<>();
         for (String userId : targets) {
             // 路由表里没有 = 视为离线；真正的离线存储在 IM 服务侧。
             // 多端时一个用户可能同时在多个实例上，必须每个实例都推。
-            for (String instance : registry.instancesOf(userId)) {
-                byInstance.computeIfAbsent(instance, key -> new ArrayList<>()).add(userId);
+            for (String instance : routes.getOrDefault(userId, Set.of())) {
+                byInstance.computeIfAbsent(instance, _ -> new ArrayList<>()).add(userId);
             }
         }
 
