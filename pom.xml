@@ -20,6 +20,10 @@
 
     <properties>
         <java.version>25</java.version>
+        <!-- MyBatis-Plus 不在 Spring Boot BOM 里，版本必须在这里钉住：
+             3.5.16 的 spring-boot4-starter 才支持 Spring Boot 4 / Spring Framework 7，
+             误用 spring-boot3-starter 会在启动时因 Spring 6 的 API 缺失而失败。 -->
+        <mybatis-plus.version>3.5.16</mybatis-plus.version>
     </properties>
 
     <!--
@@ -92,6 +96,11 @@
                 <groupId>com.github</groupId>
                 <artifactId>im-storage-jdbc</artifactId>
                 <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.baomidou</groupId>
+                <artifactId>mybatis-plus-spring-boot4-starter</artifactId>
+                <version>${mybatis-plus.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

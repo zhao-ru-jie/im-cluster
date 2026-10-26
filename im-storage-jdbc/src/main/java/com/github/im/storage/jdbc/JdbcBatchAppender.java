@@ -1,9 +1,13 @@
 package com.github.im.storage.jdbc;
 
 import com.github.im.server.message.StoredMessage;
+import com.github.im.storage.jdbc.entity.MessageEntity;
+import com.github.im.storage.jdbc.mapper.MessageMapper;
+import org.apache.ibatis.session.ExecutorType;
+import org.apache.ibatis.session.SqlSession;
+import org.apache.ibatis.session.SqlSessionFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -23,6 +27,13 @@ import java.util.concurrent.LinkedBlockingQueue;
  *
  * <p>把 N 条插入放进一个事务，fsync 摊薄成 1/N。N=64 时同样的盘能到几万 QPS。
  *
+ * <h2>为什么不用 {@code saveBatch}</h2>
+ *
+ * <p>MyBatis-Plus 的 {@code saveBatch} 是「开一个 {@code ExecutorType.BATCH} 的 SqlSession，
+ * 循环 insert，最后 `flushStatements`」，但它<b>不负责提交</b>——提交时机由 Spring 事务决定。
+ * 本类的契约是「{@code append} 返回 = 已提交」，所以这里显式地自己开 BATCH 会话并
+ * {@code commit()}，不把「是否已落库」这个判断交给外层有没有开事务。
+ *
  * <h2>为什么不在「攒批窗口」上浪费延迟</h2>
  *
  * <p>常见写法是「等满 2ms 再提交」，低负载时每条消息平白多 2ms。这里用的是
@@ -30,7 +41,7 @@ import java.util.concurrent.LinkedBlockingQueue;
  * <ol>
  *   <li>调用方把消息放进队列并等自己的 future；</li>
  *   <li>后台线程阻塞等第一条，醒来后<b>非阻塞地</b>把队列里现有的全部取出；</li>
- *   <li>一次 {@code batchUpdate} 提交，complete 所有 future。</li>
+ *   <li>一个 BATCH 会话提交，complete 所有 future。</li>
  * </ol>
  * 于是：消息稀疏时队列里只有一条 → 立即提交（<b>零额外延迟</b>）；
  * 消息密集时队列里本来就有很多条 → 自然合并成大事务。Nagle 算法的同一个思路。
@@ -57,19 +68,20 @@ final class JdbcBatchAppender implements AutoCloseable {
     /** 队列容量：真正的上限是「同时等待落库的消息数」，超了就走同步写 */
     private static final int QUEUE_CAPACITY = 8_192;
 
-    private static final String INSERT_SQL = JdbcMessageRepository.INSERT_SQL;
-
     private record Pending(StoredMessage message, CompletableFuture<Void> done) {
     }
 
-    private final JdbcTemplate jdbc;
+    private final SqlSessionFactory sqlSessionFactory;
+    /** 同步写路径用：Spring 注入的 Mapper 代理每条语句自动提交 */
+    private final MessageMapper mapper;
     private final BlockingQueue<Pending> queue = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
     private final Thread flusher;
     private final boolean enabled;
     private volatile boolean running = true;
 
-    JdbcBatchAppender(JdbcTemplate jdbc, boolean enabled) {
-        this.jdbc = jdbc;
+    JdbcBatchAppender(SqlSessionFactory sqlSessionFactory, MessageMapper mapper, boolean enabled) {
+        this.sqlSessionFactory = sqlSessionFactory;
+        this.mapper = mapper;
         this.enabled = enabled;
         this.flusher = Thread.ofPlatform()
                 .name("im-db-batcher")
@@ -118,9 +130,7 @@ final class JdbcBatchAppender implements AutoCloseable {
     }
 
     private void insertNow(StoredMessage message) {
-        jdbc.update(INSERT_SQL, message.conversationId(), message.seq(), message.serverMsgId(),
-                message.from(), message.to(), message.convType(), message.clientMsgId(),
-                message.body(), message.createdAt());
+        mapper.insert(MessageEntity.from(message));
     }
 
     /** 后台线程：阻塞等第一条 → 非阻塞抽干队列 → 一个事务提交 */
@@ -146,18 +156,22 @@ final class JdbcBatchAppender implements AutoCloseable {
         }
     }
 
+    /**
+     * 一个 BATCH 会话提交整批。
+     *
+     * <p>顺序是「先 commit 再 complete future」：反过来会让调用方在事务提交前就回 ack，
+     * 一旦提交失败就变成「客户端以为落库了、实际没有」——这正是本类要防的场景。
+     */
     private void flush(List<Pending> batch) {
         if (batch.isEmpty()) {
             return;
         }
-        List<Object[]> args = new ArrayList<>(batch.size());
-        for (Pending pending : batch) {
-            StoredMessage m = pending.message();
-            args.add(new Object[]{m.conversationId(), m.seq(), m.serverMsgId(), m.from(), m.to(),
-                    m.convType(), m.clientMsgId(), m.body(), m.createdAt()});
-        }
-        try {
-            jdbc.batchUpdate(INSERT_SQL, args);
+        try (SqlSession session = sqlSessionFactory.openSession(ExecutorType.BATCH, false)) {
+            MessageMapper batchMapper = session.getMapper(MessageMapper.class);
+            for (Pending pending : batch) {
+                batchMapper.insert(MessageEntity.from(pending.message()));
+            }
+            session.commit();
             batch.forEach(pending -> pending.done().complete(null));
             if (batch.size() > 1) {
                 log.debug("[storage] group commit 合并 {} 条消息", batch.size());

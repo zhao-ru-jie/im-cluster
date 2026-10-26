@@ -1,14 +1,16 @@
 package com.github.im.storage.jdbc;
 
+import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.github.im.server.group.GroupMemberRepository;
-import org.springframework.jdbc.core.JdbcTemplate;
+import com.github.im.storage.jdbc.entity.GroupMemberEntity;
+import com.github.im.storage.jdbc.mapper.GroupMemberMapper;
 
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 
 /**
- * MySQL 版群成员存储（{@code im.storage=jdbc}）。
+ * MySQL 版群成员存储（{@code im.storage=jdbc}），基于 MyBatis-Plus。
  *
  * <p>表结构见 {@code db/schema.sql} 的 {@code im_group_member}：
  * {@code uk_group_member (group_id, user_id)} 保证加成员幂等，
@@ -22,26 +24,20 @@ import java.util.List;
  */
 public class JdbcGroupMemberRepository implements GroupMemberRepository {
 
-    /** INSERT IGNORE 把「重复加成员」的幂等语义下沉到数据库的唯一索引 */
-    private static final String INSERT_SQL = """
-            INSERT IGNORE INTO im_group_member (group_id, user_id, role, created_at)
-            VALUES (?, ?, ?, ?)
-            """;
-
-    private static final String DELETE_SQL = """
-            DELETE FROM im_group_member WHERE group_id = ? AND user_id = ?
-            """;
-
-    private static final String MEMBERS_SQL = """
-            SELECT user_id FROM im_group_member WHERE group_id = ?
-            """;
+    /**
+     * 一条 INSERT 里最多塞多少人。
+     *
+     * <p>每人 4 个占位符，500 人 = 2000 个参数，离 MySQL 的 65535 上限很远，
+     * 同时也避免单条 SQL 过长把 max_allowed_packet 顶爆。
+     */
+    private static final int INSERT_CHUNK = 500;
 
     private static final String DEFAULT_ROLE = "MEMBER";
 
-    private final JdbcTemplate jdbc;
+    private final GroupMemberMapper mapper;
 
-    public JdbcGroupMemberRepository(JdbcTemplate jdbc) {
-        this.jdbc = jdbc;
+    public JdbcGroupMemberRepository(GroupMemberMapper mapper) {
+        this.mapper = mapper;
     }
 
     @Override
@@ -50,20 +46,30 @@ public class JdbcGroupMemberRepository implements GroupMemberRepository {
             return;
         }
         long now = System.currentTimeMillis();
-        List<Object[]> batch = new ArrayList<>(userIds.size());
-        for (String userId : userIds) {
-            batch.add(new Object[]{groupId, userId, DEFAULT_ROLE, now});
+        List<String> batch = new ArrayList<>(userIds);
+        for (int from = 0; from < batch.size(); from += INSERT_CHUNK) {
+            List<String> chunk = batch.subList(from, Math.min(from + INSERT_CHUNK, batch.size()));
+            // INSERT IGNORE：重复加人由 uk_group_member 静默跳过（等价于 Redis 的 SADD）
+            mapper.insertIgnoreBatch(groupId, chunk, DEFAULT_ROLE, now);
         }
-        jdbc.batchUpdate(INSERT_SQL, batch);
     }
 
     @Override
     public void removeMember(String groupId, String userId) {
-        jdbc.update(DELETE_SQL, groupId, userId);
+        mapper.delete(Wrappers.<GroupMemberEntity>lambdaQuery()
+                .eq(GroupMemberEntity::getGroupId, groupId)
+                .eq(GroupMemberEntity::getUserId, userId));
     }
 
     @Override
     public List<String> membersOf(String groupId) {
-        return jdbc.queryForList(MEMBERS_SQL, String.class, groupId);
+        List<GroupMemberEntity> rows = mapper.selectList(Wrappers.<GroupMemberEntity>lambdaQuery()
+                .select(GroupMemberEntity::getUserId)
+                .eq(GroupMemberEntity::getGroupId, groupId));
+        List<String> members = new ArrayList<>(rows.size());
+        for (GroupMemberEntity row : rows) {
+            members.add(row.getUserId());
+        }
+        return members;
     }
 }

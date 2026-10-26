@@ -12,32 +12,40 @@
 
     <artifactId>im-storage-jdbc</artifactId>
     <name>im-storage-jdbc</name>
-    <description>MessageRepository 的 MySQL 实现（im.storage=jdbc 时生效）</description>
+    <description>MessageRepository / GroupMemberRepository 的 MySQL 实现（MyBatis-Plus，im.storage=jdbc 时生效）</description>
 
     <dependencies>
-        <!-- 只需要 IM 服务的存储端口（MessageRepository / StoredMessage） -->
+        <!-- 只需要 IM 服务的存储端口（MessageRepository / StoredMessage / GroupMemberRepository） -->
         <dependency>
             <groupId>com.github</groupId>
             <artifactId>im-server</artifactId>
         </dependency>
 
-        <!-- 刻意不用 spring-boot-starter-jdbc：它会在没有 DSN 时触发 DataSource 自动装配并启动失败。
-             这里手工装配 HikariDataSource，只有显式配置 im.storage=jdbc 才创建连接池。 -->
+        <!--
+          持久层用 MyBatis-Plus：
+            - 单表 CRUD / 条件查询（recent、since、maxSeq）走 BaseMapper + LambdaQueryWrapper，
+              不用手写 SQL，字段改名时编译期就会报错；
+            - 只有 MySQL 方言才有的语义（如 INSERT IGNORE 的幂等加成员）才落到 Mapper 上的注解 SQL。
+
+          注意必须用 spring-boot4-starter：spring-boot3-starter 依赖 Spring 6，
+          在 Spring Framework 7 上会因 API 缺失启动失败。
+
+          它会把 spring-boot-starter-jdbc 一并带进来（spring-jdbc + HikariCP 我们本来就在用），
+          但 MybatisPlusAutoConfiguration 是 @ConditionalOnSingleCandidate(DataSource.class)：
+          im.storage=redis 时不创建 DataSource，MyBatis 相关 Bean 一个都不会生成。
+        -->
         <dependency>
-            <groupId>org.springframework</groupId>
-            <artifactId>spring-jdbc</artifactId>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-spring-boot4-starter</artifactId>
         </dependency>
-        <dependency>
-            <groupId>com.zaxxer</groupId>
-            <artifactId>HikariCP</artifactId>
-        </dependency>
+
         <dependency>
             <groupId>com.mysql</groupId>
             <artifactId>mysql-connector-j</artifactId>
             <scope>runtime</scope>
         </dependency>
 
-        <!-- group commit 的合并/失败语义可以用 mock 的 JdbcTemplate 完整覆盖，不需要真库 -->
+        <!-- group commit 的合并/失败语义可以用 mock 的 SqlSessionFactory 完整覆盖，不需要真库 -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
