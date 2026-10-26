@@ -28,13 +28,19 @@ import java.util.stream.Collectors;
  * <ul>
  *   <li>Nacos 负责：「gatewayInstanceId → 实时可达的 gRPC 地址(ip:port)」，带健康探针；</li>
  *   <li>Redis 负责：「userId → gatewayInstanceId」这种 per-user 会话路由，Nacos 管不了；</li>
- *   <li>IM 服务本身不注册到 Nacos，网关通过 K8s Service / 静态地址调用 IM 服务的
- *       {@code MessageIngress}（IM 服务是无状态应用，普通 Service 负载均衡即可）。</li>
+ *   <li>「网关 → IM 服务」的上行寻址<b>不由本类负责</b>：IM 服务由它自己注册
+ *       （{@code im-server-boot} 的 {@code ServerNacosRegistrar}，service=im-server，
+ *       注册的是 gRPC 端口），网关侧由 {@code im-gateway-boot} 的 {@code IngressTargets}
+ *       订阅该服务的健康实例，再交给 gRPC 的 {@code round_robin} 轮询；
+ *       订阅不到时才回退 {@code im.server.address}（静态地址兜底）。
+ *       之所以不用 K8s Service 做四层负载：gRPC 是长连接，连上就粘在同一台 Pod 上，
+ *       起 N 个 im-server 会只有一个在干活。</li>
  * </ul>
  *
  * <p><b>不健康监听</b>：订阅实例变更，diff 出掉队的实例并调用
  * {@link GatewayRegistry#removeInstanceBindings(String)} 清理 Redis 路由，
- * 避免窗口期内消息持续推往死实例。清理动作发生在其它健康实例上（死实例自己已无法执行）。
+ * 避免窗口期内消息持续推往死实例。清理动作发生在其它健康实例上（死实例自己已无法执行），
+ * 并且按确定性选主只让<b>其中一台</b>执行——否则 N-1 台会各扫一遍全库（见 {@link #cleanDeadInstance}）。
  *
  * @author zhaorujie
  * @since 1.0.0
@@ -127,25 +133,75 @@ public class GatewayNacosDiscovery {
                     .filter(Objects::nonNull)
                     .collect(Collectors.toSet());
 
+            // 排序后再选主：Nacos 通知里的实例顺序不保证一致，不排序各实例会算出不同的 owner
+            List<String> aliveSorted = nowHealthy.stream().sorted().toList();
+
             for (String gone : new HashSet<>(healthyInstanceIds)) {
                 if (nowHealthy.contains(gone)) {
                     continue;
                 }
+                // 自己「变不健康」时只更新本地视图，绝不清理 Redis 路由，原因有三：
+                //   1. 进程真死了，这段监听根本不会执行——死实例的路由只能由活着的实例代劳清理；
+                //   2. 进程还活着时只有两种可能：主动摘流（deregisterSelf 之后仍要靠这些路由
+                //      收推送、广播 session.migrate）与 Nacos 心跳抖动。两种情况下本机连接都
+                //      好好的，删掉自己的路由会让 IM 服务把这些在线用户判成离线、消息误落离线队列；
+                //   3. 真死了也有兜底：路由 TTL 30s，只靠本实例每 10s 一次的续期维持；
+                //      而删掉之后下一轮续期又会写回来，等于白造一个 0~10s 的假离线窗口。
                 if (gone.equals(addressResolver.localInstanceId())) {
                     healthyInstanceIds.remove(gone);
                     continue;
                 }
-                log.warn("[nacos] 网关实例 {} 不再健康，清理 Redis 中该实例的用户路由", gone);
-                try {
-                    gatewayRegistry.removeInstanceBindings(gone);
-                } catch (Exception ex) {
-                    log.error("[nacos] 清理实例 {} 的 Redis 路由失败: {}", gone, ex.getMessage());
-                }
                 healthyInstanceIds.remove(gone);
+                cleanDeadInstance(gone, aliveSorted);
             }
             healthyInstanceIds.addAll(nowHealthy);
         };
         namingService.subscribe(serviceName, instanceListener);
+    }
+
+    /**
+     * 清理一个已下线实例残留的用户路由，<b>保证同一时刻只有一个实例真正执行</b>。
+     *
+     * <p>为什么必须去重：Nacos 把「XX 不健康」推给<b>每个</b>订阅者，N-1 个活实例都会走到这里，
+     * 而 {@link GatewayRegistry#removeInstanceBindings(String)} 是一次 O(全部在线用户) 的全库 SCAN。
+     * N-1 份并发正好砸在「刚掉一个节点、客户端批量重连、路由表读写最忙」的时刻，
+     * 等于拿 Redis 单线程的延迟去换一次本来就可有可无的清理。
+     *
+     * <p>选主规则：健康实例列表<b>排序</b>后取 {@code hash(死实例ID) % 实例数}。不需要锁、
+     * 不需要协调，天然只清一次；排序是前提，否则各实例算出的 owner 会不一致。
+     *
+     * <p>漏清是安全的：命中的 owner 自己也恰好不可用时没人清理，死实例的路由因为不再被续期，
+     * 30s TTL 后自然过期；这期间多出来的无效推送由 IM 服务的 {@code failed_user_ids} 落离线兜底。
+     */
+    private void cleanDeadInstance(String deadInstanceId, List<String> aliveSorted) {
+        if (aliveSorted.isEmpty()) {
+            log.warn("[nacos] 网关实例 {} 不再健康，但当前无健康实例可执行清理，交由路由 TTL 兜底", deadInstanceId);
+            return;
+        }
+        String owner = cleanupOwnerOf(deadInstanceId, aliveSorted);
+        if (!owner.equals(addressResolver.localInstanceId())) {
+            log.debug("[nacos] 网关实例 {} 不再健康，由 {} 负责清理路由（本实例跳过）", deadInstanceId, owner);
+            return;
+        }
+        log.warn("[nacos] 网关实例 {} 不再健康，本实例负责清理其在 Redis 中的用户路由", deadInstanceId);
+        try {
+            gatewayRegistry.removeInstanceBindings(deadInstanceId);
+        } catch (Exception ex) {
+            log.error("[nacos] 清理实例 {} 的 Redis 路由失败: {}", deadInstanceId, ex.getMessage());
+        }
+    }
+
+    /**
+     * 「谁负责清理这个死实例的路由」的确定性选主：所有实例对同一组输入必须算出同一结果。
+     *
+     * <p>抽成静态纯函数是为了能单测：选主错了不会抛异常，只会退化成「多台一起扫全库」或
+     * 「谁都不扫」，前者表现为故障瞬间 Redis 抖一下，后者表现为消息多绕 30s 才落离线，
+     * 两个方向在线上都很难看出来。
+     *
+     * @param aliveSorted 已排序的健康实例 ID 列表；<b>排序是选主一致性的前提</b>
+     */
+    static String cleanupOwnerOf(String deadInstanceId, List<String> aliveSorted) {
+        return aliveSorted.get(Math.floorMod(deadInstanceId.hashCode(), aliveSorted.size()));
     }
 
     private String instanceIdOf(Instance ins) {
