@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.github</groupId>
+        <artifactId>im-cluster</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>im-benchmark</artifactId>
+    <name>im-benchmark</name>
+    <description>压测端：用大量 WebSocket 长连接压网关的建连 / 心跳 / 上行受理与下行推送链路</description>
+
+    <!--
+      依赖边界（与「压测端只依赖协议、不依赖业务实现」的约定一致）：
+        只依赖 Netty 与 Jackson，不依赖 im-gateway / im-server / im-rpc。
+        原因：压测端要是把被测服务的实现打进自己的 classpath，
+        压测进程的 GC / 类加载就开始替被测代码背锅，测出来的数不可信；
+        而且会诱导压测端去调内部 API，绕过真正的客户端协议。
+
+      帧格式（JSON 文本帧）在此模块内独立实现一份，不复用网关的 ClientFrames：
+      客户端侧只需要「构造上行帧 + 解析下行帧」，复用服务端编码器反而会把服务端语义带进来。
+      但 Jackson 的「代」必须与网关一致（Boot 4 用的是 tools.jackson，不是 com.fasterxml），
+      否则字段名/数字格式的理解会和线上分叉。
+    -->
+    <dependencies>
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-all</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>tools.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>im-benchmark</finalName>
+        <plugins>
+            <!-- 压测端不是 Spring 应用，只用 repackage 把 Netty/Jackson 打进可执行 jar，
+                 这样在压测机上直接 java -jar im-benchmark.jar 带上参数就能跑，
+                 不必依赖压测机上有没有 Maven / 项目源码。 -->
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <mainClass>com.github.im.benchmark.BenchmarkRunner</mainClass>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
