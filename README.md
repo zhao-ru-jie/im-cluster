@@ -92,7 +92,7 @@ im-server-boot  ──> im-server  / im-rpc / im-storage-jdbc ──> im-proto
                              ↑                                                │
                              └────────── gRPC DownstreamPush.Push ────────────┘
 
-im-gateway ──写──> Redis(im:gw:user:{userId} = SET{网关实例})
+im-gateway ──写──> Redis(im:gateway:user:{userId} = SET{网关实例})
 im-server  ──读写──> Redis(im:conv:msgs / im:offline / im:seq / im:idem)（im.storage=jdbc 时消息落 MySQL）
 ```
 
@@ -109,10 +109,11 @@ im-server  ──读写──> Redis(im:conv:msgs / im:offline / im:seq / im:ide
 4. **标识**：`serverMsgId` 独立生成（UUIDv7），与 seq **解耦**——seq 允许有洞、回绕也不会撞 ID；
 5. **落库（write-ahead）**：经 `MessageRepository.append()` 写存储——先落库，再推送；
 6. **ack 先行**：落库成功 + 幂等记录写入 = 受理成功，**立刻回 `msg.ack`**（含 `serverMsgId`、`seq`），不等推送；
-7. **异步投递**：`DeliveryDispatcher` 在虚拟线程池里做路由与下发——读 `im:gw:user:{bob}`（集合）得到
+7. **异步投递**：`DeliveryDispatcher` 在虚拟线程池里做路由与下发——读 `im:gateway:user:{bob}`（集合）得到
    bob 所在的**所有**网关实例（Nacos 启用时解析成健康 ip:port），`PushPort.push()` 到这些实例
    （**跨实例并行**，总耗时 ≈ 最慢的那个实例，而不是 RTT 相加），各实例再按 `userId` 找**本机全部设备**写帧；
-8. **离线兜底**：投递失败（不在线 / 推送异常 / 超时）→ 该帧落 `im:offline:{bob}`，bob 重连时补发。
+8. **离线兜底**：投递失败（不在线 / 推送异常 / 超时）→ 单聊把帧落 `im:offline:{bob}`，
+   群聊只在 `im:offline:ptr:{bob}` 记一个「补到哪」的指针，bob 重连时补发（见「离线消息」一节）。
 
 关键取舍：**先落库后推送**（宁可重复推送，不可丢消息）、**推送失败即转离线**（不做无限重试）、
 **ack 不等推送**（受理成功的判据只有落库，实时性交给异步投递 + 离线补发）、
@@ -357,7 +358,7 @@ message accepted: traceId=trace-e2e-0001 conv=s:alice:bob seq=13 msgId=01a166bb-
 
 1. **本机会话表**：`ConnectionManager` 变成 `userId → deviceId → 会话`，`send(userId, frame)` 扇出到
    所有设备。部分设备写失败只要有一台成功就算投递成功——其余设备重连后按 seq 拉齐；
-2. **在线路由**：`im:gw:user:{userId}` 从 String 变成 **SET**：手机连网关 A、网页连网关 C 时集合里
+2. **在线路由**：`im:gateway:user:{userId}` 从 String 变成 **SET**：手机连网关 A、网页连网关 C 时集合里
    有两个实例，IM 服务逐个实例推，各实例再分给本机设备；
 3. **failed 语义**：`failed = 目标 − 已投递`。不能直接汇总各实例返回的 failed，否则
    「手机推到、网页所在实例失败」会让一个**已经收到消息的人**被再排一份离线。
@@ -497,17 +498,71 @@ CREATE TABLE im_group_member (
 
 ### 离线消息
 
-离线判定与存储都在 **IM 服务**侧（不是网关职责）：
+离线判定与存储都在 **IM 服务**侧（不是网关职责）。存储分两条通道，区别只在「放大倍数」：
 
-1. 网关推送返回失败（不在线 / 在别的实例但推失败）；
-2. IM 服务把帧写入 `im:offline:{userId}`；
-3. 用户重连后网关调 `MessageIngress.pullPending()` 拉取并逐条下发（单次上限 200 条，返回 `remaining`）。
+| 场景 | key | 结构 | 为什么 |
+|------|-----|------|--------|
+| 单聊 | `im:offline:{userId}` | List（帧） | 一条消息只有一个收件人，存一份完整帧就是最省的形态 |
+| 群聊 | `im:offline:ptr:{userId}` | Hash `conversationId -> 待补发 seq` | 群消息收件人是全体成员，按人存帧会「一条消息 = 不在线人数份」 |
+
+**群聊为什么不存帧**：500 人群、450 人不在线、50 人各发 5 条 = 250 条消息 × 450 人 =
+112,500 份相同帧（~30MB），并且随消息数线性增长；每条群消息写入都是 450 次 RPUSH。
+改成指针后，每个「用户 × 会话」只占一个 field（几十字节），后续消息只把同一个 field 往前推，
+**占用不随消息数增长**——你那个场景从 112,500 条降到 450 个 field。
+
+写路径都用 `HSETNX` 语义：字段已存在就保留**更小的**那个 seq（最早的未补发位置），
+否则中间那段会永远补不回来。
+
+补发（`MessageIngress.pullPending()`）：
+
+1. 先 `drain` 单聊帧队列（同时覆盖升级前写下的群聊整帧，滚动升级不丢消息）；
+2. 再按指针逐会话补拉：起点 = `max(指针, 客户端上报水位 + 1)`，从会话历史取
+   `seq > 起点` 的消息、用 `ClientFrames.frameOf()` 重建帧（与实时推送**同构**）；
+3. 补完更新指针：追平则清理字段，没补完则前进到最后一条 +1；单轮最多 20 个会话、
+   单次最多 200 帧，`remaining` 告诉客户端还有没有（单聊按帧计、群聊按会话计）。
+
+三条硬约定：
+
+- **历史查询失败绝不推进指针**：宁可下次重复补（客户端按 seq 去重），也不能把指针推过去——那等于永久丢一段消息；
+- **指针只前进不回退**：并发 pull（多端同时上线）读到同一个旧指针只会重复补发，回退会造成死循环；
+- **两条通道都有 TTL**：帧队列另有长度上限（`im.offline.max-frames`，默认 500）。
+  长期不上线的用户不该让队列无界增长；超期未上线则放弃补发，历史仍在消息存储里，客户端可主动拉历史。
 
 ### 群聊与群成员
 
 `GroupMemberRepository` 同样双实现：Redis Set `im:group:members:{groupId}`（默认）或 MySQL `im_group_member`。
 群聊扇出 = 群成员列表去掉发送者；成员列表为空时**当成无人可投**，绝不退化成「投给群 ID」
 （那会往离线队列塞进永远不被拉取的数据）。
+
+**扇出成本与两步优化**。一条群消息 =「按人查在线路由」+「按实例 gRPC 下发」。5000 人群若逐个
+`SMEMBERS` 查路由，就是 5000 次串行往返（1~2.5s），这是群消息延迟的全部来源：
+
+1. **批量路由**：`instancesOfAll()` 把 key 切成 500 一片、并发 `executePipelined`，一片一次往返，
+   顺带把不在线的人筛成空集合，只为在线成员构造下发。切片而不是一次发 5000 条，是因为
+   Redis 单线程，大 pipeline 会把库顶住；Cluster 下跨 slot 会抛 `CROSSSLOT`，
+   此时自动退化为逐条查询——慢，但不会让整条群消息全落离线；
+2. **跨实例并行**：每个网关实例一次 gRPC，先全部提交再统一收集，总耗时 ≈ 最慢的那个实例；
+3. **失败转离线同样批量**：群聊走 `recordGroupPending()`（每人一个 `HSETNX + PEXPIRE`），
+   单聊走 `storeAll()`（`RPUSH + LTRIM + PEXPIRE`），都是每 500 人一次 pipeline。
+   这段代码跑在投递许可里，逐条写会让「5000 人全离线」白占额度一整秒。
+
+本机（Redis 在 localhost，RTT ≈ 0.07ms）5000 用户实测：
+
+| 操作 | 逐个 | 批量 | 倍数 |
+|---|---|---|---|
+| 查路由 `SMEMBERS` | 596ms | 131ms | 4.5x |
+| 落离线（每人 1 条写命令） | 370ms | 61ms | 6.1x |
+
+批量收益与具体命令无关：两种离线写法都是「每人 1 条写命令」，收益全在往返次数从 N 降到 N/500。
+跨机房（RTT 0.3ms 量级）时逐个查会退化到 1.5s 以上，批量仍在百毫秒级——
+**换成网络 Redis 后收益比本机数字大得多**，本机测出来的 4.5x 是保守下限。
+
+配合「ack 先行」，5000 人群的一条消息：**ack 与群规模无关**（只包含落库 + 幂等写），
+扇出耗时主要是批量路由（百毫秒级）+ 各实例 gRPC 往返（并行，≈ 最慢实例）。
+端到端用 20 人群验证过 19/20 到达（发送者按设计不回推）。
+
+> 再往上（万人群、跨可用区），单靠这两步不够，需要「大群降级」：只推在线用户 + 其余人收一条
+> 有新消息的通知，客户端主动拉取（写扩散 → 读写混合）。
 
 > 群成员落到 MySQL 才能支持「查某用户加入了哪些群」「按角色做权限」，Redis Set 做不到。
 
@@ -530,7 +585,7 @@ CREATE TABLE im_group_member (
 
 - **上行**：网关解帧 → `MessageIngress.submit()`；实现可换（本地直调 / gRPC 远程），业务代码不变；
 - **下行**：IM 服务只调 `PushPort.push(task)`，`frame` 已是完整报文，网关**原样透传**；
-- **在线路由**：`im:gw:user:{userId}`（SET 集合，多端时含多个实例）只由网关写（TTL 30s + 10s 续期），IM 服务只读。
+- **在线路由**：`im:gateway:user:{userId}`（SET 集合，多端时含多个实例）只由网关写（TTL 30s + 10s 续期），IM 服务只读。
 
 ### 上行通道三档（按部署形态切换）
 
@@ -558,8 +613,10 @@ IM 服务 → Redis 查 userId→网关实例 → Nacos 解析实例→健康 ip
 ```
 
 Nacos 未启用或连不上时，`NacosNodeDiscovery.resolveTarget()` **自动回退为直接用 nodeId(host:port)**，
-单机/同机部署行为不变。节点被判定不健康时，其他健康节点会清理 Redis 中指向它的路由，
-这些用户随即视为离线、消息转离线队列。
+单机/同机部署行为不变。节点被判定不健康时，健康节点会清理 Redis 中指向它的路由，
+这些用户随即视为离线、消息转离线队列。清理是一次全库 SCAN，因此按「健康实例排序后
+`hash(死实例) % 实例数`」选出唯一 owner 执行，避免 N-1 台各扫一遍全库；
+选中的那台恰好也不可用时，靠路由 30s TTL 自然过期兜底。
 
 #### 上行方向（网关 → IM 服务）怎么选实例
 
@@ -568,7 +625,7 @@ Nacos 未启用或连不上时，`NacosNodeDiscovery.resolveTarget()` **自动�
 | | 注册 | 订阅 | 选择方式 |
 |---|---|---|---|
 | `GatewayNacosDiscovery`（im-gateway） | 自己 → `im-gateway` | 同服务实例（清死实例路由） | 不选，按 userId 精确寻址 |
-| `IngressNacosDiscovery`（im-gateway-boot） | 不注册 | `im-server` 的健康实例 | gRPC `round_robin`（subchannel 层轮询 + 故障拉黑） |
+| `IngressTargets`（im-gateway-boot） | 不注册 | `im-server` 的健康实例 | gRPC `round_robin`（subchannel 层轮询 + 故障拉黑） |
 | `ServerNacosRegistrar`（im-server-boot） | 自己 → `im-server`（gRPC 端口） | — | — |
 
 两条容易被忽略的规则：
@@ -821,6 +878,9 @@ kubectl apply -f k8s/im-node.yaml     # 或 im-gateway.yaml + im-server.yaml（�
 | `im.server.address` / `timeout-ms` / `wait-for-ready` | `IM_SERVER_ADDR` / `IM_SERVER_TIMEOUT_MS` / `IM_SERVER_WAIT_FOR_READY` | `127.0.0.1:9091` / `300` / `true` | 网关 → IM |
 | `im.push.timeout-ms` / `wait-for-ready` | `IM_PUSH_TIMEOUT_MS` / `IM_PUSH_WAIT_FOR_READY` | `800` / `false` | IM → 网关，超时即落离线 |
 | `im.delivery.max-inflight` | `IM_DELIVERY_MAX_INFLIGHT` | `1024` | 异步推送并发上限，打满即退化为同步推送 |
+| `im.offline.frame-ttl` | `IM_OFFLINE_FRAME_TTL` | `7d` | 单聊离线帧队列过期时间 |
+| `im.offline.max-frames` | `IM_OFFLINE_MAX_FRAMES` | `500` | 单聊离线帧队列每人上限（超出丢最旧） |
+| `im.offline.pointer-ttl` | `IM_OFFLINE_POINTER_TTL` | `7d` | 群聊补发指针过期时间（超期放弃补发，历史仍可主动拉） |
 | `im.node.grpc-port` / `grpc-host` | `IM_GRPC_PORT` / `IM_GRPC_HOST` | `9090` / 自动探测 | 实例 ID |
 | `im.node.grpc.tls.enabled` / `trust-cert` | `IM_GRPC_TLS` / `IM_GRPC_TRUST` | `false` / 空 | gRPC TLS |
 | `im.node.grpc.health-check-enabled` | `IM_GRPC_HEALTH_CHECK` | `true` | 客户端健康检查（排除 NOT_SERVING 实例） |
@@ -831,8 +891,9 @@ kubectl apply -f k8s/im-node.yaml     # 或 im-gateway.yaml + im-server.yaml（�
 
 | key | 写方 | 读方 |
 |-----|------|------|
-| `im:gw:user:{userId}` (SET) | 网关（TTL 续期） | IM 服务（下行路由：用户 → 网关实例集合） |
-| `im:offline:{userId}` | IM 服务 | IM 服务 |
+| `im:gateway:user:{userId}` (SET) | 网关（TTL 续期） | IM 服务（下行路由：用户 → 网关实例集合） |
+| `im:offline:{userId}` (List) | IM 服务 | IM 服务（单聊离线帧队列，TTL + 长度上限） |
+| `im:offline:ptr:{userId}` (Hash) | IM 服务 | IM 服务（群聊补发指针：会话 → 待补发 seq，TTL） |
 | `im:conv:msgs:{conversationId}` | IM 服务（`im.storage=redis`） | IM 服务 |
 | `im:seq:{conversationId}` | IM 服务 | IM 服务 |
 | `im:idem:{from}\|{clientMsgId}` | IM 服务 | IM 服务 |
@@ -884,7 +945,7 @@ im-cluster/
 │   ├── session/ClientSession.java            # 传输无关的会话抽象
 │   ├── session/NettyClientSession.java       # Netty Channel 上的实现（文本帧 / 长度帧）
 │   ├── session/ConnectionManager.java        # 本实例 用户→设备→会话（唯一不外部化的状态）
-│   ├── session/GatewayRegistry.java          # Redis 路由 im:gw:user:{userId}=SET{实例} + 续期
+│   ├── session/GatewayRegistry.java          # Redis 路由 im:gateway:user:{userId}=SET{实例} + 续期
 │   ├── session/SessionAttributes.java        # Channel 属性：userId/deviceId/session
 │   ├── transport/NettyGatewayServer.java     # Netty 双通道接入（WS + TCP）
 │   ├── transport/SessionLifecycle.java       # 连接生命周期 + 上行帧处理（两种传输唯一实现）

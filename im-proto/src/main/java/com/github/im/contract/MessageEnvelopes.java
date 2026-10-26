@@ -27,22 +27,16 @@ public final class MessageEnvelopes {
                                                  String gatewayInstance,
                                                  String traceId) {
         SubmitMessageRequest.Builder builder = SubmitMessageRequest.newBuilder()
+                .setTraceId(traceId)
                 .setClientMsgId(envelope.clientMsgId())
                 .setFromUserId(envelope.from())
+                .setDeviceId(deviceId)
                 .setConversationId(envelope.conversationId())
                 .setConvType(envelope.convType())
                 .setReceiverId(envelope.to())
                 .setPayload(envelope.body() == null ? "" : envelope.body())
-                .setClientTs(envelope.clientTs());
-        if (deviceId != null) {
-            builder.setDeviceId(deviceId);
-        }
-        if (gatewayInstance != null) {
-            builder.setGatewayInstance(gatewayInstance);
-        }
-        if (traceId != null && !traceId.isBlank()) {
-            builder.setTraceId(traceId);
-        }
+                .setClientTs(envelope.clientTs())
+                .setGatewayInstance(gatewayInstance);
         return builder.build();
     }
 

@@ -87,14 +87,17 @@ public class RemoteGatewayPushPort implements PushPort {
 
         // 按「目标网关实例」分组。多端下同一个 userId 会出现在多个实例的分组里，
         // 这是对的：每个实例负责把它本机上的设备都推一遍。
+        // 一次批量查完整组人的路由（分片 pipeline + 并发）：
+        // 5000 人群原本要 5000 次串行往返（1~2.5s），现在 10 次分片往返、10ms 量级。
+        Map<String, Set<String>> routes = routeReader.instancesOfAll(targets);
         Map<String, List<String>> byInstance = new LinkedHashMap<>();
         for (String userId : targets) {
-            Set<String> instances = routeReader.instancesOf(userId);
+            Set<String> instances = routes.getOrDefault(userId, Set.of());
             if (instances.isEmpty()) {
                 continue;   // 不在线：最后统一算作 failed
             }
             for (String instanceId : sorted(instances)) {
-                byInstance.computeIfAbsent(instanceId, key -> new ArrayList<>()).add(userId);
+                byInstance.computeIfAbsent(instanceId, _ -> new ArrayList<>()).add(userId);
             }
         }
 

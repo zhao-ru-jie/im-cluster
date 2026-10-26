@@ -173,6 +173,7 @@ public class SessionLifecycle {
         SubmitMessageRequest request = MessageEnvelopes.toRequest(envelope,
                 session.deviceId(), registry.localInstanceId(), traceId);
         try {
+            // 调用grpc客户端服务RemoteMessageIngress -> MessageIngressGrpcService -> MessageService进行业务处理
             SubmitMessageResponse response = ingress.submit(request);
             if (MessageEnvelopes.isOk(response)) {
                 session.send(frames.ack(response.getClientMsgId(), response.getServerMsgId(),
@@ -205,6 +206,7 @@ public class SessionLifecycle {
             if (!watermarks.isEmpty()) {
                 request.putAllWatermarks(watermarks);
             }
+            // 通过grpc调用RemoteMessageIngress这个类，grpc服务端MessageIngressGrpcService接收到请求，会调用MessageService这个类进行业务处理
             PullPendingResponse pending = ingress.pullPending(request.build());
             for (String frame : pending.getFramesList()) {
                 if (!connectionManager.send(userId, frame)) {

@@ -64,7 +64,7 @@ public class GatewayDrainService {
 
     public GatewayDrainService(ConnectionManager connectionManager,
                                GatewayNacosDiscovery nacosDiscovery,
-                               com.github.im.gateway.session.GatewayRegistry registry,
+                               GatewayRegistry registry,
                                ClientFrames frames,
                                GatewayMetrics metrics,
                                ApplicationEventPublisher events,

@@ -63,7 +63,7 @@ public record MessageEnvelope(String from,
 
     /** 单聊会话 ID：两个 userId 排序后拼接，保证 A→B 与 B→A 落在同一会话 */
     public static String singleConversationId(String a, String b) {
-        return a.compareTo(b) <= 0 ? "s:" + a + ":" + b : "s:" + b + ":" + a;
+        return a.compareTo(b) <= 0 ? ("s:" + a + ":" + b) : ("s:" + b + ":" + a);
     }
 
     /** 幂等键：发送方 + 客户端消息 ID */
