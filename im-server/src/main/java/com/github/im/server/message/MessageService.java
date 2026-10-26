@@ -15,7 +15,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -32,11 +34,6 @@ import java.util.UUID;
  * </ol>
  * 因此「推送失败」只影响实时性，不会丢消息；客户端上线后按 seq 拉齐。
  *
- * <p><b>为什么 ID 与 seq 要解耦</b>：seq 的权威状态在 Redis，可能丢（重启/淘汰/切主）。
- * 若 ID 由 {@code conversationId#seq} 派生，seq 回绕就等于消息 ID 撞车；拆开后
- * 「唯一性」交给 UUIDv7（本地生成、不回绕），「顺序性」交给 seq（只要求会话内单调、
- * 允许有洞），两者的故障域彻底分开。
- *
  * @author zhaorujie
  * @since 1.0.0
  */
@@ -50,6 +47,14 @@ public class MessageService implements MessageIngress {
     /** 幂等表里同时存「消息 ID 与 seq」，两者已解耦、无法互相推导，必须一起回放 */
     private static final String IDEM_SEP = "|";
     private static final int DEFAULT_PULL_MAX = 200;
+    /**
+     * 单次 pull 最多处理多少个「有待补群消息」的会话。
+     *
+     * <p>每个会话要查一次消息历史（MySQL 时是一条 SQL），必须封顶，否则一个加了几百个群、
+     * 又长期离线的用户可以靠一次 pull 打出几百条查询。超出部分留在指针里，下次 pull 继续
+     * （{@code pendingConversations} 按会话 ID 字典序取，保证每轮都能推进）。
+     */
+    private static final int MAX_PULL_CONVERSATIONS = 20;
 
     private static final int CODE_OK = 0;
     private static final int CODE_BAD_REQUEST = 400;
@@ -144,6 +149,19 @@ public class MessageService implements MessageIngress {
         return submit(MessageEnvelopes.toRequest(envelope, null, null, null));
     }
 
+    /**
+     * 补发离线消息：两条通道，对应两种放大倍数（详见 {@link OfflineMessageStore} 类注释）。
+     *
+     * <ol>
+     *   <li><b>单聊帧队列</b>：直接 {@code drain} 出来，顺带把升级前写下的群聊整帧也带出去；</li>
+     *   <li><b>群聊指针</b>：离线期间只记了「这个人在这个会话上补到哪」，这里按 seq 区间
+     *       从会话历史取消息、用 {@link ClientFrames#frameOf} 重建帧。</li>
+     * </ol>
+     *
+     * <p>为什么要用客户端上报的水位兜一层：用户离线时记下指针后，可能又连着收了一段时间的
+     * 实时推送（指针不会因为实时推送而前移，少一次每条消息的写）。补发时从
+     * {@code max(指针, 客户端水位 + 1)} 开始，避免把已经收到过的消息再补一遍。
+     */
     @Override
     public PullPendingResponse pullPending(PullPendingRequest request) {
         String userId = request.getUserId();
@@ -154,11 +172,70 @@ public class MessageService implements MessageIngress {
         // 让发号器多一道与 Redis 无关的下界（见 ClientWatermarkStore 的说明）。
         watermarkStore.observe(request.getWatermarksMap());
         int max = request.getMax() > 0 ? request.getMax() : DEFAULT_PULL_MAX;
-        List<String> frames = offlineMessageStore.drain(userId, max);
+
+        List<String> out = new ArrayList<>(max);
+        out.addAll(offlineMessageStore.drain(userId, max));
+        int pendingConversations = 0;
+        if (out.size() < max) {
+            pendingConversations = pullGroupPending(userId, request.getWatermarksMap(), max - out.size(), out);
+        }
         return PullPendingResponse.newBuilder()
-                .addAllFrames(frames)
-                .setRemaining((int) offlineMessageStore.size(userId))
+                .addAllFrames(out)
+                .setRemaining((int) (offlineMessageStore.size(userId) + pendingConversations))
                 .build();
+    }
+
+    /**
+     * 群聊补发：按会话指针从历史里取 {@code seq > 起点} 的消息并重建帧。
+     *
+     * <p>两条硬约定：
+     * <ul>
+     *   <li><b>历史查询失败绝不推进指针</b>：宁可下次多补一遍（客户端按 seq 去重），
+     *       也不能把指针推过去，那等于永久丢一段消息；</li>
+     *   <li><b>指针只前进</b>：并发 pull（多端同时上线、重连风暴）可能读到同一个旧指针，
+     *       各自补发一遍是重复但无害的，回退才会造成死循环。</li>
+     * </ul>
+     *
+     * @param budget 本次还能补多少帧（全局上限，避免一个用户把整轮 pull 撑爆）
+     * @return 本次之后仍有待补消息的会话数
+     */
+    private int pullGroupPending(String userId, Map<String, Long> watermarks, int budget, List<String> out) {
+        Map<String, Long> pending = offlineMessageStore.pendingConversations(userId, MAX_PULL_CONVERSATIONS);
+        if (pending.isEmpty()) {
+            return 0;
+        }
+        // 超出单轮处理上限的会话数也要计进 remaining，否则客户端会以为已经拉干净了
+        int remaining = (int) Math.max(0, offlineMessageStore.pendingConversationCount(userId) - pending.size());
+        for (Map.Entry<String, Long> entry : pending.entrySet()) {
+            if (budget <= 0) {
+                remaining++;
+                continue;
+            }
+            String conversationId = entry.getKey();
+            long pendingFrom = entry.getValue();
+            long start = Math.max(pendingFrom, watermarks.getOrDefault(conversationId, 0L) + 1);
+            List<StoredMessage> messages;
+            int limit = budget;
+            try {
+                messages = messageRepository.since(conversationId, start - 1, limit);
+            } catch (RuntimeException e) {
+                log.error("[offline] 补拉会话历史失败，指针保持不动待下轮重试 conv={} from={} err={}",
+                        conversationId, start, e.getMessage());
+                remaining++;
+                continue;
+            }
+            for (StoredMessage message : messages) {
+                out.add(frames.frameOf(message));
+            }
+            budget -= messages.size();
+            boolean caughtUp = messages.size() < limit;
+            long nextSeq = messages.isEmpty() ? pendingFrom : messages.get(messages.size() - 1).seq() + 1;
+            offlineMessageStore.advancePending(userId, conversationId, pendingFrom, nextSeq, caughtUp);
+            if (!caughtUp) {
+                remaining++;
+            }
+        }
+        return remaining;
     }
 
     /**

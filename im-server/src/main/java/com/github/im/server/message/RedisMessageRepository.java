@@ -80,4 +80,34 @@ public class RedisMessageRepository implements MessageRepository {
         }
         return messages;
     }
+
+    /**
+     * 扫描本会话保留的全部条目，按 seq 过滤后取前 {@code limit} 条。
+     *
+     * <p>同样是「多实例下 append 顺序 ≠ seq 顺序」的原因：List 上的下标区间无法对应 seq 区间，
+     * 只能先全取再筛。{@code trim} 把保留量压在 {@value #MAX_LENGTH} 条，成本有上限；
+     * 生产用 {@code JdbcMessageRepository} 的 {@code WHERE seq > ? ORDER BY seq LIMIT ?}。
+     */
+    @Override
+    public List<StoredMessage> since(String conversationId, long afterSeq, int limit) {
+        if (limit <= 0) {
+            return List.of();
+        }
+        List<String> rows = redis.opsForList().range(RedisKeys.CONV_MESSAGES_PREFIX + conversationId, 0, -1);
+        if (rows == null || rows.isEmpty()) {
+            return List.of();
+        }
+        List<StoredMessage> matched = new ArrayList<>(rows.size());
+        for (String row : rows) {
+            if (row == null || row.isBlank()) {
+                continue;
+            }
+            StoredMessage message = objectMapper.readValue(row, StoredMessage.class);
+            if (message.seq() > afterSeq) {
+                matched.add(message);
+            }
+        }
+        matched.sort((left, right) -> Long.compare(left.seq(), right.seq()));
+        return matched.size() <= limit ? matched : matched.subList(0, limit);
+    }
 }

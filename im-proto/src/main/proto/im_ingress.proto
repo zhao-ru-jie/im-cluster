@@ -23,7 +23,12 @@ service MessageIngress {
   rpc BatchSubmit(BatchSubmitRequest) returns (BatchSubmitResponse);
 
   // 连接建立时拉取该用户待补发的消息帧（离线消息 / 多端漫游缺口），
-  // 同时接收客户端上报的各会话消费水位（watermarks），供 seq 发号器兜底下界。
+  // 同时接收客户端上报的各会话消费水位（watermarks）：既可给 seq 发号器兜底下界，
+  // 也是群聊离线补发的起点（客户端已经收过的 seq 不再重发）。
+  //
+  // 群聊离线不按人存帧（一条群消息 = 全体不在线成员份相同内容，会随消息数线性膨胀），
+  // 只按「用户 × 会话」记一个待补发 seq；帧由本接口按该 seq 区间从会话历史重建，
+  // 结构与实时推送的 msg.push 完全一致。
   rpc PullPending(PullPendingRequest) returns (PullPendingResponse);
 }
 
@@ -76,5 +81,6 @@ message PullPendingRequest {
 
 message PullPendingResponse {
   repeated string frames = 1; // 已序列化的下行帧，网关原样透传给客户端
-  int32 remaining = 2;        // 仍滞留待拉取的条数（用于决定是否继续拉）
+  int32 remaining = 2;        // 仍滞留待拉取的数量（用于决定是否继续拉）：
+                              // 单聊按帧计，群聊按「还有待补消息的会话数」计（不逐条数历史）
 }

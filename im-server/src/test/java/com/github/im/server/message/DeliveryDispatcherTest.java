@@ -12,9 +12,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyCollection;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -66,8 +69,8 @@ class DeliveryDispatcherTest {
         CountDownLatch stored = new CountDownLatch(1);
         doAnswer(invocation -> {
             stored.countDown();
-            return null;
-        }).when(offlineStore).store(anyString(), anyString());
+            return 1;
+        }).when(offlineStore).storeAll(anyCollection(), anyString());
 
         DeliveryDispatcher dispatcher = new DeliveryDispatcher(router, offlineStore, 8);
         try {
@@ -119,5 +122,30 @@ class DeliveryDispatcherTest {
         dispatcher.dispatch(envelope, "frame", "trace", 5L);
 
         verify(router, times(1)).deliver(any(), anyString(), anyString());
+    }
+
+    @Test
+    @DisplayName("群聊落离线只记补发指针，不按人存整帧")
+    void groupOfflineRecordsPointerInsteadOfFrames() throws Exception {
+        when(envelope.conversationId()).thenReturn("g:1");
+        when(envelope.isGroup()).thenReturn(true);
+        when(router.deliver(any(), anyString(), anyString())).thenReturn(List.of("bob", "carol"));
+        CountDownLatch recorded = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            recorded.countDown();
+            return 2;
+        }).when(offlineStore).recordGroupPending(anyCollection(), anyString(), anyLong());
+
+        DeliveryDispatcher dispatcher = new DeliveryDispatcher(router, offlineStore, 8);
+        try {
+            dispatcher.dispatch(envelope, "frame", "trace", 9L);
+            assertTrue(recorded.await(2, TimeUnit.SECONDS), "群聊失败成员必须记补发指针");
+
+            verify(offlineStore).recordGroupPending(List.of("bob", "carol"), "g:1", 9L);
+            // 关键断言：群聊一旦退化成按人存整帧，一条消息就是「不在线人数份」相同内容
+            verify(offlineStore, never()).storeAll(anyCollection(), anyString());
+        } finally {
+            dispatcher.shutdown();
+        }
     }
 }

@@ -25,6 +25,17 @@ public interface MessageRepository {
     List<StoredMessage> recent(String conversationId, int limit);
 
     /**
+     * 取会话中 {@code seq > afterSeq} 的至多 {@code limit} 条，按 seq 升序返回。
+     *
+     * <p>群聊离线补发的数据来源：离线只记「这个人在这个会话上补到哪了」，
+     * 真正要发的帧在补发时按 seq 区间从这里取出再重建，避免按人存帧导致的
+     * 「一条群消息 = 不在线人数份」放大。
+     *
+     * <p>返回条数 &lt; {@code limit} 代表这段区间已经取完（补发方据此判断是否可以清掉指针）。
+     */
+    List<StoredMessage> since(String conversationId, long afterSeq, int limit);
+
+    /**
      * 会话已落库的最大 seq；{@code 0} = 无历史。
      *
      * <p>这是 seq 发号器的<b>下界来源</b>：Redis 里的 {@code im:seq:{conversationId}} 只是

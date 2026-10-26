@@ -108,15 +108,25 @@ public class DeliveryDispatcher {
                     envelope.conversationId(), seq, e.getMessage());
             failed = List.of(envelope.to());
         }
+        // 落离线：分两条通道，区别只在「放大倍数」（详见 OfflineMessageStore 类注释）
         int stored = 0;
-        for (String userId : failed) {
+        if (!failed.isEmpty()) {
             try {
-                offlineStore.store(userId, frame);
-                stored++;
+                stored = envelope.isGroup()
+                        // 群聊：只记「这批人在这个会话上补到哪了」，帧由会话历史重建。
+                        // 存整帧的话，一条群消息 = 不在线人数份相同内容（500 人群 9 成不在线就是 450 份），
+                        // 且随消息数线性增长。
+                        ? offlineStore.recordGroupPending(failed, envelope.conversationId(), seq)
+                        // 单聊：一个收件人一份帧，直接存最省，补发也不需要回查历史
+                        : offlineStore.storeAll(failed, frame);
             } catch (RuntimeException e) {
+                log.error("[delivery] conv={} seq={} 落离线异常（{} 人）: {}",
+                        envelope.conversationId(), seq, failed.size(), e.getMessage());
+            }
+            if (stored < failed.size()) {
                 // 落离线都失败只能记 error：Redis 抖动时至少日志里留有 traceId 可追
-                log.error("[delivery] conv={} seq={} user={} 落离线失败: {}",
-                        envelope.conversationId(), seq, userId, e.getMessage());
+                log.error("[delivery] conv={} seq={} 落离线只成功 {}/{}",
+                        envelope.conversationId(), seq, stored, failed.size());
             }
         }
         if (log.isDebugEnabled()) {

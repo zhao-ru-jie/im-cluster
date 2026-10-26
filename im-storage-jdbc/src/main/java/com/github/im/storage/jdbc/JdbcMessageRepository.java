@@ -4,6 +4,8 @@ import com.github.im.server.message.MessageRepository;
 import com.github.im.server.message.StoredMessage;
 import org.springframework.jdbc.core.JdbcTemplate;
 
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -42,6 +44,15 @@ public class JdbcMessageRepository implements MessageRepository, AutoCloseable {
               FROM im_message
              WHERE conversation_id = ?
              ORDER BY seq DESC
+             LIMIT ?
+            """;
+
+    /** 群聊离线补发：从某个 seq 之后按序取，走 uk_msg_conv_seq 的范围扫描 */
+    private static final String SINCE_SQL = """
+            SELECT conversation_id, seq, server_msg_id, from_user, to_user, conv_type, client_msg_id, body, created_at
+              FROM im_message
+             WHERE conversation_id = ? AND seq > ?
+             ORDER BY seq ASC
              LIMIT ?
             """;
 
@@ -84,18 +95,38 @@ public class JdbcMessageRepository implements MessageRepository, AutoCloseable {
     @Override
     public List<StoredMessage> recent(String conversationId, int limit) {
         List<StoredMessage> messages = new ArrayList<>(jdbc.query(RECENT_SQL,
-                (rs, rowNum) -> new StoredMessage(
-                        rs.getString("conversation_id"),
-                        rs.getLong("seq"),
-                        rs.getString("server_msg_id"),
-                        rs.getString("from_user"),
-                        rs.getString("to_user"),
-                        rs.getString("conv_type"),
-                        rs.getString("client_msg_id"),
-                        rs.getString("body"),
-                        rs.getLong("created_at")),
+                (rs, rowNum) -> map(rs),
                 conversationId, limit));
         Collections.reverse(messages);
         return messages;
+    }
+
+    /**
+     * 群聊离线补发用：{@code seq > afterSeq} 的升序区间。
+     *
+     * <p>直接命中 {@code uk_msg_conv_seq (conversation_id, seq)} 的范围扫描，
+     * 代价只与「本次要补多少条」相关，与会话总量无关。
+     */
+    @Override
+    public List<StoredMessage> since(String conversationId, long afterSeq, int limit) {
+        if (limit <= 0) {
+            return List.of();
+        }
+        return new ArrayList<>(jdbc.query(SINCE_SQL,
+                (rs, rowNum) -> map(rs),
+                conversationId, afterSeq, limit));
+    }
+
+    private static StoredMessage map(ResultSet rs) throws SQLException {
+        return new StoredMessage(
+                rs.getString("conversation_id"),
+                rs.getLong("seq"),
+                rs.getString("server_msg_id"),
+                rs.getString("from_user"),
+                rs.getString("to_user"),
+                rs.getString("conv_type"),
+                rs.getString("client_msg_id"),
+                rs.getString("body"),
+                rs.getLong("created_at"));
     }
 }
