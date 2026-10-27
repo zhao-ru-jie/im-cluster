@@ -5,6 +5,12 @@ import com.github.im.proto.ingress.v1.AckPendingRequest;
 import com.github.im.proto.ingress.v1.AckPendingResponse;
 import com.github.im.proto.ingress.v1.BatchSubmitRequest;
 import com.github.im.proto.ingress.v1.BatchSubmitResponse;
+import com.github.im.proto.ingress.v1.DeliveredAckRequest;
+import com.github.im.proto.ingress.v1.DeliveredAckResponse;
+import com.github.im.proto.ingress.v1.ListConversationsRequest;
+import com.github.im.proto.ingress.v1.ListConversationsResponse;
+import com.github.im.proto.ingress.v1.MarkReadRequest;
+import com.github.im.proto.ingress.v1.MarkReadResponse;
 import com.github.im.proto.ingress.v1.PullPendingRequest;
 import com.github.im.proto.ingress.v1.PullPendingResponse;
 import com.github.im.proto.ingress.v1.SubmitMessageRequest;
@@ -119,6 +125,23 @@ public class ShadowMessageIngress implements MessageIngress {
     @Override
     public AckPendingResponse ackPending(AckPendingRequest request) {
         return primary.ackPending(request);
+    }
+
+    /** 端到端 ACK 同理：双跑会把同一份 delivered 水位写两次，且 shadow 侧的结果没人用 */
+    @Override
+    public DeliveredAckResponse ackDelivered(DeliveredAckRequest request) {
+        return primary.ackDelivered(request);
+    }
+
+    /** 会话列表与已读都是「有副作用/有状态」的查询，双跑会读到不一致的快照，只走 primary */
+    @Override
+    public ListConversationsResponse listConversations(ListConversationsRequest request) {
+        return primary.listConversations(request);
+    }
+
+    @Override
+    public MarkReadResponse markRead(MarkReadRequest request) {
+        return primary.markRead(request);
     }
 
     private void compareOne(SubmitMessageRequest request, SubmitMessageResponse primaryResult) {

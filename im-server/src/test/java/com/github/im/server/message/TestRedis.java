@@ -58,10 +58,10 @@ final class TestRedis {
     }
 
     static String seqKey(String conversationId) {
-        return RedisKeys.SEQ_PREFIX + conversationId;
+        return RedisKeys.convSeq(conversationId);
     }
 
     static String messagesKey(String conversationId) {
-        return RedisKeys.CONV_MESSAGES_PREFIX + conversationId;
+        return RedisKeys.convMessages(conversationId);
     }
 }

@@ -45,6 +45,15 @@ public class MessageEntity {
     /** 服务端受理时间（毫秒） */
     private Long createdAt;
 
+    /** 消息类型：TEXT / IMAGE / FILE / VOICE / VIDEO / CUSTOM */
+    private String contentType;
+
+    /** 媒体元数据 JSON（url/size/name/duration/...），服务端不解析 */
+    private String attrs;
+
+    /** 撤回时间（毫秒），null = 未撤回；不放进 StoredMessage，渲染由 recalledSeqs 批量判定 */
+    private Long recalledAt;
+
     public static MessageEntity from(StoredMessage message) {
         MessageEntity entity = new MessageEntity();
         entity.setConversationId(message.conversationId());
@@ -56,13 +65,15 @@ public class MessageEntity {
         entity.setClientMsgId(message.clientMsgId());
         entity.setBody(message.body());
         entity.setCreatedAt(message.createdAt());
+        entity.setContentType(message.contentType());
+        entity.setAttrs(message.attrs());
         return entity;
     }
 
     public StoredMessage toStoredMessage() {
         return new StoredMessage(conversationId, seq == null ? 0L : seq, serverMsgId,
                 fromUser, toUser, convType, clientMsgId, body,
-                createdAt == null ? 0L : createdAt);
+                createdAt == null ? 0L : createdAt, contentType, attrs);
     }
 
     public Long getId() {
@@ -143,5 +154,29 @@ public class MessageEntity {
 
     public void setCreatedAt(Long createdAt) {
         this.createdAt = createdAt;
+    }
+
+    public String getContentType() {
+        return contentType;
+    }
+
+    public void setContentType(String contentType) {
+        this.contentType = contentType;
+    }
+
+    public String getAttrs() {
+        return attrs;
+    }
+
+    public void setAttrs(String attrs) {
+        this.attrs = attrs;
+    }
+
+    public Long getRecalledAt() {
+        return recalledAt;
+    }
+
+    public void setRecalledAt(Long recalledAt) {
+        this.recalledAt = recalledAt;
     }
 }

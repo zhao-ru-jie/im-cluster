@@ -252,7 +252,7 @@ class SeqAllocatorTest {
 
     /** 幂等键必须逐用例唯一，否则会读到别的用例/线上残留的记录 */
     private String idemKeyOf(String conversationId) {
-        String idemKey = RedisKeys.IDEM_PREFIX + "test-" + conversationId;
+        String idemKey = RedisKeys.convIdem(conversationId, "test-" + conversationId);
         createdIdemKeys.add(idemKey);
         return idemKey;
     }

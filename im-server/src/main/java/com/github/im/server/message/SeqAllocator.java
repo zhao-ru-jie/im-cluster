@@ -149,7 +149,7 @@ public class SeqAllocator {
         if (state.needsFloorRefresh()) {
             state.raiseFloor(storageFloor(conversationId));
         }
-        String key = RedisKeys.SEQ_PREFIX + conversationId;
+        String key = RedisKeys.convSeq(conversationId);
         Long seq = redis.execute(NEXT_SEQ, List.of(key), String.valueOf(state.floor()));
         if (seq != null && seq > 0) {
             state.raiseFloor(seq);
@@ -179,7 +179,7 @@ public class SeqAllocator {
         if (state.needsFloorRefresh()) {
             state.raiseFloor(storageFloor(conversationId));
         }
-        String seqKey = RedisKeys.SEQ_PREFIX + conversationId;
+        String seqKey = RedisKeys.convSeq(conversationId);
         List<String> raw;
         try {
             raw = executeAllocate(idemKey, seqKey, String.valueOf(state.floor()));

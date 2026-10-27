@@ -62,7 +62,7 @@ public class GatewayRouteReader {
      * @return 该用户当前所在的网关实例集合；空集合 = 不在线（或路由已 TTL 过期）
      */
     public Set<String> instancesOf(String userId) {
-        String key = RedisKeys.GATEWAY_USER_PREFIX + userId;
+        String key = RedisKeys.gatewayUser(userId);
         try {
             Set<String> members = redis.opsForSet().members(key);
             return members == null ? Set.of() : members;
@@ -115,7 +115,7 @@ public class GatewayRouteReader {
     private void queryShard(List<String> ids, Map<String, Set<String>> out) {
         List<byte[]> keys = new ArrayList<>(ids.size());
         for (String id : ids) {
-            keys.add((RedisKeys.GATEWAY_USER_PREFIX + id).getBytes(StandardCharsets.UTF_8));
+            keys.add(RedisKeys.gatewayUser(id).getBytes(StandardCharsets.UTF_8));
         }
         try {
             List<Object> raw = redis.executePipelined((RedisCallback<Object>) connection -> {

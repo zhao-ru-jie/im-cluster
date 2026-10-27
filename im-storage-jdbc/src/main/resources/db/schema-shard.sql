@@ -1,0 +1,55 @@
+-- ============================================================================
+-- 消息表按会话分片（可选，默认不启用）
+--
+-- 分片键 = conversation_id。理由：消息的所有读写都是「按会话 + seq」的形态
+-- （seq 发号、历史范围扫、幂等、撤回集合），而 im_message 的唯一键与主查询
+-- 已经以 (conversation_id, seq) 打头。以 userId 分片会让群消息散到 N 个分片，
+-- 群聊扇出变成跨分片查询。
+--
+-- Redis 侧的分片已经默认生效：所有会话 key 共用 {conversationId} hash tag
+-- （见 RedisKeys），Cluster 的 slot 天然按会话分。
+-- 这里补的是 MySQL 侧的物理切分，用原生 HASH 分区实现——应用代码零改动，
+-- 路由由 MySQL 自己完成（这也是为什么 ShardRouter 只需要「算得对」，
+-- 不需要在每个查询上拼表名）。
+--
+-- ---------------------------------------------------------------------------
+-- 前置条件：分区表要求「分区键必须包含在每个唯一索引里」。
+-- im_message 当前是 PRIMARY KEY (id) + UNIQUE uk_msg_conv_seq (conversation_id, seq)
+-- + UNIQUE uk_msg_idem (from_user, client_msg_id) + UNIQUE uk_msg_server_id。
+-- 后三个都不含分区键之外的问题——但 uk_msg_idem 与 uk_msg_server_id **不包含
+-- conversation_id**，所以直接分区会被 MySQL 拒绝：
+--
+--   ERROR 1503 (HY000): A UNIQUE INDEX must include all columns in the
+--   table's partitioning function
+--
+-- 因此启用分片前必须先做一次表改造（见下方 ALTER），把这两个唯一约束
+-- 降级为普通索引 + 由应用保证唯一性（幂等键在 Redis 里已先行拦截，
+-- server_msg_id 由 UUIDv7 保证）。
+-- ---------------------------------------------------------------------------
+
+-- 步骤 1：主键改为 (id, conversation_id)（雪花 id 仍然全局唯一，只是复合主键让分区可行）
+--         并把两个唯一索引降级为普通索引
+-- ALTER TABLE im_message
+--     DROP INDEX uk_msg_idem,
+--     ADD INDEX idx_msg_idem (from_user, client_msg_id),
+--     DROP INDEX uk_msg_server_id,
+--     ADD INDEX idx_msg_server_id (server_msg_id),
+--     DROP PRIMARY KEY,
+--     ADD PRIMARY KEY (id, conversation_id);
+
+-- 步骤 2：按会话哈希分区。分区数取 2 的幂便于后续 REORGANIZE 拆分；
+--         16 片 ≈ 单表容量 / 16，通常能撑到亿级消息。
+-- ALTER TABLE im_message
+--     PARTITION BY HASH (conversation_id) PARTITIONS 16;
+
+-- ---------------------------------------------------------------------------
+-- 注意事项（写给真的要开机的人）：
+--
+-- 1. 分区不是分库：所有分区仍在同一个 MySQL 实例里，解决的是「单表过大导致
+--    索引变深、DDL 变慢、历史数据难以按会话过期」，不解决实例级故障与容量上限。
+--    要跨实例，需要把 ShardRouter.messageTableOf 接成「库名.表名」并做数据源路由。
+-- 2. 分区后 DROP PARTITION 可以按片快速清历史（比 DELETE 快几个数量级），
+--    但按会话的删除做不到——同一会话的消息固定在同一片。
+-- 3. im.shard.count 与 PARTITIONS 必须一致，否则 ShardRouter 算出的分片号
+--    与 MySQL 实际落的分区对不上（排查时 debug 日志里的 mysql=/redis= 就是为此）。
+-- ============================================================================

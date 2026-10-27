@@ -28,14 +28,14 @@ import org.springframework.context.annotation.Configuration;
  *   <li><b>轮询精确</b>：gRPC 在 subchannel 层轮询，不受「每请求 RPC 次数」与实例数的公因子影响；</li>
  *   <li><b>故障剔除内建</b>：连不上的 subchannel 进 {@code TRANSIENT_FAILURE} 自动退出轮询，恢复后自动放回；</li>
  *   <li><b>新实例先连上再参与轮询</b>：新地址的 subchannel 要 READY 才进轮询，所以不会出现
- *       「网关选中冷实例、首条消息把 260ms+ 建连耗时塞进 300ms deadline」的偶发 503。</li>
+ *       「网关选中冷实例、首条消息把建连耗时（实测 260~340ms）塞进 deadline」的偶发 503。</li>
  * </ul>
  *
- * <p><b>超时</b>（默认 300ms）决定网关对「单条消息实时性」的耐心：超时即回 {@code error 503}
- * 让客户端退避重发，<b>不会</b>在网关侧重试，也不会因为 IM 服务慢而断开长连接。
+ * <p><b>超时</b>（默认 1s，见 {@code im.server.timeout-ms}）决定网关对「单条消息实时性」的耐心：
+ * 超时即回 {@code error 503} 让客户端退避重发，<b>不会</b>在网关侧重试，也不会因为 IM 服务慢而断开长连接。
+ * 早先默认 300ms，与「建连 260~340ms」本就贴得太近——分离部署下 IM 服务还要落库，正常抖动就会撞线。
  *
- * <p><b>本次重接又为什么要预热</b>：channel 的第一次建连（含被调方 gRPC 服务进程的首连接，
- * 实测 260~340ms）必须在流量到来之前完成，否则第一条消息仍然会吃满 deadline。
+ * <p><b>仍然要预热</b>：deadline 放宽只是留余量，不该把「首次建连」这种可预期的耗时算进每条消息的预算里。
  *
  * @author zhaorujie
  * @since 1.0.0
@@ -85,7 +85,7 @@ public class GatewayWiringConfig {
     public MessageIngress messageIngress(GrpcChannelFactory channels,
                                          IngressTargets targets,
                                          IngressNameResolverProvider resolverProvider,
-                                         @Value("${im.server.timeout-ms:300}") long timeoutMs,
+                                         @Value("${im.server.timeout-ms:1000}") long timeoutMs,
                                          @Value("${im.server.wait-for-ready:true}") boolean waitForReady) {
         // resolverProvider 作为参数只是为了确保「scheme 已注册」先于 channel 构建
         String target = IngressNameResolverProvider.SCHEME + ":///" + targets.serviceName();

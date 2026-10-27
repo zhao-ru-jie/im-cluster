@@ -33,7 +33,7 @@ class GatewayRouteReaderTest {
     @AfterEach
     void cleanup() {
         if (redis != null && !userIds.isEmpty()) {
-            userIds.forEach(id -> redis.delete(RedisKeys.GATEWAY_USER_PREFIX + id));
+            userIds.forEach(id -> redis.delete(RedisKeys.gatewayUser(id)));
         }
         if (factory != null) {
             factory.destroy();
@@ -99,7 +99,7 @@ class GatewayRouteReaderTest {
         userIds.add(userId);
         for (String instance : instances) {
             if (instance != null) {
-                redis().opsForSet().add(RedisKeys.GATEWAY_USER_PREFIX + userId, instance);
+                redis().opsForSet().add(RedisKeys.gatewayUser(userId), instance);
             }
         }
         return userId;

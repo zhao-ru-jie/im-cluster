@@ -58,6 +58,16 @@ public class GatewayRegistry {
     private static final Duration TTL = Duration.ofSeconds(30);
 
     /**
+     * 设备集合的保留时长，比路由 TTL 长得多。
+     *
+     * <p>路由表是「现在谁在线」的实时缓存，30s 过期正是它想要的语义；
+     * 设备集合是「这个人有哪些端」的历史事实，要覆盖「离线几天后上线补发」的场景。
+     * 30 天与客户端水位（{@code im.watermark.ttl}）对齐：超过这个时间还没上线的端，
+     * 本来也不该再收到那么早的消息。
+     */
+    private static final Duration DEVICE_TTL = Duration.ofDays(30);
+
+    /**
      * SCAN 每批的 COUNT 提示值。
      *
      * <p>太小 → 往返次数多、清理慢；太大 → 单次命令阻塞 Redis 时间变长（Redis 单线程，
@@ -109,14 +119,32 @@ public class GatewayRegistry {
             return;
         }
         for (String userId : userIds) {
-            safeSadd(RedisKeys.GATEWAY_USER_PREFIX + userId, localInstanceId);
+            safeSadd(RedisKeys.gatewayUser(userId), localInstanceId);
         }
         log.debug("heartbeat renewed {} routing entries on {}", userIds.size(), localInstanceId);
     }
 
     /** 用户在本实例上建连：把自己加进该用户的实例集合 */
     public void bindUser(String userId) {
-        safeSadd(RedisKeys.GATEWAY_USER_PREFIX + userId, localInstanceId);
+        bindUser(userId, null);
+    }
+
+    /**
+     * 用户在本实例上建连：登记「实例路由」+「设备」。
+     *
+     * <p>设备集合是<b>多端同步</b>的前提：IM 服务侧要靠它判断「是不是所有端都已经补过某个位置」，
+     * 从而安全地清掉群聊补发锚点。少了它，锚点只能靠 TTL 过期，期间每轮补发都为这些会话
+     * 白查一次历史。
+     *
+     * <p><b>断开时不摘设备</b>（与 {@link #unbindUser} 刻意不对称）：离线补发需要知道
+     * 「这个用户用过哪些端」，摘掉就等于把离线期间的消息只留给最后一个在线的端。
+     * 换机留下的历史 deviceId 由 {@link #DEVICE_TTL} 自然回收。
+     */
+    public void bindUser(String userId, String deviceId) {
+        safeSadd(RedisKeys.gatewayUser(userId), localInstanceId);
+        if (deviceId != null && !deviceId.isBlank()) {
+            safeSadd(RedisKeys.userDevices(userId), deviceId, DEVICE_TTL);
+        }
     }
 
     /**
@@ -125,7 +153,7 @@ public class GatewayRegistry {
      * <p>不能直接 DEL：同一用户可能还有别的设备连在其它网关实例上，DEL 会把它们一起判成离线。
      */
     public void unbindUser(String userId) {
-        String key = RedisKeys.GATEWAY_USER_PREFIX + userId;
+        String key = RedisKeys.gatewayUser(userId);
         try {
             Long removed = redis.opsForSet().remove(key, localInstanceId);
             if (removed != null && removed > 0 && isSetEmpty(key)) {
@@ -144,7 +172,7 @@ public class GatewayRegistry {
      * <p>多端时可能返回多个实例，调用方必须逐个推送，不能只取第一个。
      */
     public Set<String> instancesOf(String userId) {
-        String key = RedisKeys.GATEWAY_USER_PREFIX + userId;
+        String key = RedisKeys.gatewayUser(userId);
         try {
             Set<String> members = redis.opsForSet().members(key);
             return members == null ? Set.of() : members;
@@ -196,7 +224,7 @@ public class GatewayRegistry {
     private void queryShard(List<String> ids, Map<String, Set<String>> out) {
         List<byte[]> keys = new ArrayList<>(ids.size());
         for (String id : ids) {
-            keys.add((RedisKeys.GATEWAY_USER_PREFIX + id).getBytes(StandardCharsets.UTF_8));
+            keys.add(RedisKeys.gatewayUser(id).getBytes(StandardCharsets.UTF_8));
         }
         try {
             List<Object> raw = redis.executePipelined((RedisCallback<Object>) connection -> {
@@ -249,14 +277,18 @@ public class GatewayRegistry {
      * 由离线队列兜底，代价远小于连接建不起来。
      */
     private void safeSadd(String key, String instanceId) {
+        safeSadd(key, instanceId, TTL);
+    }
+
+    private void safeSadd(String key, String member, Duration ttl) {
         try {
-            redis.opsForSet().add(key, instanceId);
+            redis.opsForSet().add(key, member);
         } catch (RuntimeException e) {
-            log.warn("[route] 路由 key 类型不兼容，删除重建：key={} err={}", key, e.getMessage());
+            log.warn("[route] key 类型不兼容，删除重建：key={} err={}", key, e.getMessage());
             redis.delete(key);
-            redis.opsForSet().add(key, instanceId);
+            redis.opsForSet().add(key, member);
         }
-        redis.expire(key, TTL);
+        redis.expire(key, ttl);
     }
 
     /** 本网关实例 ID（= 本实例 gRPC 可达地址 host:port） */
@@ -292,7 +324,7 @@ public class GatewayRegistry {
     public void removeInstanceBindings(String deadInstanceId) {
         byte[] deadInstanceBytes = deadInstanceId.getBytes(StandardCharsets.UTF_8);
         ScanOptions options = ScanOptions.scanOptions()
-                .match(RedisKeys.GATEWAY_USER_PREFIX + "*")
+                .match(RedisKeys.gatewayUserPattern())
                 .count(SCAN_BATCH)
                 .build();
 

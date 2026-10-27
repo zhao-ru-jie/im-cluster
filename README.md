@@ -279,14 +279,23 @@ TCP      : IdleStateHandler(按原始字节计时) → LengthFieldBasedFrameDeco
 ```jsonc
 // 客户端 → 网关
 {"ver":1,"type":"msg.send","clientMsgId":"c-1","to":"bob","body":"hi","traceId":"可选"}
+{"ver":1,"type":"msg.send","clientMsgId":"c-2","to":"bob","body":"",
+ "contentType":"IMAGE","attrs":"{\"url\":\"https://cdn/a.png\",\"w\":800,\"h\":600}"}   // 富媒体
 {"ver":1,"type":"ping"}
 {"ver":1,"type":"sync","watermarks":{"s:alice:bob":100}}          // 上报各会话已见最大 seq
+{"ver":1,"type":"msg.recv","acks":[{"conversationId":"s:alice:bob","seq":7}]}    // 端到端「已送达」（可攒批）
+{"ver":1,"type":"msg.read","conversationId":"s:alice:bob","seq":7}               // 「已读」（用户级，只前进）
 {"ver":1,"type":"connect","userId":"alice","deviceId":"native","token":"..."}   // 仅 TCP 首帧
 
 // 网关 → 客户端
 {"ver":1,"type":"msg.ack","clientMsgId":"c-1","serverMsgId":"0192f0c4-8a3b-7c2d-9f01-4b7a2c8d5e60","seq":7,"code":0,"traceId":"..."}
 {"ver":1,"type":"msg.push","conversationId":"s:alice:bob","convType":"SINGLE","seq":7,
- "serverMsgId":"0192f0c4-8a3b-7c2d-9f01-4b7a2c8d5e60","clientMsgId":"c-1","from":"alice","to":"bob","body":"hi","ts":1750000000000}
+ "serverMsgId":"0192f0c4-8a3b-7c2d-9f01-4b7a2c8d5e60","clientMsgId":"c-1","from":"alice","to":"bob",
+ "body":"hi","contentType":"TEXT","ts":1750000000000}
+{"ver":1,"type":"msg.state","conversationId":"s:alice:bob","convType":"SINGLE",
+ "state":"READ","seq":7,"userId":"bob","ts":1750000000000}      // 发给发送方的状态回执
+{"ver":1,"type":"msg.update","conversationId":"s:alice:bob","convType":"SINGLE",
+ "seq":7,"change":"RECALLED","actorId":"alice","ts":1750000000000}   // 变更事件（撤回/本地删除）
 {"ver":1,"type":"pong","ts":1750000000000}
 {"ver":1,"type":"error","clientMsgId":"c-1","code":503,"message":"im service unavailable"}
 {"ver":1,"type":"session.migrate","reason":"scale-in","retryAfterMs":1500}
@@ -294,6 +303,78 @@ TCP      : IdleStateHandler(按原始字节计时) → LengthFieldBasedFrameDeco
 
 `msg.push` 与 `GET /conv/{conversationId}/messages` 返回的历史消息**同构**（同一份模板渲染），
 客户端「拉历史 + 接实时帧」不需要两套解析。旧报文 `{"to":...,"body":...}`（不带 `type`）仍然可用。
+
+#### 消息状态机
+
+一条消息在客户端可见的状态有四个，来源刻意分开（混在一起就没法回答「用户到底收到没有」）：
+
+| 状态 | 帧 / 接口 | 谁产生 | 粒度 |
+|---|---|---|---|
+| 已发送（服务端受理） | 上行 `msg.send` → 下行 `msg.ack` | IM 服务（落库 + 幂等记录） | 单条 |
+| 已送达（设备确认收到） | 上行 `msg.recv` → 下行 `msg.state`(DELIVERED) | **客户端**（唯一可信来源） | 设备 × 会话（`im:wm:{userId}:{deviceId}`） |
+| 已读 | 上行 `msg.read` 或 `POST /conv/{id}/read` → 下行 `msg.state`(READ) | 客户端 | 用户 × 会话（`im:user:read:{userId}`） |
+| 网关已写入连接 | 内部 `AckPending`（不出帧） | 网关 `writeAndFlush` 成功 | 设备 × 会话 |
+
+- `msg.recv` **必须攒批**（几条或 50~100ms 一次），逐条 ACK 会把「消息数」放大成「RPC 数」；
+  服务端按会话取 max，重复上报无害。
+- 已送达 / 已读回执**只推单聊**：群聊的「已读」是按人统计的集合，扇出是「成员数 × 消息数」，
+  属于另一个模型（群已读聚合），塞进单点回执只会得到一条没人能解释清楚的帧。
+- 回执**只前进**：进程内按 `会话 + 状态` 去重，重复上报不会让对端收到一串相同帧；
+  推送失败也不重试——下一条消息会带更大的 `seq` 把对端显示自愈。
+- 端到端 ACK 会**抬高补发起点**（`max(锚点, 设备游标+1, 客户端水位+1)`），
+  所以确认过的消息不会再被补发一遍；ACK 不是指标，它改变投递行为。
+
+#### 消息生命周期：撤回与删除
+
+| | 撤回（RECALL） | 本地删除（DELETE） |
+|---|---|---|
+| 影响范围 | **会话级**：会话里所有人都看不到原文 | **用户级**：只有操作者自己看不到 |
+| 谁能做 | 只有发送方，且在 `im.recall.window` 内（默认 2 分钟） | 任何人，对自己视角 |
+| 存储 | `im_message.recalled_at`（jdbc）/ `im:msg:recalled:{conv}`（redis） | `im_message_delete`（jdbc）/ `im:msg:del:{userId}:{conv}`（redis） |
+| 帧的目标 | 会话内所有人（含发送方自己的其他端） | 只有操作者自己（同步给他的其他端） |
+| 列表里 | 保留占位，`body` 为空 + `recalled:true` | 直接消失 |
+
+```
+POST /conv/{conversationId}/messages/{seq}/recall?operatorId=alice
+POST /conv/{conversationId}/messages/{seq}/delete?userId=alice
+GET  /conv/{conversationId}/messages?userId=alice&limit=50   ← 带 userId 才会按他的删除记录过滤
+```
+
+**最关键的一条：脱敏必须在读路径上做，而不只是广播事件。** 撤回有三处会「把原文端出来」的入口，
+全部都要过同一道处理：
+
+1. 历史接口（`MessageService#history`）；
+2. 群聊补发（按 seq 从历史重建帧）；
+3. **单聊补发**——离线队列里存的是「发送时刻的帧快照」，它不会自己变。所以补发出口处会逐帧
+   解析出 `conversationId + seq`，按最新状态改写成 `recalled:true` 并把 `body`/`attrs` 抹掉。
+
+只做第 1 条是最容易犯的错：用户重连一次，撤回的消息就全回来了。
+
+**为什么 `msg.update` 不复用 `msg.state`**：`state` 是「走到哪一步」（DELIVERED/READ，单调前进、
+按会话去重、只推新高），`update` 是「内容或可见性变了」（可针对任意 seq、不单调、撤回要广播给
+所有人而删除只给自己）。两者共用同一条下行通道（`PushPort`），但去重口径不同 ——
+`msg.state` 只推新高，`msg.update` 只推一次（`change|conv|seq|userId`）。
+
+三个明确的取舍：
+
+- **删除不减未读数**：未读是 `lastSeq - readSeq` 算出来的，删掉一条未读消息不会改变两个游标。
+  主流客户端会「删一条、角标减一」，那是计数模型的能力；游标模型的代价，写在这里而不是假装没有。
+- **撤回不物理删除**：消息本体留着（多端要画「已撤回」占位、审计要留痕）。真正的物理清除是
+  「合规删除」，需要级联到对象存储，属于另一个动作。
+- **查询撤回状态失败时按未撤回下发**（记 error）：反过来会在存储抖动时把正常消息<b>永久</b>
+  变成「已撤回占位」，那是不可恢复的错误；而按原文下发的窗口只有一次补发。
+
+#### 富媒体
+
+- `contentType`：`TEXT`（缺省）/ `IMAGE` / `FILE` / `VOICE` / `VIDEO` / `CUSTOM`。
+- `attrs`：媒体元数据的 JSON **字符串**（`url` / `size` / `name` / `duration` / `width` / `height` / `thumb`），
+  网关与 IM 服务**都不解析**——媒体字段的演进速度远快于消息通道，逐字段建模会让每加一个属性
+  都动一次协议与表结构。
+- 文件本体**不走本通道**：客户端直传对象存储，消息里只走 URL。把二进制塞进消息链路会拖慢
+  seq 发号、幂等表与离线队列，而它们都不需要看到字节。
+- 纯文本消息的帧里不带 `attrs`（保持与旧版一致的形状与长度）；`contentType` 始终下发。
+- 会话列表摘要按类型渲染：媒体消息显示 `[图片]` / `[文件]` / `[语音]` / `[视频]`，
+  这样算摘要时**不需要反序列化 body**，也不必为了列表去解析 `attrs`。
 
 ### 接入鉴权（token）
 
@@ -328,6 +409,58 @@ java -cp im-gateway/target/classes com.github.im.gateway.auth.HmacTokenAuthentic
 **已验证**（真实网关进程 + 真实客户端）：无 token → 401、`token=garbage` → 401、
 有效 token → OPEN、**把 alice 的 token 拿去当 bob 用 → 401**（最关键的一条）。
 
+### 关系链与投递前准入（ACL）
+
+鉴权解决「你是谁」，准入解决「你能不能发这一条」。没有后者的后果很具体：
+单聊会话只是两个 userId 排序拼接（`s:{a}:{b}`），**任何人都能给任何人发消息**；
+群 ID 往往可枚举（`g:1`、`g:sales`），不校验等于任何人都能往任何群发言。
+这类问题必须在**投递之前**拦——事后过滤等于骚扰信息的第一屏已经显示出来了。
+
+三档开关（与 `im.auth.mode` 同一套风格）：
+
+| `im.acl.mode` | 行为 | 用途 |
+|---|---|---|
+| `off`（默认） | 不校验，**零额外往返** | 本地联调、纯内网 |
+| `warn` | 校验并记日志，但一律放行 | 上线前观察「本该拦掉多少」 |
+| `enforce` | 校验失败即 403（`error` 帧，客户端不该重试） | 正式生效 |
+
+规则：
+
+| 场景 | 判定 | 说明 |
+|---|---|---|
+| 群聊 | 发送者必须是群成员（`SISMEMBER` / 唯一键存在性，O(1)） | 每条群消息一次，不能走全量 `SMEMBERS` |
+| 单聊 · 黑名单 | **任一方向**拉黑都拒绝 | 拉黑只存「我拉黑了谁」，判定必须查两次 |
+| 单聊 · 好友 | 可选（`im.acl.require-friend`） | 开放社交不要求；企业 IM 通常由组织架构同步关系 |
+| 发给自己 | 始终允许 | 文件传输助手这类场景 |
+
+三个设计点：
+
+- **校验位置在「幂等 + 发号」之前**：被拒的消息不占 seq、不进幂等表、不进离线队列。
+  否则骚扰消息虽然没投出去，也已经消耗了序号，还给对账留下一堆孤儿记录。
+- **黑名单不通知被拉黑方**：`isBlocked(this, other)` 只能由 `this` 自己发起。
+  让被拉黑方能查到「你被谁拉黑了」，本身就是信息泄露。
+- **默认 off 是刻意的**：开启后每条单聊消息多 2~4 次 Redis 往返、每条群消息多 1 次。
+  这个开销应该由部署方在知道自己在为什么付费的前提下打开；`warn` 档就是为此准备的过渡态。
+
+存储与接口：
+
+```
+Redis（默认）   im:rel:friend:{userId}  Set，好友（双向两份，O(1) 点查）
+                im:rel:block:{userId}   Set，黑名单（单向一份）
+MySQL          im_relation (owner_id, target_id, relation_type) 唯一键；好友双向两行、黑名单单向一行
+
+GET    /relation/{userId}/friends              好友列表
+POST   /relation/{userId}/friends              ["bob"]   建立双向好友（幂等）
+DELETE /relation/{userId}/friends/{friendId}             解除好友（双向）
+GET    /relation/{userId}/blocks               黑名单
+POST   /relation/{userId}/blocks               ["spammer"]   拉黑
+DELETE /relation/{userId}/blocks/{blockedId}              取消拉黑
+```
+
+> 不做「好友申请 → 通知 → 同意」的两阶段流程：它需要通知子系统（红点、未读、跨端已处理状态），
+> 属于业务侧。这些接口的定位是**由接入方的好友/组织架构系统同步过来**，IM 侧只消费「关系成立」这个事实。
+> 也仍没有群角色权限（群主/管理员/禁言）——那是群体系的一部分，见「已知限制」。
+
 ### 链路追踪（traceId）
 
 `msg.send` 可以带 `traceId`，不带则网关生成一个 32 位十六进制 ID。同一个 ID 贯穿：
@@ -354,7 +487,7 @@ message accepted: traceId=trace-e2e-0001 conv=s:alice:bob seq=13 msgId=01a166bb-
 | 不同 `deviceId` | 并存；一条消息推给该用户的**每一个**设备 |
 | 不带 `deviceId` | 落 `default` 槽位，等价于旧的「单用户单连接」 |
 
-链路上三处同时配合才成立：
+链路上四处同时配合才成立：
 
 1. **本机会话表**：`ConnectionManager` 变成 `userId → deviceId → 会话`，`send(userId, frame)` 扇出到
    所有设备。部分设备写失败只要有一台成功就算投递成功——其余设备重连后按 seq 拉齐；
@@ -362,6 +495,175 @@ message accepted: traceId=trace-e2e-0001 conv=s:alice:bob seq=13 msgId=01a166bb-
    有两个实例，IM 服务逐个实例推，各实例再分给本机设备；
 3. **failed 语义**：`failed = 目标 − 已投递`。不能直接汇总各实例返回的 failed，否则
    「手机推到、网页所在实例失败」会让一个**已经收到消息的人**被再排一份离线。
+4. **设备登记表**：`im:gateway:devices:{userId}`（SET，网关建连时写，TTL 30 天，**断开不摘**）。
+   它是补发侧判断「是不是所有端都补过某个位置」的唯一依据——没有它就只能二选一：
+   要么误删共享锚点（另一台设备永久缺一段），要么让锚点留到 TTL 过期（每轮补发白查历史）。
+
+#### 补发侧的状态划分：共享只留下界，进度按端分开
+
+「用户级状态 + 多设备」这类问题的通解是：**能被多端共享的只有下界，进度必须按端分开**。
+本项目的落地：
+
+| 状态 | 粒度 | 为什么 |
+|---|---|---|
+| `im:offline:q:{userId}`（单聊帧队列） | 用户级一份 | 帧本身与设备无关，靠 ZSet 的入队序号定位 |
+| `im:offline:cur:{userId}:{deviceId}` | **设备级** | 这台设备补到哪个位置 |
+| `im:offline:ptr:{userId}`（群聊锚点） | 用户级一份 | 「最早的未补发位置」，只给新设备兜底，防止从 seq 1 拉整个历史 |
+| `im:offline:gcur:{userId}:{deviceId}` | **设备级** | 这台设备在每个会话补到哪 |
+| `im:wm:{userId}:{deviceId}` | **设备级** | 客户端亲口确认收到哪 |
+
+群聊补发起点 = `max(锚点, 本设备游标 + 1, 客户端水位 + 1)`。锚点只有在
+「所有已登记设备都已补过这个位置」时才退休——否则删掉它，另一台设备要么永久缺这段，
+要么从 seq 1 重拉整个会话历史。
+
+**补发的帧只推给发起请求的那条连接**（`ConnectionManager.sendTo`，不是 `send`）：
+每台设备有自己的游标、会各自拉一遍；如果用扇出，手机上线会把同一批离线消息同时砸给网页，
+重复一遍，还会让两端的未读数一起跳。
+
+### 会话列表与未读数
+
+在此之前「会话」只是一个字符串约定（`s:a:b` / `g:{id}`），没有实体，所以做不了会话列表、
+未读数、最后一条消息摘要——它们都需要一个地方回答「这个会话现在到哪了」。
+
+| 数据结构 | 内容 |
+|---|---|
+| `im:conv:meta:{convId}` (Hash) | `type` / `last_seq` / `last_time` / `last_from` / `last_digest` / `last_msg_id` |
+| `im:user:convs:{userId}` (ZSet) | `member = convId`，`score = 最后消息时间`（会话列表 + 排序） |
+| `im:user:read:{userId}` (Hash) | `convId -> 已读到的 seq`（**用户级**） |
+
+**未读数是算出来的，不是存出来的**：`unread = last_seq - read_seq`。
+
+存计数（每条消息给每个成员 `INCR`）在群聊里是「消息数 × 成员数」的写放大，而且**一次写失败就永久和真实值不一致**；
+两个游标相减天然自愈——任何一端漏写，下次读到的都是正确的差值。代价是拉列表时每个会话要读一次已读位置，
+所以一页共用一次 pipeline。
+
+**已读是用户级，同步水位是设备级**——这两个概念最容易被混为一谈：
+
+| | 粒度 | 回答的问题 |
+|---|---|---|
+| `im:user:read:{userId}` | **用户级** | 人看到哪了（一个人只有一个答案） |
+| `im:wm:{userId}:{deviceId}` | 设备级 | 这条数据同步到哪个端了（传输语义） |
+
+所以多端已读合并在这一层是**免费的**：手机读完，网页的未读角标下次拉列表就是 0，
+不需要「N 个设备各报一个已读、读取时取 max」，也不用处理「A 端读到 10、B 端读到 20、C 端只读到 5」的偏序。
+反过来，如果按设备存已读，你会被迫在读取路径上做这套合并。
+
+**新会话的已读基线**：用户第一次出现在某个会话的列表里时，已读位置初始化为**当时的** `lastSeq`。
+否则新人进一个十万条历史的群，未读数一上来就是 100000，客户端为了清零还得把整个历史标成已读。
+这个初始化和「加入会话列表」必须在同一个 Lua 里完成（两个 key 共用 `{userId}` hash tag 保证同 slot），
+否则会出现「ZSet 进去了、基线没设」的窗口，那一瞬间的未读数就是全量历史。
+
+**两个只前进**（都是为了兜住乱序与并发）：
+- `last_seq` 用 `HGET` 先比较再写：两条消息并发 submit 时，后分配的 seq 可能先落库，
+  无条件覆盖会让会话列表的最后一条消息闪回旧内容，未读数还会算成负数；
+- 已读位置 `HSET` 前比较，并且 **cap 到 `lastSeq`**：客户端可能上报未来的 seq（本地乐观计数），
+  不 cap 未读数会变负。
+
+**大群的写扩散降级**：一条消息要把所有成员的 `im:user:convs` 都推一遍，10 万人群就是 10 万次 ZADD。
+超过 `im.conversation.fanout-limit`（默认 1000）人时**直接跳过写扩散**，只更新元信息，
+成员的会话列表靠 `im:group:user:{userId}` 反查在**读时**补齐。所以群成员存储多了个反向索引
+（Redis 版多维护一个 Set，JDBC 版直接走 `idx_group_member_user` 索引）。
+
+**会话标记（置顶 / 免打扰）**：`im:user:convflags:{userId}`（Hash，`conversationId -> 位图`），
+第 0 位置顶、第 1 位免打扰。
+
+- **用位而不是两个字段**：这两项几乎总是一起读（会话列表一页几十行）、一起改（设置页一次提交），
+  一个 HGET 就够了；
+- **只改传了的那一项**：`pinned`/`muted` 是 `Boolean`，缺省 = 这一项不动。
+  否则「设为置顶」会顺手把免打扰清掉，用户会以为自己在设置页丢了配置；
+- **免打扰不影响未读数**：未读该算还得算，只是客户端不响铃、不打角标。
+  把「免打扰」实现成「不计未读」是同一个词在两种语义间打架，最后一定会算错；
+- 值得注意的语义边界：置顶只影响**服务端返回的顺序**（置顶优先，其次按最后消息时间倒序），
+  不改变写入与补发的任何行为。
+
+**接口**：
+
+```
+GET  /conv?userId=alice&limit=50                        会话列表，置顶优先，其次按最后消息时间倒序，带 unread/pinned/muted
+POST /conv/{conversationId}/read?userId=alice&seq=100    上报已读（只前进，服务端 cap 到 lastSeq）
+POST /conv/{conversationId}/flag?userId=alice&pinned=true            置顶（不改免打扰）
+POST /conv/{conversationId}/flag?userId=alice&muted=false            取消免打扰（不改置顶）
+```
+
+> 仍然没做的：单聊会话的对方昵称/头像（需要用户资料子系统）、群公告/群名（需要群实体）、
+> 会话删除/归档。会话列表的骨架（谁有哪些会话、未读多少、最后一句说了什么、置顶与免打扰）已经具备。
+
+### 存储分片与 key 空间（appId / conversationId）
+
+分片维度先于分片实现落地：**即使当前只有 1 个分片、1 个租户，两条维度也已经是 key 与路由的一等公民**。
+理由很实际——分片这件事一旦要加，最先出错的永远是「同一份数据在两处被算到不同分片」，
+而那种实现几乎总是各模块自己写 `Math.abs(id.hashCode()) % n`。
+
+**每个 key 只带两个 hash tag**（`RedisKeys` 是唯一构造点）：
+
+| 维度 | tag | key 形态 |
+|---|---|---|
+| 会话 | `{conversationId}` | `im:conv:{c}:meta` / `:msgs` / `:seq` / `:recalled` / `:idem:{from}\|{msgId}` |
+| 用户 | `{userId}` | `im:user:{u}:convs` / `:read` / `:flags` / `:wm:{device}` / `:offline:*` / `:friends` … |
+| 群 | `{groupId}` | `im:group:{g}:members` |
+
+**这次改造修掉了一个真实缺陷**：改造前 `im:seq:{c}` 与 `im:idem:{from}|{msgId}` 都没有 tag，
+而 `SeqAllocator` 的「幂等查询 + 发号」合并脚本同时访问这两个 key —— 在 Redis Cluster 上
+会直接 `CROSSSLOT` 失败（单机 Redis 无感，所以一直没暴露）。现在幂等键挂在会话维度上
+（`im:conv:{c}:idem:...`），与 seq 计数器天然同 slot。
+
+同 slot 带来的结构性收益：`meta + msgs + seq + recalled` 现在可以放进**同一个 Lua**，
+将来把「受理一条消息」（取号 → 追加 → 更新 meta）合并成一次往返，而不用改 key 设计。
+
+**租户维度**用进程级根前缀（`im.tenant.app-id`，默认空 → `im:`）：
+
+- 为什么不是每条请求带 appId：同一个 Redis 里用前缀隔离租户是"伪隔离"（备份、迁移、慢查询、
+  内存水位全分不开），真多租户按实例或按库隔离；
+- 为什么不走 ThreadLocal 上下文：项目里的推送是虚拟线程池，上下文在那里会静默丢失，
+  那类 bug 的排查成本远高于收益。
+
+**MySQL 侧**：`conversationId` 已经是 `im_message` 唯一键与主查询的首列，
+物理切分用原生 `PARTITION BY HASH(conversation_id)`，脚本与前置条件（唯一键必须含分区键）
+写在 `db/schema-shard.sql`，默认不启用——单机部署没有收益，而分区对主键有额外约束。
+
+`ShardRouter` 是这套规则的唯一实现：`shardOf(conversationId)` 用 CRC32（与 `zlib.crc32` 一致，
+离线脚本能算出同一个分片）、`messageTableOf` 在单分片时退化回 `im_message`。它的 debug 日志
+同时打出 `mysql=` 与 `redis=`，用于对照两侧是否按同一维度切分。
+
+> 迁移注意：key 名变了（`im:conv:meta:x` → `im:conv:{x}:meta`），旧数据不会自动读到。
+> 本项目是自研单租户部署，直接清空 Redis 即可；如果要平滑迁移，需要对旧前缀做一次
+> rename/双读，脚本成本高于收益。
+
+### 离线通知（厂商推送）
+
+长连接只在 App 前台、进程活着、网络可用时有效。用户真正收不到消息的场景恰好是**连接不在**：
+进程被杀、后台被系统冻结、手机休眠。这时唯一的通道是手机厂商的推送服务——它由系统进程常驻
+接管，能唤醒 App 或至少显示一条通知。
+
+所以两条通道的触发条件是互补的：`PushPort`（长连接下发）返回的 `failed_user_ids`，
+正是厂商推送的目标用户。
+
+```text
+MessageRouter.deliver → failed(userIds) → ① 落离线队列（权威通道）
+                                        → ② VendorPushPort（提醒通道，尽力而为）
+```
+
+**边界为什么放在「中转」**：APNs 是 HTTP/2 + 每次签发的 JWT，FCM 是 OAuth2 服务账号，
+华为/小米/OPPO/vivo 各有一套 AppKey 签名与字段命名。把这四套塞进消息服务只有一种结果——
+消息服务的发布节奏被推送 SDK 的升级绑死，且任何一家的连接抖动都能影响投递线程池。
+IM 服务只声明「推给谁、推什么」（`VendorPushRequest`：userId / title / body /
+conversationId / seq / contentType），怎么推由 `VendorPushPort` 的实现承担。
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `im.vendor-push.enabled` | `false` | 关闭时**不装配任何实现**，启动日志里不会出现连不上的告警 |
+| `im.vendor-push.endpoint` | 空 | 中转服务的接收地址 |
+| `im.vendor-push.token` | 空 | `Authorization: Bearer <token>` |
+| `im.vendor-push.timeout` | `3s` | 连接与请求超时 |
+
+两条内部护栏（都不需要配置）：
+
+- **人数上限 200**：一个 500 人群九成不在线时，逐人推送等于自己给自己限流，
+  还会让真实用户的通知排在后面；
+- **正文截断 80 字符**：各家厂商对 payload 都有硬限制，通知正文只需要让用户判断「要不要点开」。
+
+失败**不重试**：通知丢了，用户下次打开 App 照样能从离线队列拿到消息（那才是权威通道）。
+为一条通知维护重试队列，是拿可靠性去换一件非权威的事。
 
 设备数上限 `im.gateway.max-devices-per-user`（默认 5）：超限时**拒绝新连接**而不是踢掉老设备，
 避免一个客户端 bug 反复重连把用户其它设备挤下线。
@@ -538,9 +840,11 @@ CREATE TABLE im_group_member (
 > 所以 score 用 per-user 的入队序号（`im:offline:q:{userId}` 旁边的 `:pos` 计数器，
 > 计数器丢了会从队列最大位置续上，不会从 1 重来导致顺序错乱）。
 
-**游标按设备隔离**：`im:offline:cur:{userId}:{deviceId}`。手机和网页各自补到哪互不相干——
-用户级单一游标的后果是「先上线的设备一确认，另一个设备就永远补不到那段」。
+**游标按设备隔离**：单聊 `im:offline:cur:{userId}:{deviceId}`、群聊
+`im:offline:gcur:{userId}:{deviceId}`。手机和网页各自补到哪互不相干——用户级单一游标的后果是
+「先上线的设备一确认，另一个设备就永远补不到那段」。
 删数据仍只按「总条数超上限」裁，不按游标裁（按游标裁会让先确认的设备删掉另一个设备还没读的消息）。
+多端同步的整体设计见「多端在线」小节的「共享只留下界，进度按端分开」。
 
 #### 群聊补发的起点与上限
 
@@ -576,6 +880,12 @@ CREATE TABLE im_group_member (
 `GroupMemberRepository` 同样双实现：Redis Set `im:group:members:{groupId}`（默认）或 MySQL `im_group_member`。
 群聊扇出 = 群成员列表去掉发送者；成员列表为空时**当成无人可投**，绝不退化成「投给群 ID」
 （那会往离线队列塞进永远不被拉取的数据）。
+
+除了正查（群 → 成员）还有**反查**（用户 → 群，`groupsOf`）：Redis 形态多维护一个
+`im:group:user:{userId}` Set（写入/移除成员时两边一起改），JDBC 形态直接走 `idx_group_member_user` 索引。
+反查的用途是**大群会话列表的补齐**——群消息的会话列表是写扩散的，超过 `im.conversation.fanout-limit`
+会跳过写扩散，成员的列表只能靠反查在读时补出来。少了它，大群成员「明明在群里却看不到会话」。
+退群时两边必须一起摘，否则退群的人会一直看到那个群。
 
 **扇出成本与两步优化**。一条群消息 =「按人查在线路由」+「按实例 gRPC 下发」。5000 人群若逐个
 `SMEMBERS` 查路由，就是 5000 次串行往返（1~2.5s），这是群消息延迟的全部来源：
@@ -721,6 +1031,9 @@ Nacos 未启用或连不上时，`NacosNodeDiscovery.resolveTarget()` **自动�
 | **丢消息** | 先落库后推送；推送失败落离线队列；「可丢实时性，不可丢消息」 |
 | **离线补发丢消息** | 补发是 at-least-once：`pullPending` 读不删，网关全部写成功才 `ackPending` 推进游标；失败重连重复补，客户端按 seq 去重 |
 | **补发"已送达"不可判定** | 客户端 `sync` 上报的水位按 `im:wm:{userId}:{deviceId}` 落 Redis（30d TTL），是 delivered 的唯一可信口径 |
+| **多端互相吃掉离线消息** | 补发进度按设备分开（`im:offline:cur` / `im:offline:gcur`），用户级只保留「最早未补发」锚点；锚点要等所有登记设备都补过才退休 |
+| **会话列表写失败** | 只记 error，不影响受理：消息已落库，补发与历史拉取都不依赖会话列表（它只是「入口」） |
+| **未读数与真实消息数不一致** | 不存计数，用 `last_seq - read_seq` 相减，天然自愈 |
 | **网关宕机** | 路由 TTL 过期 + Nacos 健康剔除；残留路由由其他健康节点清理；消息转离线 |
 | **IM 服务不可用** | 网关**保住连接**，回 `error 503` 让客户端退避重发，不主动断连（连接比单条消息的实时性稀缺） |
 | **死连接** | Netty 心跳两段式探测，超时断开并清路由 |
@@ -927,6 +1240,8 @@ kubectl apply -f k8s/im-node.yaml     # 或 im-gateway.yaml + im-server.yaml（�
 | `im.offline.max-frames` | `IM_OFFLINE_MAX_FRAMES` | `500` | 单聊离线队列每人上限（超出丢最旧） |
 | `im.offline.pointer-ttl` | `IM_OFFLINE_POINTER_TTL` | `7d` | 群聊补发指针过期时间（超期放弃补发，历史仍可主动拉） |
 | `im.watermark.ttl` | `IM_WATERMARK_TTL` | `30d` | 客户端消费水位保留时长（delivered 对账数据） |
+| `im.conversation.list-ttl` | `IM_CONVERSATION_LIST_TTL` | `30d` | 会话列表 / 已读位置保留时长（长期无消息自然消失） |
+| `im.conversation.fanout-limit` | `IM_CONVERSATION_FANOUT_LIMIT` | `1000` | 会话列表写扩散的人数上限，超过则只更新元信息（靠群反查表补齐） |
 | `im.node.grpc-port` / `grpc-host` | `IM_GRPC_PORT` / `IM_GRPC_HOST` | `9090` / 自动探测 | 实例 ID |
 | `im.node.grpc.tls.enabled` / `trust-cert` | `IM_GRPC_TLS` / `IM_GRPC_TRUST` | `false` / 空 | gRPC TLS |
 | `im.node.grpc.health-check-enabled` | `IM_GRPC_HEALTH_CHECK` | `true` | 客户端健康检查（排除 NOT_SERVING 实例） |
@@ -940,13 +1255,19 @@ kubectl apply -f k8s/im-node.yaml     # 或 im-gateway.yaml + im-server.yaml（�
 | `im:gateway:user:{userId}` (SET) | 网关（TTL 续期） | IM 服务（下行路由：用户 → 网关实例集合） |
 | `im:offline:q:{userId}` (ZSet) + `:pos` (String) | IM 服务 | IM 服务（单聊离线队列，score = 入队序号；读不删，TTL + 长度上限） |
 | `im:offline:cur:{userId}:{deviceId}` (String) | IM 服务（网关 ack 驱动） | IM 服务（每设备已确认补发到的位置） |
-| `im:offline:ptr:{userId}` (Hash) | IM 服务（网关 ack 驱动） | IM 服务（群聊补发指针：会话 → 待补发 seq，TTL） |
+| `im:offline:ptr:{userId}` (Hash) | IM 服务 | IM 服务（群聊补发**锚点**：会话 → 最早的未补发 seq，TTL） |
+| `im:offline:gcur:{userId}:{deviceId}` (Hash) | IM 服务（网关 ack 驱动） | IM 服务（每设备在每个会话已补发到的 seq） |
+| `im:gateway:devices:{userId}` (SET) | 网关 | IM 服务（该用户登记过的设备，判断锚点能否退休） |
 | `im:wm:{userId}:{deviceId}` (Hash) | IM 服务 | IM 服务（客户端亲口确认的已见 seq，delivered 口径，30d TTL） |
 | `im:offline:{userId}` (List) | — | **已废弃**，升级窗口内读一次把积压帧发掉 |
 | `im:conv:msgs:{conversationId}` | IM 服务（`im.storage=redis`） | IM 服务 |
 | `im:seq:{conversationId}` | IM 服务 | IM 服务 |
 | `im:idem:{from}\|{clientMsgId}` | IM 服务 | IM 服务 |
 | `im:group:members:{groupId}` | IM 服务（`im.storage=redis`） | IM 服务（群聊扇出） |
+| `im:group:user:{userId}` (SET) | IM 服务（`im.storage=redis`） | IM 服务（反查「我加入了哪些群」，大群会话列表补齐） |
+| `im:conv:meta:{convId}` (Hash) | IM 服务 | IM 服务（会话元信息：last_seq / last_time / 最后一条摘要） |
+| `im:user:convs:{userId}` (ZSet) | IM 服务 | IM 服务（会话列表，score = 最后消息时间） |
+| `im:user:read:{userId}` (Hash) | IM 服务 | IM 服务（**用户级**已读位置，多端共用） |
 
 ---
 
@@ -1021,8 +1342,14 @@ im-cluster/
 │   ├── message/RedisMessageRepository.java   # 默认存储实现
 │   ├── message/StoredMessage.java            # 结构化存储记录
 │   ├── message/OfflineMessageStore.java      # 离线消息
-│   ├── message/ClientFrames.java             # 下行 msg.push 帧序列化（实时与历史同构）
+│   ├── message/ClientFrames.java             # 下行 msg.push / msg.state 帧序列化（实时与历史同构）
+│   ├── message/MessageStateNotifier.java     # 状态回执：把 delivered/read 推回发送方（仅单聊）
+│   ├── message/MessageUpdateNotifier.java    # 变更事件：撤回广播全会话、删除只推操作者自己的端
+│   ├── message/MessageDigests.java           # 会话摘要与媒体占位符（列表与通知共用同一份文案）
+│   ├── push/HttpVendorPush.java              # 厂商推送（离线通知）：HTTP 中转，默认关闭
 │   ├── group/GroupMemberRepository.java      # 群成员端口 + Redis 实现
+│   ├── relation/MessageAcl.java              # 投递前准入：群成员 + 黑名单 + 可选好友（三档开关）
+│   ├── relation/RelationRepository.java      # 关系链端口（好友双向 / 黑名单单向）
 │   ├── grpc/MessageIngressGrpcService.java   # @GrpcService：供远程网关上行
 │   └── controller/                           # /send、/conv/{conversationId}/messages、/group/...
 │
@@ -1057,13 +1384,38 @@ im-cluster/
   `uri().equals(websocketPath)` 判断，`/ws?userId=alice` 不等于 `/ws`，请求会被静默转发到 pipeline 尾部丢弃
   ——既不应答 101 也不报错，客户端只表现为握手超时。本项目在握手闸门里校验完身份后
   `request.setUri(wsPath)` 再交下去。
+- **Lua 脚本要兼容 Redis 3.x**：本机联调用的 Redis 是 `3.2.100`（Windows 老版本），所以脚本里
+  **不能用**多字段 `HSET k f1 v1 f2 v2`（4.0+）、`ZADD ... GT/XX/NX`（6.2+）、`UNLINK`（4.0+）、
+  `GETEX`（6.2+）等新命令，否则报的是 `Wrong number of args calling Redis command From Lua script`
+  这种和真实原因完全无关的错。需要「只前进」语义时先用 `HGET`/`ZSCORE` 比较再写。
+  `SET k v PX ms`（2.6.12+）、`HSETNX`、`ZRANGEBYSCORE`、`ZREMRANGEBYRANK`、`PEXPIRE` 都可以放心用。
 - **多端靠 deviceId 区分**：`ConnectionManager` 的 key 是 `userId → deviceId → 会话`。
   同一 deviceId 重连踢旧连接；**不带 deviceId 的客户端全部落到 `default` 槽位**，
   等价于旧的「单用户单连接」——想多端必须带 deviceId。
-- **离线队列共享、游标按设备分开**：队列还是「用户级」的一份（写入时不知道用户有哪些设备，
-  按设备写扩散代价太大），但**确认游标是 per-device** 的，所以先上线的设备不会把后上线的
-  那份吃掉——各自从自己的位置往后读，重复的那部分由客户端按 seq 去重。
-  仍然没有解决的是「一次 pull 的结果会扇出给该用户所有在线设备」，那一层留给多端同步。
+- **离线队列/锚点共享，进度按设备分开**：队列和群聊锚点还是「用户级」的一份（写入时不知道
+  用户有哪些设备，按设备写扩散代价太大），但**确认进度是 per-device** 的，补发帧也只推给
+  发起请求的那条连接。所以先上线的设备不会把后上线那份吃掉。
+- **未读数是算的，已读是用户级的**：见「会话列表与未读数」。多端合并在这一层是免费的——
+  已读只有一份状态（`im:user:read:{userId}`），不存在「N 个设备各报一个已读、读取时取 max」的合并逻辑。
+  需要按设备分的只有**同步**水位（`im:wm:{userId}:{deviceId}`），那是传输语义，别混。
+- **分片只落到「维度 + 路由函数」**：Redis 侧已按会话/用户分 slot，MySQL 侧的分区脚本未启用，
+  也没有跨实例的库路由（`ShardRouter.messageTableOf` 目前只产出表名，不产出库名）。
+  key 名已变更（`im:conv:{c}:meta` 形态），旧数据不会自动读到，需要清库或做一次 rename 迁移。
+- **撤回/删除的能力边界**：没有「群主/管理员撤回他人消息」（需要群角色），没有「双向删除」
+  （delete for everyone，等价于撤回但不限发送方），没有「撤回后可编辑重发」，
+  也没有合规层面的物理清除（消息本体与对象存储里的文件都还在）。
+- **本地删除不影响未读数**：未读是 `lastSeq - readSeq` 的游标差值，删掉一条未读消息不会让它减一。
+- **准入只到「关系 + 群成员」粒度**：没有群角色权限（群主/管理员/谁能踢人、谁能禁言），
+  也没有「拉黑后历史会话如何处理」「删除好友后能否继续会话」这类产品策略。
+  `im_relation` 的写入也不是原子的：好友是两行，中途失败会留下单边残留，
+  而 `areFriends` 要求两侧都存在（所以残留只会让关系「看起来没建立」，不会误放行），重试即收敛。
+- **状态回执只覆盖单聊**：`msg.state`（DELIVERED / READ）不推群聊。群里的「已读」是
+  「谁读到第几号」的集合，要对前缀内每个发送者分发，扇出是「成员数 × 消息数」，
+  得先有群已读的聚合视图（已读/未读人数）才谈得上正确。当前的群聊消息仍可查水位，只是不发帧。
+- **富媒体只传 URL，不传字节**：`attrs.url` 指向对象存储，上传/下载/鉴权/清理都不在本项目范围内
+  （也没有内置上传接口）。服务端不校验 URL 是否可达——那是接入方与存储之间的事。
+- **`contentType` / `attrs` 需要库表同步升级**：老库升级要手工执行 `schema.sql` 头部注释里的
+  `ALTER TABLE im_message ADD COLUMN ...`，否则 MyBatis-Plus 生成的列清单会带上不存在的列。
 - **断连必须按会话移除**：见「可靠性设计」里的快速重连条目。
 - **客户端必须回 `pong`**：服务端发的应用层 `{"type":"ping"}` 需要应答，否则空闲超时后会被断开。
 - **鉴权只在建连时校验一次**：连接建立后 token 过期不会主动断连（长连接可能远活过 token 的 TTL）。

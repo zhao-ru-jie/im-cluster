@@ -1,118 +1,250 @@
 package com.github.im.contract;
 
 /**
- * Redis key 空间：跨服务共享的数据契约，集中定义避免两侧各写一份字符串。
+ * Redis key 空间：跨服务共享的数据契约，<b>所有 key 的唯一构造点</b>。
  *
- * <p>所有权（谁写谁读）在这里固定下来，是拆分后「数据一致性」的落点：
- * <table border="1">
- *   <caption>key 归属</caption>
- *   <tr><th>key</th><th>写方</th><th>读方</th></tr>
- *   <tr><td>{@link #GATEWAY_USER_PREFIX}{userId}</td><td>长连接服务</td><td>IM 服务（下行路由，SET 集合：多端可能同时在多个实例上）</td></tr>
- *   <tr><td>{@link #OFFLINE_PREFIX}{userId}</td><td>IM 服务</td><td>IM 服务（<b>已废弃</b>的 List 队列，仅升级窗口内读一次）</td></tr>
- *   <tr><td>{@link #OFFLINE_QUEUE_PREFIX}{userId}</td><td>IM 服务</td><td>IM 服务（单聊离线 ZSet，score=seq，读不删）</td></tr>
- *   <tr><td>{@link #OFFLINE_CURSOR_PREFIX}{userId}:{deviceId}</td><td>IM 服务（网关 ack 驱动）</td><td>IM 服务（每设备已确认补发到的 seq）</td></tr>
- *   <tr><td>{@link #CLIENT_WATERMARK_PREFIX}{userId}:{deviceId}</td><td>IM 服务</td><td>IM 服务（客户端亲口确认的已见 seq，delivered 口径）</td></tr>
- *   <tr><td>{@link #OFFLINE_PTR_PREFIX}{userId}</td><td>IM 服务（网关 ack 驱动）</td><td>IM 服务（群聊补发指针，带 TTL）</td></tr>
- *   <tr><td>{@link #CONV_MESSAGES_PREFIX}{conversationId}</td><td>IM 服务</td><td>IM 服务</td></tr>
- *   <tr><td>{@link #SEQ_PREFIX}{conversationId}</td><td>IM 服务</td><td>IM 服务</td></tr>
- *   <tr><td>{@link #IDEM_PREFIX}{from}|{clientMsgId}</td><td>IM 服务</td><td>IM 服务</td></tr>
- *   <tr><td>{@link #GROUP_MEMBERS_PREFIX}{groupId}</td><td>IM 服务</td><td>IM 服务（群聊扇出）</td></tr>
- * </table>
+ * <h2>两级分片维度</h2>
+ *
+ * <p>每个 key 都带一个 <b>hash tag</b>，只有两个维度：
+ * <ul>
+ *   <li><b>会话维度</b> {@code {conversationId}}：{@code im:conv:{c}:meta} / {@code :msgs} /
+ *       {@code :seq} / {@code :recalled} / {@code :idem:*}</li>
+ *   <li><b>用户维度</b> {@code {userId}}：{@code im:user:{u}:convs} / {@code :read} /
+ *       {@code :wm:*} / {@code :offline:*} / {@code :friends} …</li>
+ * </ul>
+ *
+ * <p>为什么必须统一：Cluster 下多 key 脚本/pipeline 要求所有 key 落在同一 slot。
+ * 改造前 {@code im:seq:{c}} 与 {@code im:idem:{from}|{msgId}} 都没有 tag，
+ * 于是 {@code SeqAllocator} 的「幂等查询 + 发号」合并脚本在 Cluster 上会直接
+ * {@code CROSSSLOT}（单机 Redis 无感，所以一直没暴露）。统一 tag 之后：
+ *
+ * <ul>
+ *   <li>「幂等查询 + 发号」天然同 slot；</li>
+ *   <li>{@code meta + msgs + seq + recalled} 同 slot，将来可以把「受理一条消息」
+ *       （取号 → 追加 → 更新 meta → 记撤回）合并成一次 Lua，省掉 3 次往返；</li>
+ *   <li>一个用户的所有离线相关 key 同 slot（队列/游标/指针经常在同一个脚本里出现）。</li>
+ * </ul>
+ *
+ * <h2>租户（appId）维度</h2>
+ *
+ * <p>key 的最前面是<b>可配置的根</b>：默认 {@code im}，多租户部署时设
+ * {@code im.tenant.app-id=acme} 得到 {@code acme:im:…}。
+ *
+ * <p>为什么是<b>进程级</b>配置而不是每条请求带 appId：
+ * <ul>
+ *   <li>同一个 Redis 里用前缀隔离租户是"伪隔离"——备份、迁移、慢查询、内存水位全都分不开，
+ *       真多租户一定是按实例或按库隔离；</li>
+ *   <li>进程级配置不需要把 appId 贯穿 proto、方法签名与所有异步线程（项目里的推送是
+ *       虚拟线程池，ThreadLocal 上下文在那里会静默丢失，那是最难查的一类 bug）。</li>
+ * </ul>
  *
  * @author zhaorujie
  * @since 1.0.0
  */
 public final class RedisKeys {
 
-    /**
-     * 在线路由：SET{网关实例 ID}，带 TTL，由网关心跳续期。
-     *
-     * <p>是集合而不是单值：多端时同一用户可能同时连在多个网关实例上，
-     * 下行必须逐个实例推送，再由各实例分发给本机上的设备。
-     */
-    public static final String GATEWAY_USER_PREFIX = "im:gateway:user:";
-    /**
-     * 单聊离线消息帧队列（List，带 TTL 与长度上限）。
-     *
-     * <p>只放「一条消息只有一个收件人」的场景；群聊走 {@link #OFFLINE_PTR_PREFIX}。
-     *
-     * @deprecated 已被 {@link #OFFLINE_QUEUE_PREFIX}（ZSet）取代。本结构的问题是
-     *         「读即消费」（{@code LRANGE + LTRIM} 原子移走），网关拿到帧后写失败就丢，
-     *         属于 at-most-once。新队列按 seq 建索引 + per-device 游标，可以读不删、确认后再推进。
-     *         旧 key 仍被读取一次（升级窗口内把积压的帧发掉），之后自然过期。
-     */
-    @Deprecated
-    public static final String OFFLINE_PREFIX = "im:offline:";
-    /**
-     * 单聊离线消息队列（<b>ZSet</b>：{@code score = seq}，{@code member = 完整下行帧}）。
-     *
-     * <p>用 ZSet 而不是 List 的三个理由：
-     * <ol>
-     *   <li><b>能按 seq 定位</b>：补发起点是「该设备已确认到的 seq」，{@code ZRANGEBYSCORE key (cursor +inf}
-     *       是 O(log N + M)，List 只能按下标读，而 {@code LTRIM} 一裁下标就漂移；</li>
-     *   <li><b>读不删</b>：读的时候不动数据，由 {@link #OFFLINE_CURSOR_PREFIX} 的游标表达「谁读到哪了」，
-     *       于是「读到了但没发出去」不会丢；</li>
-     *   <li><b>天然有序</b>：按 seq 升序补发，不再依赖入队顺序（旧 List 的补发顺序是到达顺序，可能乱序）。</li>
-     * </ol>
-     *
-     * <p>裁剪仍按条数：写入时 {@code ZREMRANGEBYRANK 0 -(max+1)} 保留最新 {@code max} 条，
-     * 语义与旧 List 的 {@code LTRIM} 一致——超期/超量的用户放弃补发，历史仍在消息存储里。
-     *
-     * <p>前缀刻意与 {@link #OFFLINE_PREFIX} 不同（多一段 {@code q:}）：ZSet 与 List 同 key 会触发
-     * WRONGTYPE，换名字比「删掉重建」更安全（重建会把升级前积压的离线消息丢掉）。
-     */
-    public static final String OFFLINE_QUEUE_PREFIX = "im:offline:q:";
-    /**
-     * 单聊离线补发的<b>设备级游标</b>（String：该设备已确认收到的最大 seq）。
-     *
-     * <p>per-device 而不是 per-user：手机和网页各自补到哪互不相干。用户级单一游标的后果是
-     * 「先上线的设备一确认，另一个设备就永远补不到那段」——多端场景下等于丢消息。
-     *
-     * <p>游标<b>只前进</b>（{@code CAS}：只有新旧值都大于当前值才写），回退会导致重复补发死循环。
-     */
-    public static final String OFFLINE_CURSOR_PREFIX = "im:offline:cur:";
-    /**
-     * 客户端消费水位（Hash：{@code conversationId -> 客户端已确认收到的最大 seq}，per user+device）。
-     *
-     * <p>与 {@link #OFFLINE_CURSOR_PREFIX} 的区别：游标是「网关写进 socket 成功」，
-     * 水位是「客户端亲口说收到了」（{@code sync} 帧上报）。前者是<b>至少一次</b>的保证，
-     * 后者是<b>delivered</b> 的唯一可信口径——两者都需要，不能互相替代。
-     *
-     * <p>落 Redis 而不是只留进程内：进程重启就清空的表撑不起「已送达」这个语义，
-     * 而它同时还是 seq 发号器在「消息存储与计数器一起丢」时唯一的下界来源（见 {@code SeqAllocator}）。
-     */
-    public static final String CLIENT_WATERMARK_PREFIX = "im:wm:";
-    /**
-     * 群聊离线补发指针（Hash：{@code conversationId -> 待补发的 seq}，带 TTL）。
-     *
-     * <p>为什么不给群聊存帧：一条群消息要写给所有不在线成员，500 人群 9 成不在线时，
-     * 存帧就是每条消息 450 份相同内容，且随消息数线性增长。改成指针后，每个
-     * 「用户 × 会话」只占一个 field，后续消息只把同一个 field 往前推，
-     * <b>占用不随消息数增长</b>——补发时再按 seq 从会话历史重建帧。
-     *
-     * <p><b>注意前缀包含关系</b>：本前缀以 {@link #OFFLINE_PREFIX} 开头，所以任何
-     * {@code im:offline:*} 的批量扫描/迁移/清理都会把指针 key 一起算进来。
-     * 需要批量处理时请显式区分这两种 key，不要图省事直接用外层前缀。
-     */
-    public static final String OFFLINE_PTR_PREFIX = "im:offline:ptr:";
-    /** 会话消息存储（List，按 seq 追加） */
-    public static final String CONV_MESSAGES_PREFIX = "im:conv:msgs:";
-    /**
-     * 会话内序号分配器（String 计数器，每条消息一次原子 {@code INCR}）。
-     *
-     * <p>注意：它是<b>加速器而非权威</b>——丢了可以重建，重建下界取
-     * {@code im_message} / 会话消息里的最大 seq（见 {@code SeqAllocator}）。
-     */
-    public static final String SEQ_PREFIX = "im:seq:";
-    /**
-     * 幂等表：{@code {from}|{clientMsgId} -> "{serverMsgId}|{seq}"}（24h TTL）。
-     *
-     * <p>写入时机是<b>落库成功之后</b>；读取则与 seq 发号合并在同一个 Lua 里（见 {@code SeqAllocator}）。
-     */
-    public static final String IDEM_PREFIX = "im:idem:";
-    /** 群成员集合（Set），im.storage=redis 时的群成员存储 */
-    public static final String GROUP_MEMBERS_PREFIX = "im:group:members:";
+    private static final String DEFAULT_ROOT = "im";
+
+    /** 进程级根前缀，启动时由配置设置一次；默认与原行为一致 */
+    private static volatile String root = DEFAULT_ROOT;
 
     private RedisKeys() {
+    }
+
+    /**
+     * 设置租户根前缀（启动时调用一次）。
+     *
+     * @param appId 租户标识；空白表示回到默认根 {@code im}
+     */
+    public static void configure(String appId) {
+        root = (appId == null || appId.isBlank()) ? DEFAULT_ROOT : appId.trim() + ":im";
+    }
+
+    /** 当前根前缀（观测/测试用） */
+    public static String root() {
+        return root;
+    }
+
+    // ==== 会话维度（tag = {conversationId}） ====
+
+    /** 会话元信息（Hash：type / last_seq / last_time / last_from / last_digest / last_msg_id） */
+    public static String convMeta(String conversationId) {
+        return root + ":conv:" + tag(conversationId) + ":meta";
+    }
+
+    /** 会话消息存储（Redis 形态是 List，按 seq 追加；jdbc 形态见 im_message） */
+    public static String convMessages(String conversationId) {
+        return root + ":conv:" + tag(conversationId) + ":msgs";
+    }
+
+    /**
+     * 会话内序号分配器（String 计数器）。
+     *
+     * <p>它是<b>加速器而非权威</b>：丢了可以重建，下界取 {@code im_message} 里的最大 seq。
+     */
+    public static String convSeq(String conversationId) {
+        return root + ":conv:" + tag(conversationId) + ":seq";
+    }
+
+    /** 已撤回的 seq 集合（Set）；与 {@link #convMessages} 同 slot，读路径可以一次拿齐 */
+    public static String convRecalled(String conversationId) {
+        return root + ":conv:" + tag(conversationId) + ":recalled";
+    }
+
+    /**
+     * 幂等表（String：{@code "{serverMsgId}|{seq}"}，24h TTL）。
+     *
+     * <p>挂在<b>会话</b>维度上而不是只按 {@code from|clientMsgId}：它要与 {@link #convSeq}
+     * 出现在同一个发号脚本里，两者必须同 slot。语义上也没有损失——同一个 clientMsgId
+     * 在同一个会话内重复才算重复提交。
+     */
+    public static String convIdem(String conversationId, String idempotencyKey) {
+        return root + ":conv:" + tag(conversationId) + ":idem:" + idempotencyKey;
+    }
+
+    // ==== 用户维度（tag = {userId}） ====
+
+    /** 用户的会话列表（ZSet：member=conversationId，score=最后一条消息时间） */
+    public static String userConvs(String userId) {
+        return root + ":user:" + tag(userId) + ":convs";
+    }
+
+    /** 用户在各会话的已读位置（Hash：conversationId -> 已读到的最大 seq） */
+    public static String userRead(String userId) {
+        return root + ":user:" + tag(userId) + ":read";
+    }
+
+    /** 用户在各会话的标记位（Hash：conversationId -> 位图；bit0 置顶、bit1 免打扰） */
+    public static String userFlags(String userId) {
+        return root + ":user:" + tag(userId) + ":flags";
+    }
+
+    /** 客户端水位（Hash：conversationId -> 客户端亲口确认收到的最大 seq），per user+device */
+    public static String userWatermark(String userId, String deviceId) {
+        return root + ":user:" + tag(userId) + ":wm:" + deviceId;
+    }
+
+    /** 用户注册过的设备集合（Set，网关写、IM 服务读，带 TTL） */
+    public static String userDevices(String userId) {
+        return root + ":user:" + tag(userId) + ":devices";
+    }
+
+    /** 用户加入的群反查（Set：userId -> groupId），大群降级后靠它补齐会话列表 */
+    public static String userGroups(String userId) {
+        return root + ":user:" + tag(userId) + ":groups";
+    }
+
+    /** 单聊离线帧队列（ZSet：score=seq，member=完整下行帧） */
+    public static String userOfflineQueue(String userId) {
+        return root + ":user:" + tag(userId) + ":offline";
+    }
+
+    /** 单聊离线队列的写入位置计数器（String），与队列同 slot */
+    public static String userOfflinePosition(String userId) {
+        return root + ":user:" + tag(userId) + ":offline:pos";
+    }
+
+    /** 单聊离线补发的设备级游标（String：该设备已确认补发到的最大 seq） */
+    public static String userOfflineCursor(String userId, String deviceId) {
+        return root + ":user:" + tag(userId) + ":offline:cur:" + deviceId;
+    }
+
+    /** 群聊补发的设备级游标（Hash：conversationId -> 该设备已确认补发到的 seq） */
+    public static String userOfflineGroupCursor(String userId, String deviceId) {
+        return root + ":user:" + tag(userId) + ":offline:gcur:" + deviceId;
+    }
+
+    /** 群聊补发锚点（Hash：conversationId -> 待补发的 seq，带 TTL） */
+    public static String userOfflinePtr(String userId) {
+        return root + ":user:" + tag(userId) + ":offline:ptr";
+    }
+
+    /** 用户本地删除的消息（Set：seq），按会话分开 */
+    public static String userDeleted(String userId, String conversationId) {
+        return root + ":user:" + tag(userId) + ":deleted:" + conversationId;
+    }
+
+    /** 好友集合（Set：userId -> 好友 userId，双向各写一份） */
+    public static String userFriends(String userId) {
+        return root + ":user:" + tag(userId) + ":friends";
+    }
+
+    /** 黑名单（Set：单向，只记「我拉黑了谁」） */
+    public static String userBlocks(String userId) {
+        return root + ":user:" + tag(userId) + ":blocks";
+    }
+
+    /**
+     * 已废弃的单聊离线 List 队列。
+     *
+     * <p>新的 ZSet 队列（{@link #userOfflineQueue}）取代它：旧结构的「读即消费」
+     * （{@code LRANGE + LTRIM}）在网关写失败时就丢帧，属 at-most-once。
+     * 这里仍保留读取路径，只为把升级窗口内积压的帧发掉。
+     *
+     * @deprecated 用 {@link #userOfflineQueue(String)}
+     */
+    @Deprecated
+    public static String userLegacyOffline(String userId) {
+        return root + ":user:" + tag(userId) + ":legacy-offline";
+    }
+
+    // ==== 群维度（tag = {groupId}） ====
+
+    /** 群成员集合（Set），im.storage=redis 时的群成员存储 */
+    public static String groupMembers(String groupId) {
+        return root + ":group:" + tag(groupId) + ":members";
+    }
+
+    /** 群资料（Hash：name / owner_id / announcement / max_members / created_at / muted_all / dismissed） */
+    public static String groupInfo(String groupId) {
+        return root + ":group:" + tag(groupId) + ":info";
+    }
+
+    /**
+     * 群内角色（Hash：{@code userId -> OWNER|ADMIN}）。
+     *
+     * <p>只存非 MEMBER 的角色：绝大多数人是普通成员，把他们也写进来会让这张表
+     * 随群人数线性增长，而读路径只需要回答「这个人是不是管理员」——缺省即 MEMBER。
+     */
+    public static String groupRoles(String groupId) {
+        return root + ":group:" + tag(groupId) + ":roles";
+    }
+
+    /**
+     * 单人禁言到期时间（Hash：{@code userId -> untilEpochMillis}）。
+     *
+     * <p>存到期时间而不是布尔值：禁言天然带时长（10 分钟 / 1 天），
+     * 存布尔就得再存一个「谁在什么时候解除」的定时任务——那是一个最容易没人维护的组件。
+     * 存时间戳则读时比较即可，过期的字段还能顺手清掉。
+     */
+    public static String groupMutes(String groupId) {
+        return root + ":group:" + tag(groupId) + ":mutes";
+    }
+
+    // ==== 路由（tag = {userId}） ====
+
+    /** 在线路由：SET{网关实例 ID}，带 TTL，由网关心跳续期；多端时可能多个实例 */
+    public static String gatewayUser(String userId) {
+        return root + ":gateway:user:" + tag(userId);
+    }
+
+    /**
+     * 在线路由 key 的 SCAN 匹配模式（用于清理「已下线实例」的残留绑定）。
+     *
+     * <p>Redis 的 glob 只把 {@code * ? [ ] \\} 当特殊字符，{@code {} 不需要转义，
+     * 所以这里可以安全地带着 hash tag 做前缀匹配。
+     */
+    public static String gatewayUserPattern() {
+        return root + ":gateway:user:{*";
+    }
+
+    /**
+     * Cluster 的 hash tag：同一实体的所有 key 因此落在同一 slot。
+     *
+     * <p>只允许在 key 构造方法内部使用——外部拼 key 会让「唯一构造点」失效，
+     * 那正是改造前 CROSSSLOT 的成因。
+     */
+    private static String tag(String id) {
+        return "{" + id + "}";
     }
 }
