@@ -75,6 +75,29 @@ im:
   delivery:
     # 单体形态同样「ack 先行 + 异步推送」：并发打满时退化成同步推送
     max-inflight: ${IM_DELIVERY_MAX_INFLIGHT:1024}
+  # —— 存储分片 ——
+  # conversationId 是唯一的分片键（Redis 用 {conversationId} hash tag，MySQL 见 db/schema-shard.sql）
+  shard:
+    count: ${IM_SHARD_COUNT:1}
+  # —— 租户（appId）维度 ——
+  # Redis key 根前缀：默认 im，配成 acme 得到 acme:im:…
+  tenant:
+    app-id: ${IM_TENANT_APP_ID:}
+  # —— 消息生命周期 ——
+  recall:
+    # 撤回时限。没有时限的撤回等于允许事后修改双方共同的历史，那是「编辑」而不是「撤回」
+    window: ${IM_RECALL_WINDOW:2m}
+  # 变更事件（下行 msg.update：RECALLED / DELETED）
+  message-events:
+    enabled: ${IM_MESSAGE_EVENTS_ENABLED:true}
+  # —— 投递前准入（ACL）——
+  #   off（默认）: 不校验，零额外往返
+  #   warn       : 校验并记日志，但一律放行（上线前观察本该拦掉多少）
+  #   enforce    : 校验失败即 403（群聊要求发送者是成员；单聊查黑名单，可选查好友）
+  acl:
+    mode: ${IM_ACL_MODE:off}
+    # 单聊是否要求双方是好友。开放社交不要求；企业/内部 IM 通常要求（关系由组织架构同步）
+    require-friend: ${IM_ACL_REQUIRE_FRIEND:false}
   # IM 服务地址（网关侧使用；K8s 下填 im-server 的 Service 名或 ClusterIP）
   server:
     address: ${IM_SERVER_ADDR:127.0.0.1:9091}

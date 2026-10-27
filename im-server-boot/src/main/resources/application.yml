@@ -67,6 +67,47 @@ im:
     # 下行推送与 ack 解耦：落库成功后立刻回 ack，推送在虚拟线程池里异步完成。
     # 并发打满时退化成同步推送（宁可 ack 慢几十毫秒，也不让推送任务把堆内存堆穿）。
     max-inflight: ${IM_DELIVERY_MAX_INFLIGHT:1024}
+  # —— 投递前准入（ACL）——
+  #   off（默认）: 不校验，零额外往返
+  #   warn       : 校验并记日志，但一律放行（上线前观察本该拦掉多少）
+  #   enforce    : 校验失败即 403（群聊要求发送者是成员；单聊查黑名单，可选查好友）
+  acl:
+    mode: ${IM_ACL_MODE:off}
+    # 单聊是否要求双方是好友。开放社交不要求；企业/内部 IM 通常要求（关系由组织架构同步）
+    require-friend: ${IM_ACL_REQUIRE_FRIEND:false}
+  # —— 存储分片 ——
+  # conversationId 是唯一的分片键：Redis 侧所有会话 key 共用 {conversationId} hash tag，
+  # MySQL 侧的物理切分见 db/schema-shard.sql。默认 1 = 不分片，行为与改造前完全一致。
+  shard:
+    count: ${IM_SHARD_COUNT:1}
+  # —— 租户（appId）维度 ——
+  # Redis key 的根前缀：默认 im，配成 acme 得到 acme:im:…。
+  # 进程级配置（多租户按实例隔离），网关与 IM 服务必须配同一个值，否则下行推送会静默判定「不在线」。
+  tenant:
+    app-id: ${IM_TENANT_APP_ID:}
+  # —— 消息生命周期 ——
+  recall:
+    # 撤回时限。没有时限的撤回等于允许事后修改双方共同的历史，那是「编辑」而不是「撤回」。
+    # 群管理员撤回他人消息需要群角色，暂未实现。
+    window: ${IM_RECALL_WINDOW:2m}
+  # 变更事件（下行 msg.update：RECALLED / DELETED）。关闭后客户端只能靠重新拉历史得知。
+  message-events:
+    enabled: ${IM_MESSAGE_EVENTS_ENABLED:true}
+  # —— 消息状态回执（下行 msg.state：DELIVERED / READ）——
+  # 对端确认收到 / 上报已读之后，向会话对端（发送方）推一条状态帧。
+  # 只推单聊：群聊的「已读」是按人统计的集合，扇出是「成员数 × 消息数」，另属一个模型。
+  state-receipt:
+    enabled: ${IM_STATE_RECEIPT_ENABLED:true}
+  # —— 厂商推送（离线通知）——
+  # 长连接投不到的用户（进程被杀 / 后台冻结 / 设备休眠）只有厂商通道能叫醒 App。
+  # 默认关闭：没有中转服务时不该有任何网络调用，也不该在启动日志里出现连不上的告警。
+  # 本服务只声明「推给谁、推什么」，APNs/FCM/华为/小米各自的鉴权与签名交给中转服务，
+  # 否则消息服务的发布节奏会被推送 SDK 绑死。
+  vendor-push:
+    enabled: ${IM_VENDOR_PUSH_ENABLED:false}
+    endpoint: ${IM_VENDOR_PUSH_ENDPOINT:}
+    token: ${IM_VENDOR_PUSH_TOKEN:}
+    timeout: ${IM_VENDOR_PUSH_TIMEOUT:3s}
   node:
     # 本实例 gRPC 对外地址：注册到 Nacos 的就是 ip:grpc-port（网关调用的是 gRPC，不是 HTTP）
     # grpc-host 留空则自动探测（POD_IP -> 本机首个非回环 IPv4 -> 127.0.0.1）

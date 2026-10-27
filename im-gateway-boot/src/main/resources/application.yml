@@ -57,7 +57,11 @@ im:
     # 降级地址：Nacos 关闭 / 初始化失败 / 拿不到健康实例时才用它；支持逗号分隔多地址，
     # 多个地址同样参与 gRPC 的 round_robin 轮询
     address: ${IM_SERVER_ADDR:127.0.0.1:9091}
-    timeout-ms: ${IM_SERVER_TIMEOUT_MS:300}
+    # 单条上行的 deadline。为什么不是 300ms：这条 RPC 是跨进程的，IM 服务侧还要落 MySQL
+    # （jdbc 形态是一次 fsync）+ 分配 seq + 写会话扩散，多实例下还可能撞上首次建连。
+    # 300ms 会把「正常抖动」判成故障并回 503，让客户端退避重发，代价远大于多等几百毫秒；
+    # 真过载时它也拦不住（请求已经打进去了），只是把「慢」变成了「失败」。
+    timeout-ms: ${IM_SERVER_TIMEOUT_MS:1000}
     # 「暂时一个 READY 的 IM 实例都没有」时，排队等到 deadline 再失败，而不是立刻 503。
     # 网关跑虚拟线程，等待几乎不占平台线程；让客户端少一次 1s+ 的退避重发。
     wait-for-ready: ${IM_SERVER_WAIT_FOR_READY:true}
