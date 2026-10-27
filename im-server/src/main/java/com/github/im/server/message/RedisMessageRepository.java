@@ -2,12 +2,18 @@ package com.github.im.server.message;
 
 import com.github.im.contract.RedisKeys;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.ObjectMapper;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Optional;
+import java.util.Set;
 
 /**
  * Redis 版消息存储（默认实现）：{@code im:conv:msgs:{conversationId}} 存 {@link StoredMessage} 的 JSON。
@@ -38,7 +44,7 @@ public class RedisMessageRepository implements MessageRepository {
 
     @Override
     public void append(StoredMessage message) {
-        String key = RedisKeys.CONV_MESSAGES_PREFIX + message.conversationId();
+        String key = RedisKeys.convMessages(message.conversationId());
         redis.opsForList().rightPush(key, objectMapper.writeValueAsString(message));
         redis.opsForList().trim(key, -MAX_LENGTH, -1);
     }
@@ -54,7 +60,7 @@ public class RedisMessageRepository implements MessageRepository {
      */
     @Override
     public long maxSeq(String conversationId) {
-        List<String> rows = redis.opsForList().range(RedisKeys.CONV_MESSAGES_PREFIX + conversationId, 0, -1);
+        List<String> rows = redis.opsForList().range(RedisKeys.convMessages(conversationId), 0, -1);
         if (rows == null || rows.isEmpty()) {
             return 0L;
         }
@@ -70,7 +76,7 @@ public class RedisMessageRepository implements MessageRepository {
 
     @Override
     public List<StoredMessage> recent(String conversationId, int limit) {
-        List<String> rows = redis.opsForList().range(RedisKeys.CONV_MESSAGES_PREFIX + conversationId, -limit, -1);
+        List<String> rows = redis.opsForList().range(RedisKeys.convMessages(conversationId), -limit, -1);
         if (rows == null || rows.isEmpty()) {
             return List.of();
         }
@@ -93,7 +99,7 @@ public class RedisMessageRepository implements MessageRepository {
         if (limit <= 0) {
             return List.of();
         }
-        List<String> rows = redis.opsForList().range(RedisKeys.CONV_MESSAGES_PREFIX + conversationId, 0, -1);
+        List<String> rows = redis.opsForList().range(RedisKeys.convMessages(conversationId), 0, -1);
         if (rows == null || rows.isEmpty()) {
             return List.of();
         }
@@ -109,5 +115,105 @@ public class RedisMessageRepository implements MessageRepository {
         }
         matched.sort((left, right) -> Long.compare(left.seq(), right.seq()));
         return matched.size() <= limit ? matched : matched.subList(0, limit);
+    }
+
+    // ==== 消息生命周期（撤回 / 删除） ====
+
+    @Override
+    public Optional<StoredMessage> find(String conversationId, long seq) {
+        List<String> rows = redis.opsForList().range(RedisKeys.convMessages(conversationId), 0, -1);
+        if (rows == null || rows.isEmpty()) {
+            return Optional.empty();
+        }
+        for (String row : rows) {
+            if (row == null || row.isBlank()) {
+                continue;
+            }
+            StoredMessage message = objectMapper.readValue(row, StoredMessage.class);
+            if (message.seq() == seq) {
+                return Optional.of(message);
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * {@code SADD} 的返回值就是「是否首次」：重复撤回返回 0，据此避免重复广播变更帧。
+     *
+     * <p>撤回集合不设 TTL：消息本身（List）也没有过期，集合先过期就等于把撤回记录弄丢、
+     * 让原文重新可见。这条实现只用于本地/小规模，集合规模由 {@value #MAX_LENGTH} 的保留量兜住。
+     */
+    @Override
+    public boolean recall(String conversationId, long seq) {
+        if (seq <= 0) {
+            return false;
+        }
+        Long added = redis.opsForSet().add(recalledKey(conversationId), String.valueOf(seq));
+        return added != null && added > 0;
+    }
+
+    /**
+     * 批量判定是否已撤回。
+     *
+     * <p>用 pipeline 逐个 {@code SISMEMBER} 而不是 {@code SMISMEMBER}：本机联调的 Redis 是 3.2，
+     * 后者 6.2 才有。一次补发最多两三百帧，pipeline 的往返开销只有一次。
+     */
+    @Override
+    public Set<Long> recalledSeqs(String conversationId, Collection<Long> seqs) {
+        List<Long> ordered = List.copyOf(new LinkedHashSet<>(seqs));
+        if (ordered.isEmpty()) {
+            return Set.of();
+        }
+        String key = recalledKey(conversationId);
+        List<Object> raw = redis.executePipelined((RedisCallback<Object>) connection -> {
+            for (Long seq : ordered) {
+                connection.setCommands().sIsMember(key.getBytes(StandardCharsets.UTF_8),
+                        String.valueOf(seq).getBytes(StandardCharsets.UTF_8));
+            }
+            return null;
+        });
+        Set<Long> recalled = new LinkedHashSet<>();
+        for (int i = 0; i < ordered.size() && i < raw.size(); i++) {
+            if (Boolean.TRUE.equals(raw.get(i))) {
+                recalled.add(ordered.get(i));
+            }
+        }
+        return recalled;
+    }
+
+    @Override
+    public void markDeleted(String userId, String conversationId, long seq) {
+        if (seq <= 0 || userId == null || userId.isBlank()) {
+            return;
+        }
+        redis.opsForSet().add(deletedKey(userId, conversationId), String.valueOf(seq));
+    }
+
+    @Override
+    public Set<Long> deletedSeqs(String userId, String conversationId) {
+        if (userId == null || userId.isBlank()) {
+            return Set.of();
+        }
+        Set<String> members = redis.opsForSet().members(deletedKey(userId, conversationId));
+        if (members == null || members.isEmpty()) {
+            return Set.of();
+        }
+        Set<Long> seqs = new LinkedHashSet<>(members.size());
+        for (String member : members) {
+            try {
+                seqs.add(Long.parseLong(member));
+            } catch (NumberFormatException ignored) {
+                // 脏数据不该让整页历史失败
+            }
+        }
+        return seqs;
+    }
+
+    private static String recalledKey(String conversationId) {
+        return RedisKeys.convRecalled(conversationId);
+    }
+
+    private static String deletedKey(String userId, String conversationId) {
+        return RedisKeys.userDeleted(userId, conversationId);
     }
 }

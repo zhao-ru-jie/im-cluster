@@ -1,15 +1,25 @@
 package com.github.im.storage.jdbc;
 
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.github.im.contract.RedisKeys;
 import com.github.im.server.message.MessageRepository;
 import com.github.im.server.message.StoredMessage;
+import com.github.im.server.shard.ShardRouter;
+import com.github.im.storage.jdbc.entity.MessageDeleteEntity;
 import com.github.im.storage.jdbc.entity.MessageEntity;
+import com.github.im.storage.jdbc.mapper.MessageDeleteMapper;
 import com.github.im.storage.jdbc.mapper.MessageMapper;
 import org.apache.ibatis.session.SqlSessionFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Optional;
+import java.util.Set;
 
 /**
  * MySQL 版消息存储（生产形态，`im.storage=jdbc`），基于 MyBatis-Plus。
@@ -36,17 +46,35 @@ import java.util.List;
  */
 public class JdbcMessageRepository implements MessageRepository, AutoCloseable {
 
+    private static final Logger log = LoggerFactory.getLogger(JdbcMessageRepository.class);
+
     private final MessageMapper mapper;
+    /** 本地删除记录（用户级）与撤回（im_message 上的一列）分开，理由见 schema.sql */
+    private final MessageDeleteMapper deleteMapper;
+    /** 会话分片路由；为 null 时按「未分片」处理（单表 im_message） */
+    private final ShardRouter shardRouter;
     private final JdbcBatchAppender appender;
 
-    public JdbcMessageRepository(MessageMapper mapper, SqlSessionFactory sqlSessionFactory, boolean batchEnabled) {
+    public JdbcMessageRepository(MessageMapper mapper, MessageDeleteMapper deleteMapper,
+                                 SqlSessionFactory sqlSessionFactory, boolean batchEnabled,
+                                 ShardRouter shardRouter) {
         this.mapper = mapper;
+        this.deleteMapper = deleteMapper;
+        this.shardRouter = shardRouter;
         this.appender = new JdbcBatchAppender(sqlSessionFactory, mapper, batchEnabled);
     }
 
     /** 落库并在返回前确认已提交（批处理时提交整批后才返回） */
     @Override
     public void append(StoredMessage message) {
+        if (log.isDebugEnabled() && shardRouter != null) {
+            // 分片号在这里落脚：排查「同一会话的数据为什么分散在不同片」时，
+            // 这一行同时给出 MySQL 分片与 Redis key（两者必须按同一个 conversationId 切）
+            log.debug("[shard] conv={} seq={} mysql={} redis={}",
+                    message.conversationId(), message.seq(),
+                    shardRouter.messageTableOf(message.conversationId()),
+                    RedisKeys.convMessages(message.conversationId()));
+        }
         appender.append(message);
     }
 
@@ -114,5 +142,77 @@ public class JdbcMessageRepository implements MessageRepository, AutoCloseable {
             messages.add(row.toStoredMessage());
         }
         return messages;
+    }
+
+    // ==== 消息生命周期（撤回 / 删除） ====
+
+    @Override
+    public Optional<StoredMessage> find(String conversationId, long seq) {
+        List<MessageEntity> rows = mapper.selectList(Wrappers.<MessageEntity>lambdaQuery()
+                .eq(MessageEntity::getConversationId, conversationId)
+                .eq(MessageEntity::getSeq, seq)
+                .last("LIMIT 1"));
+        return rows.isEmpty() ? Optional.empty() : Optional.of(rows.getFirst().toStoredMessage());
+    }
+
+    /**
+     * 撤回：{@code recalled_at IS NULL} 让 UPDATE 自带幂等。
+     *
+     * <p>这也是为什么撤回是 {@code im_message} 上的一列而不是独立事件表——
+     * 一次带条件的 UPDATE 就能同时回答「撤回了没」和「这次是不是首次」，
+     * 而事件表要先查再插，多一次往返还多一处并发窗口。
+     */
+    @Override
+    public boolean recall(String conversationId, long seq) {
+        if (seq <= 0) {
+            return false;
+        }
+        return mapper.markRecalled(conversationId, seq, System.currentTimeMillis()) > 0;
+    }
+
+    @Override
+    public Set<Long> recalledSeqs(String conversationId, Collection<Long> seqs) {
+        if (seqs == null || seqs.isEmpty()) {
+            return Set.of();
+        }
+        List<MessageEntity> rows = mapper.selectList(Wrappers.<MessageEntity>lambdaQuery()
+                .select(MessageEntity::getSeq)
+                .eq(MessageEntity::getConversationId, conversationId)
+                .in(MessageEntity::getSeq, seqs)
+                .isNotNull(MessageEntity::getRecalledAt));
+        Set<Long> recalled = new LinkedHashSet<>(rows.size());
+        for (MessageEntity row : rows) {
+            if (row.getSeq() != null) {
+                recalled.add(row.getSeq());
+            }
+        }
+        return recalled;
+    }
+
+    @Override
+    public void markDeleted(String userId, String conversationId, long seq) {
+        if (seq <= 0 || userId == null || userId.isBlank()) {
+            return;
+        }
+        deleteMapper.insertIgnore(userId, conversationId, seq, System.currentTimeMillis());
+    }
+
+    @Override
+    public Set<Long> deletedSeqs(String userId, String conversationId) {
+        if (userId == null || userId.isBlank()) {
+            return Set.of();
+        }
+        List<MessageDeleteEntity> rows = deleteMapper.selectList(
+                Wrappers.<MessageDeleteEntity>lambdaQuery()
+                        .select(MessageDeleteEntity::getSeq)
+                        .eq(MessageDeleteEntity::getUserId, userId)
+                        .eq(MessageDeleteEntity::getConversationId, conversationId));
+        Set<Long> seqs = new LinkedHashSet<>(rows.size());
+        for (MessageDeleteEntity row : rows) {
+            if (row.getSeq() != null) {
+                seqs.add(row.getSeq());
+            }
+        }
+        return seqs;
     }
 }

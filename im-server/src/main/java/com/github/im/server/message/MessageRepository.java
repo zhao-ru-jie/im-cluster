@@ -1,6 +1,9 @@
 package com.github.im.server.message;
 
+import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
+import java.util.Set;
 
 /**
  * 消息存储端口（IM 服务独占）。
@@ -43,4 +46,31 @@ public interface MessageRepository {
      * 因此发号前要周期性（每 100 条一次）用它兜底，保证序号只前进不回退。
      */
     long maxSeq(String conversationId);
+
+    // ==== 消息生命周期（撤回 / 删除） ====
+
+    /**
+     * 按 {@code conversationId + seq} 取单条消息。
+     *
+     * <p>撤回要校验「操作者是不是发送方」「是否还在可撤回时限内」，两者都需要原文。
+     * 取不到（已被 trim / 从未存在）返回 {@link Optional#empty()}。
+     */
+    Optional<StoredMessage> find(String conversationId, long seq);
+
+    /**
+     * 撤回一条消息（会话级，所有人可见）。
+     *
+     * <p>语义是<b>幂等</b>的：首次撤回返回 {@code true}，重复撤回返回 {@code false}——
+     * 重复撤回不该再广播一次变更帧。
+     */
+    boolean recall(String conversationId, long seq);
+
+    /** 这批 seq 里哪些已被撤回（渲染时统一脱敏，避免逐条查询） */
+    Set<Long> recalledSeqs(String conversationId, Collection<Long> seqs);
+
+    /** 本地删除一条消息（用户级：只影响这个用户自己的视图） */
+    void markDeleted(String userId, String conversationId, long seq);
+
+    /** 该用户在这个会话里删掉的全部 seq（读路径过滤用） */
+    Set<Long> deletedSeqs(String userId, String conversationId);
 }
