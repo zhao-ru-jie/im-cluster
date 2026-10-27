@@ -4,6 +4,7 @@ import com.github.im.contract.MessageEnvelope;
 import com.github.im.contract.PushPort;
 import com.github.im.proto.push.v1.PushTask;
 import com.github.im.server.group.GroupMemberRepository;
+import com.github.im.server.metrics.MessageMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
@@ -33,11 +34,14 @@ public class MessageRouter {
 
     private final ObjectProvider<PushPort> pushPortProvider;
     private final GroupMemberRepository groupMemberRepository;
+    private final MessageMetrics metrics;
 
     public MessageRouter(ObjectProvider<PushPort> pushPortProvider,
-                         GroupMemberRepository groupMemberRepository) {
+                         GroupMemberRepository groupMemberRepository,
+                         MessageMetrics metrics) {
         this.pushPortProvider = pushPortProvider;
         this.groupMemberRepository = groupMemberRepository;
+        this.metrics = metrics;
     }
 
     /**
@@ -52,6 +56,16 @@ public class MessageRouter {
         if (targets.isEmpty()) {
             return List.of();
         }
+        // 只有这里同时知道「该投几个人」和「几个人没投到」，送达率只能在这里算：
+        // 返回给上层的只有失败列表，人数信息一旦离开这个方法就丢了
+        long startedAt = System.nanoTime();
+        List<String> failed = doDeliver(envelope, frame, traceId, targets);
+        metrics.delivery(System.nanoTime() - startedAt, targets.size() - failed.size(), failed.size());
+        return failed;
+    }
+
+    private List<String> doDeliver(MessageEnvelope envelope, String frame, String traceId,
+                                   List<String> targets) {
         PushPort pushPort = pushPortProvider.getIfAvailable();
         if (pushPort == null) {
             // 没有任何推送通道（例如纯离线部署）：全部按失败处理，落离线等客户端上线拉取

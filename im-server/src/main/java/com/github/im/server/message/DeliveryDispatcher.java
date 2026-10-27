@@ -3,6 +3,7 @@ package com.github.im.server.message;
 import com.github.im.contract.MessageEnvelope;
 import com.github.im.contract.VendorPushPort;
 import com.github.im.contract.VendorPushRequest;
+import com.github.im.server.metrics.MessageMetrics;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -63,6 +64,8 @@ public class DeliveryDispatcher {
 
     private final MessageRouter router;
     private final OfflineMessageStore offlineStore;
+    /** 服务端指标：registry 为 null 时退化为空操作 */
+    private final MessageMetrics metrics;
     /** 可空：未开启厂商推送时没有任何实现，这条通道整体消失 */
     private final VendorPushPort vendorPush;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
@@ -73,16 +76,24 @@ public class DeliveryDispatcher {
 
     /** 单测/无厂商推送的部署用：只装配长连接下发 */
     public DeliveryDispatcher(MessageRouter router, OfflineMessageStore offlineStore, int maxInflight) {
-        this(router, offlineStore, maxInflight, null);
+        this(router, offlineStore, maxInflight, null, new MessageMetrics(null));
+    }
+
+    /** 单测用：接厂商推送但不接 registry */
+    public DeliveryDispatcher(MessageRouter router, OfflineMessageStore offlineStore, int maxInflight,
+                              ObjectProvider<VendorPushPort> vendorPushProvider) {
+        this(router, offlineStore, maxInflight, vendorPushProvider, new MessageMetrics(null));
     }
 
     @Autowired
     public DeliveryDispatcher(MessageRouter router,
                               OfflineMessageStore offlineStore,
                               @Value("${im.delivery.max-inflight:1024}") int maxInflight,
-                              ObjectProvider<VendorPushPort> vendorPushProvider) {
+                              ObjectProvider<VendorPushPort> vendorPushProvider,
+                              MessageMetrics metrics) {
         this.router = router;
         this.offlineStore = offlineStore;
+        this.metrics = metrics;
         this.vendorPush = vendorPushProvider == null ? null : vendorPushProvider.getIfAvailable();
         // 至少 1：配成 0 会让所有推送都退化成同步，等于改动全白做
         this.maxInflight = Math.max(maxInflight, 1);
@@ -147,6 +158,8 @@ public class DeliveryDispatcher {
                 // 落离线都失败只能记 error：Redis 抖动时至少日志里留有 traceId 可追
                 log.error("[delivery] conv={} seq={} 落离线只成功 {}/{}",
                         envelope.conversationId(), seq, stored, failed.size());
+                // 这批人是真正的「消息可能要靠上线拉历史才看得到」的人群，必须有指标盯住
+                metrics.offlineAppendFailed(failed.size() - stored);
             }
         }
         // 厂商推送：连接不在的用户，只有手机厂商的通道能叫醒 App。

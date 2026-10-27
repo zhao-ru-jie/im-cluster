@@ -7,6 +7,7 @@ import com.github.im.proto.ingress.v1.PullPendingRequest;
 import com.github.im.proto.ingress.v1.PullPendingResponse;
 import com.github.im.server.conversation.ConversationStore;
 import com.github.im.server.group.GroupMemberRepository;
+import com.github.im.server.metrics.MessageMetrics;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -302,7 +303,8 @@ class MessageServicePullPendingTest {
         return new MessageService(TestRedis.template(), repository, store(),
                 new ClientFrames(new ObjectMapper()), delivery, seqAllocator, watermarkStore,
                 new ConversationStore(TestRedis.template(), TTL, 1000),
-                mock(GroupMemberRepository.class), null, null, null, Duration.ofMinutes(2));
+                mock(GroupMemberRepository.class), null, null, null, Duration.ofMinutes(2),
+                new MessageMetrics(null));
     }
 
     private OfflineMessageStore store() {

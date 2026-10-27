@@ -11,6 +11,7 @@ import com.github.im.proto.push.v1.PushResult;
 import com.github.im.proto.push.v1.PushTask;
 import com.github.im.server.conversation.ConversationStore;
 import com.github.im.server.group.GroupMemberRepository;
+import com.github.im.server.metrics.MessageMetrics;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -248,7 +249,7 @@ class MessageLifecycleTest {
                 delivery, seqAllocator,
                 new ClientWatermarkStore(TestRedis.template(), TTL),
                 new ConversationStore(TestRedis.template(), TTL, MAX_RECENT),
-                groupMembers, null, null, notifier(), recallWindow);
+                groupMembers, null, null, notifier(), recallWindow, new MessageMetrics(null));
     }
 
     /** 变更事件通知器：真正走一遍实现，推送落到 {@link #pushed} 队列 */

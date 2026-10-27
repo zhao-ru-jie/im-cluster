@@ -16,10 +16,12 @@ import com.github.im.proto.ingress.v1.PullPendingResponse;
 import com.github.im.proto.ingress.v1.SubmitMessageRequest;
 import com.github.im.proto.ingress.v1.SubmitMessageResponse;
 import com.github.im.server.message.MessageService;
+import com.github.im.server.metrics.MessageMetrics;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.grpc.server.service.GrpcService;
 
 import java.util.function.Supplier;
@@ -52,9 +54,17 @@ public class MessageIngressGrpcService extends MessageIngressGrpc.MessageIngress
     private static final Logger log = LoggerFactory.getLogger(MessageIngressGrpcService.class);
 
     private final MessageService messageIngress;
+    private final MessageMetrics metrics;
 
+    /** 单测用：不接 registry */
     public MessageIngressGrpcService(MessageService messageIngress) {
+        this(messageIngress, new MessageMetrics(null));
+    }
+
+    @Autowired
+    public MessageIngressGrpcService(MessageService messageIngress, MessageMetrics metrics) {
         this.messageIngress = messageIngress;
+        this.metrics = metrics;
     }
 
     @Override
@@ -69,7 +79,8 @@ public class MessageIngressGrpcService extends MessageIngressGrpc.MessageIngress
                             StreamObserver<BatchSubmitResponse> responseObserver) {
         // 批量请求本身没有 traceId，取第一条的：与单条路径的日志口径保持一致
         String traceId = request.getMessagesCount() > 0 ? request.getMessages(0).getTraceId() : "";
-        handle("batchSubmit(" + request.getMessagesCount() + ")", traceId, responseObserver,
+        // op 只用固定方法名：带上条数会让指标的 tag 值随批量大小无限增长，把时间序列打散
+        handle("batchSubmit", traceId, responseObserver,
                 () -> messageIngress.submitBatch(request));
     }
 
@@ -115,17 +126,22 @@ public class MessageIngressGrpcService extends MessageIngressGrpc.MessageIngress
      * @param subject 关键入参（submit 系是 traceId，其余是 userId）：两端日志靠它对齐同一条请求
      */
     private <T> void handle(String rpc, String subject, StreamObserver<T> observer, Supplier<T> call) {
+        long startedAt = System.nanoTime();
         try {
-            observer.onNext(call.get());
+            T response = call.get();
+            metrics.ingress(rpc, System.nanoTime() - startedAt, MessageMetrics.RPC_OK);
+            observer.onNext(response);
             observer.onCompleted();
         } catch (IllegalArgumentException e) {
             // 参数错是调用方的问题，映射成 INVALID_ARGUMENT：网关据此不该盲目重试
+            metrics.ingress(rpc, System.nanoTime() - startedAt, MessageMetrics.RPC_INVALID);
             log.warn("[ingress] {} 参数不合法 subject={} err={}", rpc, subject, e.getMessage());
             observer.onError(Status.INVALID_ARGUMENT
                     .withDescription(rpc + ": " + e.getMessage())
                     .asRuntimeException());
         } catch (RuntimeException e) {
             // 服务端故障：必须自己记堆栈，否则只剩一个 UNKNOWN 状态，业务堆栈彻底丢失
+            metrics.ingress(rpc, System.nanoTime() - startedAt, MessageMetrics.RPC_ERROR);
             log.error("[ingress] {} 处理失败 subject={} err={}", rpc, subject, e.getMessage(), e);
             observer.onError(Status.INTERNAL
                     .withDescription(rpc + " failed: " + e.getMessage())

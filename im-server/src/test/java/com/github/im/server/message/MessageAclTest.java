@@ -7,6 +7,7 @@ import com.github.im.proto.ingress.v1.SubmitMessageResponse;
 import com.github.im.server.conversation.ConversationStore;
 import com.github.im.server.group.GroupMemberRepository;
 import com.github.im.server.group.GroupService;
+import com.github.im.server.metrics.MessageMetrics;
 import com.github.im.server.relation.MessageAcl;
 import com.github.im.server.relation.RedisRelationRepository;
 import com.github.im.server.relation.RelationRepository;
@@ -187,7 +188,7 @@ class MessageAclTest {
                 new ClientFrames(new ObjectMapper()), delivery, seqAllocator,
                 new ClientWatermarkStore(TestRedis.template(), TTL),
                 new ConversationStore(TestRedis.template(), TTL, 1000),
-                groupMembers, null, acl, null, Duration.ofMinutes(2));
+                groupMembers, null, acl, null, Duration.ofMinutes(2), new MessageMetrics(null));
     }
 
     @SuppressWarnings("unchecked")

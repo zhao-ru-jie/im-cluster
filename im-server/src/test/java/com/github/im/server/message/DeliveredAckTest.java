@@ -12,6 +12,7 @@ import com.github.im.proto.push.v1.PushResult;
 import com.github.im.proto.push.v1.PushTask;
 import com.github.im.server.conversation.ConversationStore;
 import com.github.im.server.group.GroupMemberRepository;
+import com.github.im.server.metrics.MessageMetrics;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -251,7 +252,7 @@ class DeliveredAckTest {
         return new MessageService(TestRedis.template(), repository, store(),
                 new ClientFrames(new ObjectMapper()), delivery, seqAllocator, watermarkStore(),
                 new ConversationStore(TestRedis.template(), TTL, 1000), groupMembers, stateNotifier(),
-                null, null, Duration.ofMinutes(2));
+                null, null, Duration.ofMinutes(2), new MessageMetrics(null));
     }
 
     /** 状态回执器：真正走一遍 {@link MessageStateNotifier}，推送落到 {@link #pushed} 队列里 */

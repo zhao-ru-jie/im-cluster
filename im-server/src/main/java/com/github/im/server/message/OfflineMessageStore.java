@@ -9,6 +9,8 @@ import org.springframework.data.redis.connection.Limit;
 import org.springframework.data.redis.connection.ReturnType;
 import org.springframework.data.redis.connection.zset.Tuple;
 import org.springframework.data.redis.core.RedisCallback;
+import com.github.im.server.metrics.MessageMetrics;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
@@ -124,10 +126,12 @@ public class OfflineMessageStore {
             end
             local pos = base + 1
             redis.call('SET', KEYS[2], pos, 'PX', ARGV[3])
+            local before = redis.call('ZCARD', KEYS[1])
             redis.call('ZADD', KEYS[1], pos, ARGV[1])
             redis.call('ZREMRANGEBYRANK', KEYS[1], 0, -tonumber(ARGV[2]) - 1)
             redis.call('PEXPIRE', KEYS[1], ARGV[3])
-            return pos
+            local after = redis.call('ZCARD', KEYS[1])
+            return {pos, after, before + 1 - after}
             """.getBytes(StandardCharsets.UTF_8);
 
     /**
@@ -217,15 +221,26 @@ public class OfflineMessageStore {
     private final Duration frameTtl;
     private final int maxFramesPerUser;
     private final Duration pointerTtl;
+    /** 服务端指标：registry 为 null 时退化为空操作 */
+    private final MessageMetrics metrics;
 
+    /** 单测/无指标场景用：不接 registry */
+    public OfflineMessageStore(StringRedisTemplate redis, Duration frameTtl,
+                               int maxFramesPerUser, Duration pointerTtl) {
+        this(redis, frameTtl, maxFramesPerUser, pointerTtl, new MessageMetrics(null));
+    }
+
+    @Autowired
     public OfflineMessageStore(StringRedisTemplate redis,
                                @Value("${im.offline.frame-ttl:7d}") Duration frameTtl,
                                @Value("${im.offline.max-frames:500}") int maxFramesPerUser,
-                               @Value("${im.offline.pointer-ttl:7d}") Duration pointerTtl) {
+                               @Value("${im.offline.pointer-ttl:7d}") Duration pointerTtl,
+                               MessageMetrics metrics) {
         this.redis = redis;
         this.frameTtl = frameTtl;
         this.maxFramesPerUser = Math.max(maxFramesPerUser, 1);
         this.pointerTtl = pointerTtl;
+        this.metrics = metrics;
         log.info("[offline] 单聊离线队列上限 {} 条/人、TTL {}（读不删 + 按设备游标确认）；群聊补发指针 TTL {}",
                 this.maxFramesPerUser, frameTtl, pointerTtl);
     }
@@ -249,13 +264,43 @@ public class OfflineMessageStore {
     // ==== 单聊：帧队列 ====
 
     public void store(String userId, String frame) {
-        redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
-                PUSH_FRAME, ReturnType.INTEGER, 2,
+        Object raw = redis.execute((RedisCallback<Object>) connection -> connection.scriptingCommands().eval(
+                PUSH_FRAME, ReturnType.MULTI, 2,
                 queueKey(userId),
                 positionKey(userId),
                 frame.getBytes(StandardCharsets.UTF_8),
                 String.valueOf(maxFramesPerUser).getBytes(StandardCharsets.UTF_8),
                 String.valueOf(frameTtl.toMillis()).getBytes(StandardCharsets.UTF_8)));
+        recordSingle(raw, 1);
+    }
+
+    /**
+     * 记录一次落离线的结果。
+     *
+     * <p>脚本返回 {@code {pos, 深度, 本次被裁掉的帧数}}：裁剪数持续增长说明客户端长期不消费
+     * （离线队列靠 TTL 兜底，但超过上限的帧是真的丢），这个信号必须能从指标上看出来。
+     */
+    private void recordSingle(Object raw, int frames) {
+        if (raw instanceof List<?> values && values.size() >= 3) {
+            metrics.offlineAppended(frames, asLong(values.get(2)), asLong(values.get(1)));
+        }
+    }
+
+    /** pipeline 版本：多个用户的脚本结果依次收集，深度取最后一个（同一时刻的近似值） */
+    private void recordPipelined(List<?> results, int frames) {
+        long trimmed = 0;
+        long depth = 0;
+        for (Object item : results) {
+            if (item instanceof List<?> values && values.size() >= 3) {
+                trimmed += asLong(values.get(2));
+                depth = asLong(values.get(1));
+            }
+        }
+        metrics.offlineAppended(frames, trimmed, depth);
+    }
+
+    private static long asLong(Object value) {
+        return value instanceof Number number ? number.longValue() : 0L;
     }
 
     /**
@@ -278,13 +323,14 @@ public class OfflineMessageStore {
         for (int from = 0; from < ids.size(); from += PIPELINE_BATCH) {
             List<String> batch = ids.subList(from, Math.min(from + PIPELINE_BATCH, ids.size()));
             try {
-                redis.executePipelined((RedisCallback<Object>) connection -> {
+                List<Object> written = redis.executePipelined((RedisCallback<Object>) connection -> {
                     for (String userId : batch) {
-                        connection.scriptingCommands().eval(PUSH_FRAME, ReturnType.INTEGER, 2,
+                        connection.scriptingCommands().eval(PUSH_FRAME, ReturnType.MULTI, 2,
                                 queueKey(userId), positionKey(userId), payload, maxFrames, ttlMillis);
                     }
                     return null;
                 });
+                recordPipelined(written, batch.size());
                 stored += batch.size();
             } catch (RuntimeException e) {
                 // Cluster 跨 slot（每个用户一个 hash tag，必然不同 slot）或 Redis 瞬时故障：

@@ -22,6 +22,7 @@ import com.github.im.server.conversation.ConversationStore;
 import com.github.im.server.conversation.ConversationStore.ConversationFlag;
 import com.github.im.server.conversation.ConversationStore.ConversationMeta;
 import com.github.im.server.group.GroupMemberRepository;
+import com.github.im.server.metrics.MessageMetrics;
 import com.github.im.server.relation.MessageAcl;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -107,6 +108,8 @@ public class MessageService implements MessageIngress {
     private final MessageUpdateNotifier updateNotifier;
     /** 撤回时限：超过之后只有服务端管理员能处理，客户端不再有这个动作 */
     private final Duration recallWindow;
+    /** 服务端指标：registry 为 null 时全部退化为空操作，单测直接传 {@code new MessageMetrics(null)} */
+    private final MessageMetrics metrics;
 
     public MessageService(StringRedisTemplate redis,
                           MessageRepository messageRepository,
@@ -120,7 +123,8 @@ public class MessageService implements MessageIngress {
                           MessageStateNotifier stateNotifier,
                           MessageAcl acl,
                           MessageUpdateNotifier updateNotifier,
-                          @Value("${im.recall.window:2m}") Duration recallWindow) {
+                          @Value("${im.recall.window:2m}") Duration recallWindow,
+                          MessageMetrics metrics) {
         this.redis = redis;
         this.messageRepository = messageRepository;
         this.offlineMessageStore = offlineMessageStore;
@@ -134,15 +138,18 @@ public class MessageService implements MessageIngress {
         this.acl = acl;
         this.updateNotifier = updateNotifier;
         this.recallWindow = recallWindow == null ? Duration.ofMinutes(2) : recallWindow;
+        this.metrics = metrics;
     }
 
     @Override
     public SubmitMessageResponse submit(SubmitMessageRequest request) {
+        long startedAt = System.nanoTime();
         long receivedAt = System.currentTimeMillis();
         MessageEnvelope envelope;
         try {
             envelope = MessageEnvelopes.toEnvelope(request);
         } catch (IllegalArgumentException e) {
+            metrics.submit(MessageMetrics.OUTCOME_REJECTED, System.nanoTime() - startedAt);
             return SubmitMessageResponse.newBuilder()
                     .setCode(CODE_BAD_REQUEST)
                     .setMessage(e.getMessage())
@@ -158,6 +165,7 @@ public class MessageService implements MessageIngress {
             if (!verdict.allowed()) {
                 log.debug("message rejected by acl: from={} to={} conv={} reason={}",
                         envelope.from(), envelope.to(), envelope.conversationId(), verdict.reason());
+                metrics.submit(MessageMetrics.OUTCOME_REJECTED, System.nanoTime() - startedAt);
                 return SubmitMessageResponse.newBuilder()
                         .setCode(verdict.code())
                         .setMessage(verdict.reason())
@@ -171,10 +179,13 @@ public class MessageService implements MessageIngress {
             String idemKey = RedisKeys.convIdem(envelope.conversationId(), envelope.idempotencyKey());
             // 幂等判定与发号合成一次 Redis 往返（见 SeqAllocator.allocate）：
             // 重复消息连 seq 都不会白耗一个，新消息则省掉一次 GET。
+            long seqStartedAt = System.nanoTime();
             SeqAllocator.Allocation allocation = seqAllocator.allocate(idemKey, envelope.conversationId());
+            metrics.phase(MessageMetrics.PHASE_SEQ, System.nanoTime() - seqStartedAt);
             if (allocation.duplicate()) {
                 IdempotentHit hit = IdempotentHit.parse(envelope.conversationId(), allocation.idemValue());
                 log.debug("duplicate message {} -> seq {}", envelope.idempotencyKey(), hit.seq());
+                metrics.submit(MessageMetrics.OUTCOME_DUPLICATE, System.nanoTime() - startedAt);
                 return response(envelope, hit.serverMsgId(), hit.seq(), receivedAt, true);
             }
 
@@ -186,28 +197,38 @@ public class MessageService implements MessageIngress {
 
             // 落库存结构化的 StoredMessage（不是下行帧）：建唯一索引做幂等、按 conversation_id+seq 拉漫游，
             // 帧只在读路径上用 ClientFrames 重建。换成 MySQL 只需 im.storage=jdbc，本流程不动。
+            long persistStartedAt = System.nanoTime();
             messageRepository.append(new StoredMessage(
                     envelope.conversationId(), seq, serverMsgId,
                     envelope.from(), envelope.to(), envelope.convType(),
                     envelope.clientMsgId(), envelope.body(), receivedAt,
                     envelope.contentType(), envelope.attrs()));
             redis.opsForValue().set(idemKey, serverMsgId + IDEM_SEP + seq, IDEM_TTL);
+            metrics.phase(MessageMetrics.PHASE_PERSIST, System.nanoTime() - persistStartedAt);
 
             // 会话模型：元信息 + 成员会话列表（写扩散）。放在推送之前，因为
             // 「会话列表里能看到」比「这条消息实时到了」更早被用户感知。
             // 失败不影响受理：消息已落库，补发与历史拉取都不依赖会话列表。
+            long convStartedAt = System.nanoTime();
             updateConversation(envelope, serverMsgId, seq, receivedAt);
+            metrics.phase(MessageMetrics.PHASE_CONVERSATION, System.nanoTime() - convStartedAt);
 
             // ack 先行：落库 + 幂等记录都已完成就算受理成功，推送交给 DeliveryDispatcher 异步做。
             // 推送失败仍由它落离线队列，所以「先 ack」不丢消息，只是让 ack 不再等最慢的接收者。
+            // 这一段只计「提交投递任务」的开销，真正的投递耗时在 MessageMetrics.delivery 里。
+            long dispatchStartedAt = System.nanoTime();
             delivery.dispatch(envelope, frame, traceId, seq);
+            metrics.phase(MessageMetrics.PHASE_DISPATCH, System.nanoTime() - dispatchStartedAt);
+
             log.info("message accepted: traceId={} conv={} seq={} msgId={} from={} to={}",
                     traceId, envelope.conversationId(), seq, serverMsgId,
                     envelope.from(), envelope.to());
+            metrics.submit(MessageMetrics.OUTCOME_ACCEPTED, System.nanoTime() - startedAt);
             return response(envelope, serverMsgId, seq, receivedAt, false);
         } catch (RuntimeException e) {
             // 竞态下的重复插入由唯一索引兜底（生产环境），这里按可重试返回
             log.error("submit message from {} failed: {}", envelope.from(), e.getMessage(), e);
+            metrics.submit(MessageMetrics.OUTCOME_ERROR, System.nanoTime() - startedAt);
             return SubmitMessageResponse.newBuilder()
                     .setCode(CODE_UNAVAILABLE)
                     .setMessage("internal error: " + e.getMessage())
@@ -562,6 +583,8 @@ public class MessageService implements MessageIngress {
             pendingConversations = pullGroupPending(userId, deviceId, request.getWatermarksMap(),
                     max - out.size(), out, groupAcks);
         }
+        // 补发量是「离线积压是否在消化」的直接证据：入队与补发两条曲线应该大致贴合
+        metrics.offlinePulled(out.size());
         return PullPendingResponse.newBuilder()
                 .addAllFrames(out)
                 // 只数「该设备还没确认的」，不能数队列总条数：已确认的帧要等裁剪才消失，
