@@ -178,25 +178,26 @@ public class OfflineMessageStore {
             """.getBytes(StandardCharsets.UTF_8);
 
     /**
-     * 群聊补发确认：把指针推到「已经写进连接」的位置。
+     * 推进某个<b>设备</b>在某个会话上的补发游标（只前进）。
      *
-     * <p>与旧实现的区别：旧版在<b>读取时</b>就把指针推过去（帧还没下发），一旦网关写失败，
-     * 那段消息就永久跳过了；现在推进只发生在 {@code AckPending} 里，失败则指针不动。
+     * <p>为什么必须是设备级：用户级单一指针时，手机上线补完一批就把它推过去了，
+     * 网页再上线补发起点已经在前面——那段消息对网页就是永久缺失。
      *
-     * <p>这里不再做「追平就删 field」——ack 路径不知道自己是否真的追平了（网关只回传位置）。
-     * 清理由 {@link #clearPending} 在读路径完成，且只在「确实一条都查不到」时执行，
-     * 那种情况下没有任何数据可丢。
+     * <p>字段不存在时<b>不创建</b>（返回 0）：游标由「确认」创建，而不是由「读取」创建，
+     * 否则一次失败的补发会留下一个假的进度。
      *
      * <pre>
-     * KEYS[1] = im:offline:ptr:{userId}；ARGV[1] = conversationId；ARGV[2] = 新位置；ARGV[3] = TTL 毫秒
+     * KEYS[1] = im:offline:gcur:{userId}:{deviceId}；ARGV[1] = conversationId；ARGV[2] = 新位置；ARGV[3] = TTL 毫秒
      * </pre>
      *
      * @return 1 = 真的前进了；0 = 字段不存在或已经更靠前
      */
-    private static final byte[] ADVANCE_PENDING = """
+    private static final byte[] ADVANCE_GROUP_CURSOR = """
             local cur = redis.call('HGET', KEYS[1], ARGV[1])
             if cur == false then
-                return 0
+                redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+                redis.call('PEXPIRE', KEYS[1], ARGV[3])
+                return 1
             end
             if tonumber(ARGV[2]) > tonumber(cur) then
                 redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
@@ -388,7 +389,7 @@ public class OfflineMessageStore {
         Range<Double> range = Range.of(Range.Bound.exclusive((double) cursor), Range.Bound.unbounded());
         Long queued = redis.execute((RedisCallback<Long>) connection ->
                 connection.zSetCommands().zCount(queueKey(userId), range));
-        Long legacy = redis.opsForList().size(RedisKeys.OFFLINE_PREFIX + userId);
+        Long legacy = redis.opsForList().size(RedisKeys.userLegacyOffline(userId));
         return (queued == null ? 0L : queued) + (legacy == null ? 0L : legacy);
     }
 
@@ -401,7 +402,7 @@ public class OfflineMessageStore {
      */
     @SuppressWarnings("deprecation")
     private List<String> legacyDrain(String userId, int max) {
-        String key = RedisKeys.OFFLINE_PREFIX + userId;
+        String key = RedisKeys.userLegacyOffline(userId);
         try {
             List<byte[]> raw = redis.execute((RedisCallback<List<byte[]>>) connection ->
                     connection.scriptingCommands().eval(DRAIN_LEGACY, ReturnType.MULTI, 1,
@@ -425,10 +426,16 @@ public class OfflineMessageStore {
     // ==== 群聊：补发指针 ====
 
     /**
-     * 记录「这批人在这个会话上还有未补发的消息」。
+     * 记录「这批人在这个会话上还有未补发的消息」，值是最早的未补发位置（<b>锚点</b>）。
      *
      * <p>每条群消息对每个不在线成员只写一个 field（几十字节），而不是整帧（几百字节），
      * 且同一会话的后续消息只把 field 往前推，<b>总占用不随消息数增长</b>。
+     *
+     * <p><b>锚点不表示任何一台设备的具体进度</b>：它只负责回答「这台从没补过的设备该从哪开始」。
+     * 每台设备自己补到哪记在 {@code im:offline:gcur:{userId}:{deviceId}} 里
+     * （见 {@link #ackGroupPending}），补发起点取两者的较大值。
+     * 这样手机补完不会把网页的起点推走，也是这一类「用户级状态 + 多设备」问题的通用解法：
+     * <b>共享的只留下界，进度按端分开</b>。
      *
      * @return 写入成功的用户数（失败的用户名只记 error，下次上线拉历史仍能补齐）
      */
@@ -447,7 +454,7 @@ public class OfflineMessageStore {
                 redis.executePipelined((RedisCallback<Object>) connection -> {
                     for (String userId : batch) {
                         connection.scriptingCommands().eval(RECORD_PENDING, ReturnType.INTEGER, 1,
-                                key(RedisKeys.OFFLINE_PTR_PREFIX + userId), conversation, seqValue, ttlMillis);
+                                key(RedisKeys.userOfflinePtr(userId)), conversation, seqValue, ttlMillis);
                     }
                     return null;
                 });
@@ -458,7 +465,7 @@ public class OfflineMessageStore {
                     try {
                         redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
                                 RECORD_PENDING, ReturnType.INTEGER, 1,
-                                key(RedisKeys.OFFLINE_PTR_PREFIX + userId), conversation, seqValue, ttlMillis));
+                                key(RedisKeys.userOfflinePtr(userId)), conversation, seqValue, ttlMillis));
                         stored++;
                     } catch (RuntimeException single) {
                         log.error("[offline] 记录群补发指针失败 user={} conv={} err={}",
@@ -482,7 +489,7 @@ public class OfflineMessageStore {
         if (limit <= 0) {
             return Map.of();
         }
-        Map<Object, Object> entries = redis.opsForHash().entries(RedisKeys.OFFLINE_PTR_PREFIX + userId);
+        Map<Object, Object> entries = redis.opsForHash().entries(RedisKeys.userOfflinePtr(userId));
         if (entries.isEmpty()) {
             return Map.of();
         }
@@ -506,23 +513,24 @@ public class OfflineMessageStore {
 
     /** 仍滞留待补发的会话数（用于 {@code remaining} 提示，不做精确到条数的估算） */
     public long pendingConversationCount(String userId) {
-        Long size = redis.opsForHash().size(RedisKeys.OFFLINE_PTR_PREFIX + userId);
+        Long size = redis.opsForHash().size(RedisKeys.userOfflinePtr(userId));
         return size == null ? 0L : size;
     }
 
     /**
-     * 推进补发指针（由 {@code AckPending} 调用，即「帧已经写进连接」之后）。
+     * 推进某台设备在某个会话上的补发游标（由 {@code AckPending} 调用，即「帧已经写进连接」之后）。
      *
-     * @param nextSeq 补到哪了（已下发最后一条的 seq + 1）
+     * @param deviceId 哪台设备确认的；不同设备各有一条独立进度
+     * @param nextSeq  补到哪了（已下发最后一条的 seq + 1）
      * @return true = 真的前进了
      */
-    public boolean ackGroupPending(String userId, String conversationId, long nextSeq) {
+    public boolean ackGroupPending(String userId, String deviceId, String conversationId, long nextSeq) {
         if (conversationId == null || conversationId.isBlank() || nextSeq <= 0) {
             return false;
         }
         Long moved = redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
-                ADVANCE_PENDING, ReturnType.INTEGER, 1,
-                key(RedisKeys.OFFLINE_PTR_PREFIX + userId),
+                ADVANCE_GROUP_CURSOR, ReturnType.INTEGER, 1,
+                key(groupCursorKey(userId, deviceId)),
                 conversationId.getBytes(StandardCharsets.UTF_8),
                 String.valueOf(nextSeq).getBytes(StandardCharsets.UTF_8),
                 String.valueOf(pointerTtl.toMillis()).getBytes(StandardCharsets.UTF_8)));
@@ -530,17 +538,72 @@ public class OfflineMessageStore {
     }
 
     /**
-     * 清掉某个会话的补发指针。
+     * 某台设备在某个会话上已确认补发到的位置（0 = 该设备从未补过这个会话）。
      *
-     * <p><b>只允许在读路径上、且确实一条历史都查不到时调用</b>——那种情况下指针指向的位置之后
-     * 已经没有消息，删掉它不会漏掉任何东西。反过来在 ack 路径上删就是不安全的：
-     * 网关只回传「本批补到哪」，并不知道历史是否已经追平，期间若有新消息写入，
-     * 删掉指针等于把那段永久标记成已补发。
+     * <p>这个值抬高了补发起点：设备已经补到 20，就不该再从锚点 7 重新补 7~19。
+     */
+    public long groupCursor(String userId, String deviceId, String conversationId) {
+        if (conversationId == null || conversationId.isBlank()) {
+            return 0L;
+        }
+        Object raw = redis.opsForHash().get(groupCursorKey(userId, deviceId), conversationId);
+        Long seq = parseSeq(raw);
+        return seq == null ? 0L : seq;
+    }
+
+    /**
+     * 该用户登记过的设备（网关在建连时写入，见 {@code GatewayRegistry#bindUser}）。
+     *
+     * <p>空集合意味着「不知道有哪些端」——调用方必须保守处理（不要清理共享状态），
+     * 因为那可能是旧版网关还没写过设备表。
+     */
+    public Set<String> knownDevices(String userId) {
+        Set<String> members = redis.opsForSet().members(RedisKeys.userDevices(userId));
+        return members == null ? Set.of() : members;
+    }
+
+    /**
+     * 是否<b>所有</b>已登记设备都已经补到 {@code nextSeq} 或之后。
+     *
+     * <p>这是「能不能清掉群聊补发锚点」的唯一安全判据：
+     * <ul>
+     *   <li>还有设备没补到 → 锚点必须留着（新位置要对齐到更早的那台设备）；</li>
+     *   <li>设备表为空 / 查不到 → 保守返回 false，宁可让锚点留到 TTL 过期，也不能误删；</li>
+     *   <li>某台设备根本没有该会话的游标（= 0）→ 也算没补到。</li>
+     * </ul>
+     *
+     * @param devices 预取的设备集合（一次 ack 里多个会话共用，避免逐个 SMEMBERS）
+     */
+    public boolean allDevicesReached(Set<String> devices, String userId,
+                                     String conversationId, long nextSeq) {
+        if (devices == null || devices.isEmpty() || conversationId == null || conversationId.isBlank()) {
+            return false;
+        }
+        for (String device : devices) {
+            if (groupCursor(userId, device, conversationId) < nextSeq) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 清掉某个会话的补发<b>锚点</b>（{@code im:offline:ptr:{userId}} 的一个 field）。
+     *
+     * <p>只有两种时机是安全的：
+     * <ol>
+     *   <li><b>读路径 + 起点就是锚点 + 查不到任何历史</b>：锚点之后对所有设备都没有数据；</li>
+     *   <li><b>确认路径 + 所有已登记设备都已补到这个位置</b>（{@link #allDevicesReached}）：
+     *       没有任何端还需要从更早的位置补。</li>
+     * </ol>
+     *
+     * <p>反过来「某台设备补完就删」是不安全的：其它端会失去锚点——轻则从 seq 1 重拉整个
+     * 会话历史（新设备上线时），重则把还没补的那段永久标记成已补发。
      */
     public void clearPending(String userId, String conversationId) {
         redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
                 CLEAR_PENDING, ReturnType.INTEGER, 1,
-                key(RedisKeys.OFFLINE_PTR_PREFIX + userId),
+                key(RedisKeys.userOfflinePtr(userId)),
                 conversationId.getBytes(StandardCharsets.UTF_8)));
     }
 
@@ -568,20 +631,30 @@ public class OfflineMessageStore {
 
     /** key 的单一来源：测试清理也用它构造，避免 key 格式改了以后测试静默失效 */
     static String queueKeyOf(String userId) {
-        return RedisKeys.OFFLINE_QUEUE_PREFIX + "{" + userId + "}";
+        return RedisKeys.userOfflineQueue(userId);
     }
 
     private static byte[] positionKey(String userId) {
-        return key(RedisKeys.OFFLINE_QUEUE_PREFIX + "{" + userId + "}:pos");
+        return key(RedisKeys.userOfflinePosition(userId));
     }
 
     private static String cursorKey(String userId, String deviceId) {
-        return RedisKeys.OFFLINE_CURSOR_PREFIX + "{" + userId + "}:" + normalizeDevice(deviceId);
+        return RedisKeys.userOfflineCursor(userId, normalizeDevice(deviceId));
     }
 
     /** 包级可见：供测试清理游标 key */
     static String cursorKeyOf(String userId, String deviceId) {
         return cursorKey(userId, deviceId);
+    }
+
+    /** 群聊补发的设备级游标 key（Hash：conversationId → 已补发到的 seq） */
+    private static String groupCursorKey(String userId, String deviceId) {
+        return RedisKeys.userOfflineGroupCursor(userId, normalizeDevice(deviceId));
+    }
+
+    /** 包级可见：供测试清理群聊游标 key */
+    static String groupCursorKeyOf(String userId, String deviceId) {
+        return groupCursorKey(userId, deviceId);
     }
 
     /** 空 deviceId 与网关的 default 槽位对齐，避免同一台「无 deviceId 客户端」产生两套游标 */

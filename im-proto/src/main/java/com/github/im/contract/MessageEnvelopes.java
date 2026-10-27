@@ -36,6 +36,8 @@ public final class MessageEnvelopes {
                 .setReceiverId(envelope.to())
                 .setPayload(envelope.body() == null ? "" : envelope.body())
                 .setClientTs(envelope.clientTs())
+                .setContentType(envelope.contentType())
+                .setAttrs(envelope.attrs() == null ? "" : envelope.attrs())
                 .setGatewayInstance(gatewayInstance);
         return builder.build();
     }
@@ -48,7 +50,9 @@ public final class MessageEnvelopes {
                 request.getClientMsgId(),
                 request.getConversationId(),
                 request.getConvType(),
-                request.getClientTs());
+                request.getClientTs(),
+                request.getContentType(),
+                request.getAttrs());
     }
 
     public static boolean isOk(SubmitMessageResponse response) {

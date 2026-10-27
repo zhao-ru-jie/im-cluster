@@ -5,6 +5,8 @@ import com.github.im.proto.ingress.v1.AckPendingRequest;
 import com.github.im.proto.ingress.v1.AckPendingResponse;
 import com.github.im.proto.ingress.v1.PullPendingRequest;
 import com.github.im.proto.ingress.v1.PullPendingResponse;
+import com.github.im.server.conversation.ConversationStore;
+import com.github.im.server.group.GroupMemberRepository;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -22,6 +24,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -63,8 +66,11 @@ class MessageServicePullPendingTest {
             redis.delete(OfflineMessageStore.cursorKeyOf(id, WEB));
             redis.delete(OfflineMessageStore.cursorKeyOf(id, PHONE));
             redis.delete(OfflineMessageStore.cursorKeyOf(id, "default"));
-            redis.delete(RedisKeys.OFFLINE_PTR_PREFIX + id);
-            redis.delete(RedisKeys.OFFLINE_PREFIX + id);
+            redis.delete(OfflineMessageStore.groupCursorKeyOf(id, WEB));
+            redis.delete(OfflineMessageStore.groupCursorKeyOf(id, PHONE));
+            redis.delete(RedisKeys.userDevices(id));
+            redis.delete(RedisKeys.userOfflinePtr(id));
+            redis.delete(RedisKeys.userLegacyOffline(id));
         }
     }
 
@@ -148,8 +154,8 @@ class MessageServicePullPendingTest {
     // ==== 群聊补发指针 ====
 
     @Test
-    @DisplayName("群聊：拉取不推进指针，确认后才推进")
-    void groupPointerMovesOnlyAfterAck() {
+    @DisplayName("群聊：拉取不推进任何进度，确认后只推进本设备的游标")
+    void groupDeviceCursorMovesOnlyAfterAck() {
         String userId = newUser();
         String conversation = TestRedis.conversationId();
         store().recordGroupPending(List.of(userId), conversation, 7);
@@ -161,14 +167,66 @@ class MessageServicePullPendingTest {
         assertEquals(2, pulled.getFramesCount());
         assertTrue(pulled.getFrames(0).contains("\"seq\":7"), pulled.getFrames(0));
         assertTrue(pulled.getFrames(0).contains("\"type\":\"msg.push\""), "补发的帧必须与实时推送同构");
-        assertEquals(7L, store().pendingConversations(userId, 10).get(conversation),
-                "拉取阶段绝不能推进指针：网关这时还没把帧写出去");
+        assertEquals(0L, store().groupCursor(userId, WEB, conversation),
+                "拉取阶段绝不能推进进度：网关这时还没把帧写出去");
         assertEquals(9L, pulled.getAckGroupSeqsMap().get(conversation), "要把「补到哪」告诉网关，等它写成功再确认");
 
         service().ackPending(ack(userId, WEB, pulled));
 
-        assertEquals(9L, store().pendingConversations(userId, 10).get(conversation),
+        assertEquals(9L, store().groupCursor(userId, WEB, conversation),
                 "确认之后才前进到「已补发最后一条 +1」");
+        assertEquals(7L, store().pendingConversations(userId, 10).get(conversation),
+                "锚点是共享下界，一台设备补完不能把它前移");
+    }
+
+    @Test
+    @DisplayName("群聊：一端补完后另一端仍能从自己的起点补齐（多端同步的核心）")
+    void groupMultiDeviceEachKeepsOwnProgress() {
+        String userId = newUser();
+        String conversation = TestRedis.conversationId();
+        store().recordGroupPending(List.of(userId), conversation, 7);
+        when(repository.since(eq(conversation), eq(6L), anyInt()))
+                .thenReturn(List.of(message(conversation, 7), message(conversation, 8)));
+
+        // 网页先上线补完
+        PullPendingResponse forWeb = service().pullPending(request(userId, WEB, 200));
+        assertEquals(2, forWeb.getFramesCount());
+        service().ackPending(ack(userId, WEB, forWeb));
+
+        // 手机后上线：起点必须还是自己的锚点 7，而不是网页补到的 9
+        PullPendingResponse forPhone = service().pullPending(request(userId, PHONE, 200));
+        assertEquals(2, forPhone.getFramesCount(), "手机不能因为网页补过就永久缺这段消息");
+        // 两次都以 from=6（即 seq > 6）查历史 = 两台设备各自从 7 开始补
+        verify(repository, times(2)).since(eq(conversation), eq(6L), anyInt());
+
+        // 网页再次上线：已经补到 9，不该重复
+        when(repository.since(eq(conversation), eq(8L), anyInt())).thenReturn(List.of());
+        assertEquals(0, service().pullPending(request(userId, WEB, 200)).getFramesCount());
+    }
+
+    @Test
+    @DisplayName("群聊：所有登记设备都补完，锚点才退休")
+    void groupAnchorRetiresOnlyAfterAllDevices() {
+        String userId = newUser();
+        String conversation = TestRedis.conversationId();
+        store().recordGroupPending(List.of(userId), conversation, 7);
+        when(repository.since(eq(conversation), eq(6L), anyInt()))
+                .thenReturn(List.of(message(conversation, 7)));
+        // 网关登记了两台设备
+        TestRedis.template().opsForSet().add(RedisKeys.userDevices(userId), WEB, PHONE);
+
+        PullPendingResponse forWeb = service().pullPending(request(userId, WEB, 200));
+        service().ackPending(ack(userId, WEB, forWeb));
+        assertEquals(7L, store().pendingConversations(userId, 10).get(conversation),
+                "手机还没补，锚点不能删——删了手机就会从 seq 1 重拉整个历史");
+
+        when(repository.since(eq(conversation), eq(6L), anyInt()))
+                .thenReturn(List.of(message(conversation, 7)));
+        PullPendingResponse forPhone = service().pullPending(request(userId, PHONE, 200));
+        service().ackPending(ack(userId, PHONE, forPhone));
+
+        assertTrue(store().pendingConversations(userId, 10).isEmpty(),
+                "所有端都补过了，锚点就该退休，否则每轮 pull 都为它白查一次历史");
     }
 
     @Test
@@ -242,7 +300,9 @@ class MessageServicePullPendingTest {
 
     private MessageService service() {
         return new MessageService(TestRedis.template(), repository, store(),
-                new ClientFrames(new ObjectMapper()), delivery, seqAllocator, watermarkStore);
+                new ClientFrames(new ObjectMapper()), delivery, seqAllocator, watermarkStore,
+                new ConversationStore(TestRedis.template(), TTL, 1000),
+                mock(GroupMemberRepository.class), null, null, null, Duration.ofMinutes(2));
     }
 
     private OfflineMessageStore store() {

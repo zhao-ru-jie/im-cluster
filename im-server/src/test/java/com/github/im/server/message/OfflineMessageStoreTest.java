@@ -12,9 +12,11 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -48,8 +50,11 @@ class OfflineMessageStoreTest {
                 redis.delete(OfflineMessageStore.queueKeyOf(id) + ":pos");
                 redis.delete(OfflineMessageStore.cursorKeyOf(id, WEB));
                 redis.delete(OfflineMessageStore.cursorKeyOf(id, PHONE));
-                redis.delete(RedisKeys.OFFLINE_PREFIX + id);
-                redis.delete(RedisKeys.OFFLINE_PTR_PREFIX + id);
+                redis.delete(OfflineMessageStore.groupCursorKeyOf(id, WEB));
+                redis.delete(OfflineMessageStore.groupCursorKeyOf(id, PHONE));
+                redis.delete(RedisKeys.userDevices(id));
+                redis.delete(RedisKeys.userLegacyOffline(id));
+                redis.delete(RedisKeys.userOfflinePtr(id));
             }
         }
         if (factory != null) {
@@ -276,39 +281,75 @@ class OfflineMessageStoreTest {
 
         store.recordGroupPending(List.of(userId), TestRedis.conversationId(), 1L);
 
-        Long ttlMillis = redis.getExpire(RedisKeys.OFFLINE_PTR_PREFIX + userId);
+        Long ttlMillis = redis.getExpire(RedisKeys.userOfflinePtr(userId));
         assertNotNull(ttlMillis);
         assertTrue(ttlMillis > 0, "写入后必须续期，实际 ttl=" + ttlMillis);
     }
 
     @Test
-    @DisplayName("确认后指针前进；确实没数据时才能清掉")
-    void pendingAdvancesOnAckAndClearsWhenEmpty() {
+    @DisplayName("确认推进的是「设备游标」，锚点原地不动")
+    void ackAdvancesDeviceCursorNotAnchor() {
         OfflineMessageStore store = store(500);
         String userId = newUser();
         String conversation = TestRedis.conversationId();
         store.recordGroupPending(List.of(userId), conversation, 10);
 
-        assertTrue(store.ackGroupPending(userId, conversation, 11));
-        assertEquals(11L, store.pendingConversations(userId, 10).get(conversation));
+        assertTrue(store.ackGroupPending(userId, WEB, conversation, 11));
 
-        store.clearPending(userId, conversation);
-        assertTrue(store.pendingConversations(userId, 10).isEmpty(),
-                "残留指针会让每轮 pull 都白查一次历史");
+        assertEquals(11L, store.groupCursor(userId, WEB, conversation), "本设备的进度要前进");
+        assertEquals(0L, store.groupCursor(userId, PHONE, conversation), "另一台设备还没补过");
+        assertEquals(10L, store.pendingConversations(userId, 10).get(conversation),
+                "锚点是共享下界，不能因为某台设备补过就前移——否则另一台设备永久缺这段");
     }
 
     @Test
-    @DisplayName("指针只前进不回退（旧连接的确认晚到不能把它推回去）")
-    void pendingNeverGoesBackwards() {
+    @DisplayName("设备游标只前进不回退（旧连接的确认晚到不能把它推回去）")
+    void deviceCursorNeverGoesBackwards() {
         OfflineMessageStore store = store(500);
         String userId = newUser();
         String conversation = TestRedis.conversationId();
         store.recordGroupPending(List.of(userId), conversation, 10);
-        store.ackGroupPending(userId, conversation, 15);
+        store.ackGroupPending(userId, WEB, conversation, 15);
 
-        assertEquals(false, store.ackGroupPending(userId, conversation, 3));
+        assertEquals(false, store.ackGroupPending(userId, WEB, conversation, 3));
 
-        assertEquals(15L, store.pendingConversations(userId, 10).get(conversation), "回退会造成重复补发甚至死循环");
+        assertEquals(15L, store.groupCursor(userId, WEB, conversation), "回退会造成重复补发甚至死循环");
+    }
+
+    @Test
+    @DisplayName("只有所有已登记设备都补到，才算可以退休锚点")
+    void anchorRetirableOnlyWhenAllDevicesReached() {
+        OfflineMessageStore store = store(500);
+        String userId = newUser();
+        String conversation = TestRedis.conversationId();
+        store.recordGroupPending(List.of(userId), conversation, 10);
+        redis.opsForSet().add(RedisKeys.userDevices(userId), WEB, PHONE);
+
+        Set<String> devices = store.knownDevices(userId);
+        assertEquals(Set.of(WEB, PHONE), devices);
+
+        store.ackGroupPending(userId, WEB, conversation, 20);
+        assertFalse(store.allDevicesReached(devices, userId, conversation, 20), "网页还没补过，锚点必须留着");
+
+        store.ackGroupPending(userId, PHONE, conversation, 20);
+        assertTrue(store.allDevicesReached(devices, userId, conversation, 20));
+
+        store.clearPending(userId, conversation);
+        assertTrue(store.pendingConversations(userId, 10).isEmpty());
+    }
+
+    @Test
+    @DisplayName("不知道有哪些设备时绝不判定「都补完了」")
+    void allDevicesReachedIsFalseWithoutDeviceRegistry() {
+        OfflineMessageStore store = store(500);
+        String userId = newUser();
+        String conversation = TestRedis.conversationId();
+        store.recordGroupPending(List.of(userId), conversation, 10);
+        store.ackGroupPending(userId, WEB, conversation, 20);
+
+        assertTrue(store.knownDevices(userId).isEmpty());
+        assertFalse(store.allDevicesReached(store.knownDevices(userId), userId, conversation, 20),
+                "设备集合为空可能是旧版网关没写过设备表，此时误判会让锚点被删");
     }
 
     @Test
