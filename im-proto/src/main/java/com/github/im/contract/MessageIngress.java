@@ -58,4 +58,41 @@ public interface MessageIngress {
     default AckPendingResponse ackPending(AckPendingRequest request) {
         return AckPendingResponse.newBuilder().setCode(0).setMessage("ok").build();
     }
+
+    /**
+     * 客户端收到下行帧之后的端到端确认（delivered 的真正来源）。
+     *
+     * <p>与 {@link #ackPending} 的区别是这次只说了一句话：
+     * <b>前者是「网关把它写进 socket 了」，后者是「客户端说它收到了」</b>。
+     * 可靠性（至少一次）靠前者，可观测性（到底送到没有）靠后者，两者都要，不能互相替代。
+     *
+     * <p>默认实现是空操作：ACK 丢了是有害但可控的——客户端下次 {@code sync} 时会重新上报水位，
+     * 而水位本来就按 max 推进，重复上报不会出错。
+     */
+    default DeliveredAckResponse ackDelivered(DeliveredAckRequest request) {
+        return DeliveredAckResponse.newBuilder().setCode(0).setMessage("ok").build();
+    }
+
+    /**
+     * 用户的会话列表（按最后消息时间倒序），每条带未读数。
+     *
+     * <p>默认返回空列表：会话模型是后加的，让只需要收发消息的实现不必被迫实现它。
+     */
+    default ListConversationsResponse listConversations(ListConversationsRequest request) {
+        return ListConversationsResponse.getDefaultInstance();
+    }
+
+    /**
+     * 上报已读位置。
+     *
+     * <p>默认实现是<b>直接回显</b>而不是什么都不做：调用方会拿返回值更新角标，
+     * 回 0 会让客户端的未读数卡在错误的位置上。
+     */
+    default MarkReadResponse markRead(MarkReadRequest request) {
+        return MarkReadResponse.newBuilder()
+                .setCode(0)
+                .setMessage("ok")
+                .setReadSeq(request.getSeq())
+                .build();
+    }
 }

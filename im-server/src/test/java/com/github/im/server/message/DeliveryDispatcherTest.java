@@ -1,8 +1,11 @@
 package com.github.im.server.message;
 
 import com.github.im.contract.MessageEnvelope;
+import com.github.im.contract.VendorPushPort;
+import com.github.im.contract.VendorPushRequest;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.ObjectProvider;
 
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -79,6 +82,62 @@ class DeliveryDispatcherTest {
         } finally {
             dispatcher.shutdown();
         }
+    }
+
+    @Test
+    @DisplayName("长连接投不到的用户会走厂商推送（连接不在时唯一的兜底提醒）")
+    void failedUsersGetVendorPush() throws Exception {
+        CountDownLatch pushed = new CountDownLatch(1);
+        VendorPushPort vendorPush = request -> {
+            assertEquals("alice", request.title(), "单聊通知标题是发送方");
+            assertEquals("hi", request.body());
+            assertEquals("s:alice:bob", request.conversationId());
+            assertEquals(3L, request.seq());
+            pushed.countDown();
+        };
+        when(router.deliver(any(), anyString(), anyString())).thenReturn(List.of("bob"));
+        doAnswer(invocation -> 1).when(offlineStore).storeAll(anyCollection(), anyString());
+
+        MessageEnvelope single = new MessageEnvelope("alice", "bob", "hi", "c-v1", null, null, 1L);
+        DeliveryDispatcher dispatcher = new DeliveryDispatcher(router, offlineStore, 8,
+                providerOf(vendorPush));
+        try {
+            dispatcher.dispatch(single, "frame", "trace", 3L);
+            assertTrue(pushed.await(2, TimeUnit.SECONDS), "offline 用户必须收到厂商通知");
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    @Test
+    @DisplayName("媒体消息的厂商通知正文用占位符，不是空字符串")
+    void vendorPushUsesPlaceholderForMediaMessage() throws Exception {
+        CountDownLatch pushed = new CountDownLatch(1);
+        VendorPushPort vendorPush = request -> {
+            assertEquals("[图片]", request.body());
+            assertEquals("IMAGE", request.contentType());
+            pushed.countDown();
+        };
+        when(router.deliver(any(), anyString(), anyString())).thenReturn(List.of("bob"));
+        doAnswer(invocation -> 1).when(offlineStore).storeAll(anyCollection(), anyString());
+
+        MessageEnvelope image = new MessageEnvelope("alice", "bob", "", "c-v2", null, null, 1L,
+                "IMAGE", "{\"url\":\"https://cdn/x.png\"}");
+        DeliveryDispatcher dispatcher = new DeliveryDispatcher(router, offlineStore, 8,
+                providerOf(vendorPush));
+        try {
+            dispatcher.dispatch(image, "frame", "trace", 4L);
+            assertTrue(pushed.await(2, TimeUnit.SECONDS), "图片消息的通知正文要有内容");
+        } finally {
+            dispatcher.shutdown();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static ObjectProvider<VendorPushPort> providerOf(VendorPushPort port) {
+        ObjectProvider<VendorPushPort> provider = mock(ObjectProvider.class);
+        when(provider.getIfAvailable()).thenReturn(port);
+        return provider;
     }
 
     @Test

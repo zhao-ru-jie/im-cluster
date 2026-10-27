@@ -5,6 +5,12 @@ import com.github.im.proto.ingress.v1.AckPendingRequest;
 import com.github.im.proto.ingress.v1.AckPendingResponse;
 import com.github.im.proto.ingress.v1.BatchSubmitRequest;
 import com.github.im.proto.ingress.v1.BatchSubmitResponse;
+import com.github.im.proto.ingress.v1.DeliveredAckRequest;
+import com.github.im.proto.ingress.v1.DeliveredAckResponse;
+import com.github.im.proto.ingress.v1.ListConversationsRequest;
+import com.github.im.proto.ingress.v1.ListConversationsResponse;
+import com.github.im.proto.ingress.v1.MarkReadRequest;
+import com.github.im.proto.ingress.v1.MarkReadResponse;
 import com.github.im.proto.ingress.v1.MessageIngressGrpc;
 import com.github.im.proto.ingress.v1.PullPendingRequest;
 import com.github.im.proto.ingress.v1.PullPendingResponse;
@@ -27,9 +33,9 @@ import java.util.function.Function;
  * 「每个业务请求的 RPC 次数」产生别名（2 实例 + 每条消息 2 次 RPC 时，submit 会永远落到同一个
  * 实例）。gRPC 的 LoadBalancer 工作在 subchannel 层，不存在这个问题。
  *
- * <p><b>超时语义</b>：默认 300ms。超时/不可用时向上抛异常，由网关的
- * {@code SessionLifecycle} 转成 {@code error 503}（可重试）——连接保持不断，
- * 因为「连接」比「单条消息的实时性」更稀缺。
+ * <p><b>超时语义</b>：由装配处传入（网关侧默认 1s，见 {@code im.server.timeout-ms}）。
+ * 超时/不可用时向上抛异常，由网关的 {@code SessionLifecycle} 转成 {@code error 503}（可重试）——
+ * 连接保持不断，因为「连接」比「单条消息的实时性」更稀缺。
  *
  * <p><b>waitForReady 语义</b>：{@code withWaitForReady()} 让 RPC 在「channel 暂时没有任何 READY 的
  * subchannel」时<b>排队等待</b>，而不是立刻返回 UNAVAILABLE——例如所有实例都还在 CONNECTING，
@@ -95,6 +101,27 @@ public class RemoteMessageIngress implements MessageIngress {
         return MessageIngressGrpc.newBlockingStub(channels.channelFor(target))
                 .withDeadlineAfter(timeoutMs, TimeUnit.MILLISECONDS)
                 .ackPending(request);
+    }
+
+    /**
+     * 端到端 ACK 与 {@link #ackPending} 同样不走 waitForReady：
+     * 确认丢了不会丢消息（客户端下次 sync 会重报水位），不值得让它占着虚拟线程等实例就绪。
+     */
+    @Override
+    public DeliveredAckResponse ackDelivered(DeliveredAckRequest request) {
+        return MessageIngressGrpc.newBlockingStub(channels.channelFor(target))
+                .withDeadlineAfter(timeoutMs, TimeUnit.MILLISECONDS)
+                .ackDelivered(request);
+    }
+
+    @Override
+    public ListConversationsResponse listConversations(ListConversationsRequest request) {
+        return invoke(stub -> stub.listConversations(request));
+    }
+
+    @Override
+    public MarkReadResponse markRead(MarkReadRequest request) {
+        return invoke(stub -> stub.markRead(request));
     }
 
     private <T> T invoke(Function<MessageIngressGrpc.MessageIngressBlockingStub, T> call) {

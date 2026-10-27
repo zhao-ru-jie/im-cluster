@@ -2,7 +2,9 @@ package com.github.im.server.message;
 
 import com.github.im.contract.MessageEnvelope;
 import org.springframework.stereotype.Component;
+import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.node.ObjectNode;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -31,6 +33,73 @@ import java.util.Map;
 public class ClientFrames {
 
     public static final String TYPE_PUSH = "msg.push";
+    /**
+     * 消息状态回执：告诉<b>发送方</b>「你发的那条，对方到了哪一步」。
+     *
+     * <pre>
+     * 客户端 → 网关 → IM 服务：msg.recv（已送达） / POST /conv/{id}/read（已读）
+     * IM 服务 → 网关 → 发送方：{"ver":1,"type":"msg.state","conversationId":"s:a:b","convType":"SINGLE",
+     *                          "state":"READ","seq":12,"userId":"bob","ts":1750000000000}
+     * </pre>
+     *
+     * <p>这是「消息状态机」缺的那一半：{@code msg.ack} 只说「服务端受理了」，
+     * 之前没有任何帧把「对方已送达 / 已读」告诉发送方。{@code userId} 是状态的主体
+     * （谁已读），发送方据此把「已读」标注到 {@code seq <= seq} 的气泡上。
+     */
+    public static final String TYPE_STATE = "msg.state";
+    /** 已送达（对端设备亲口确认收到） */
+    public static final String STATE_DELIVERED = "DELIVERED";
+    /** 已读（对端上报已读位置） */
+    public static final String STATE_READ = "READ";
+    /**
+     * 消息变更事件（撤回 / 本地删除）。
+     *
+     * <pre>
+     * {"ver":1,"type":"msg.update","conversationId":"s:a:b","convType":"SINGLE",
+     *  "seq":7,"change":"RECALLED","actorId":"alice","ts":1750000000000}
+     * </pre>
+     *
+     * <p>为什么单独一个帧类型而不是复用 {@code msg.state}：{@code state} 是「走到哪一步」
+     * （DELIVERED/READ，单调前进、按会话去重），{@code update} 是「内容/可见性变了」
+     * （可针对任意 seq、不单调、撤回要广播给所有人而删除只给自己）。语义与去重口径都不同。
+     */
+    public static final String TYPE_UPDATE = "msg.update";
+    /**
+     * 群变更事件（治理动作的下行同步）。
+     *
+     * <pre>
+     * {"ver":1,"type":"group.update","groupId":"a1b2c3","change":"MEMBER_REMOVED",
+     *  "actorId":"alice","targetId":"bob","ts":1750000000000}
+     * </pre>
+     *
+     * <p>为什么不能塞进 {@code msg.update}：那个帧的定位是「某条消息（会话 + seq）变了」，
+     * 而群变更没有 seq，主体是「群」本身。混用会让客户端为了处理「我被踢了」
+     * 去解析一个编号字段——语义会在这里崩掉。
+     */
+    public static final String TYPE_GROUP_UPDATE = "group.update";
+    /** 建群（推给初始成员） */
+    public static final String GROUP_CREATED = "CREATED";
+    /** 群资料变更（改名 / 公告 / 人数上限 / 全员禁言） */
+    public static final String GROUP_UPDATED = "UPDATED";
+    /** 有人被拉进群 */
+    public static final String GROUP_MEMBER_ADDED = "MEMBER_ADDED";
+    /** 有人被踢出群 */
+    public static final String GROUP_MEMBER_REMOVED = "MEMBER_REMOVED";
+    /** 有人主动退群 */
+    public static final String GROUP_MEMBER_LEFT = "MEMBER_LEFT";
+    /** 角色变更（设/撤管理员） */
+    public static final String GROUP_ROLE_CHANGED = "ROLE_CHANGED";
+    /** 单人禁言 */
+    public static final String GROUP_MUTED = "MUTED";
+    /** 解除单人禁言（与 {@link #GROUP_MUTED} 分开：客户端要据此把输入框恢复可用） */
+    public static final String GROUP_UNMUTED = "UNMUTED";
+    /** 群已解散 */
+    public static final String GROUP_DISMISSED = "DISMISSED";
+
+    /** 撤回：会话级，广播给会话内所有人（含发送方自己的其他端） */
+    public static final String CHANGE_RECALLED = "RECALLED";
+    /** 本地删除：用户级，只推给操作者自己的其他端；对端不受影响 */
+    public static final String CHANGE_DELETED = "DELETED";
     private static final int VER = 1;
 
     private final ObjectMapper objectMapper;
@@ -44,12 +113,42 @@ public class ClientFrames {
         return frameOf(new StoredMessage(
                 envelope.conversationId(), seq, serverMsgId,
                 envelope.from(), envelope.to(), envelope.convType(),
-                envelope.clientMsgId(), envelope.body(), createdAt));
+                envelope.clientMsgId(), envelope.body(), createdAt,
+                envelope.contentType(), envelope.attrs()));
     }
 
     /** 读路径用：把存储里的记录还原成帧（历史消息、离线补拉都走这里） */
     public String frameOf(StoredMessage message) {
         return objectMapper.writeValueAsString(frameMap(message));
+    }
+
+    /** 同上，但按「是否已撤回」脱敏（补发已撤回的消息时不能再带原文） */
+    public String frameOf(StoredMessage message, boolean recalled) {
+        return objectMapper.writeValueAsString(frameMap(message, recalled));
+    }
+
+    /**
+     * 出站状态回执帧（{@code msg.state}）。
+     *
+     * @param conversationId 会话 ID
+     * @param convType       SINGLE / GROUP
+     * @param state          {@link #STATE_DELIVERED} / {@link #STATE_READ}
+     * @param seq            该用户确认到的最大 seq（发送方把 {@code <= seq} 的气泡都标成该状态）
+     * @param userId         状态主体（谁已读/已送达）
+     * @param ts             回执生成时间
+     */
+    public String stateFrame(String conversationId, String convType, String state, long seq,
+                             String userId, long ts) {
+        Map<String, Object> frame = new LinkedHashMap<>();
+        frame.put("ver", VER);
+        frame.put("type", TYPE_STATE);
+        frame.put("conversationId", conversationId);
+        frame.put("convType", convType);
+        frame.put("state", state);
+        frame.put("seq", seq);
+        frame.put("userId", userId);
+        frame.put("ts", ts);
+        return objectMapper.writeValueAsString(frame);
     }
 
     /**
@@ -59,6 +158,20 @@ public class ClientFrames {
      * 每次拉取的 ts 都会变，客户端排序/去重会出错。
      */
     public Map<String, Object> frameMap(StoredMessage message) {
+        return frameMap(message, false);
+    }
+
+    /**
+     * 同上，但可以渲染「已撤回」的消息。
+     *
+     * <p>撤回不是删除：seq 仍然占位（否则客户端会当成空洞去反复拉齐），
+     * 但那一条<b>不能再带出任何原文</b>——包括 {@code body} 与 {@code attrs}
+     * （attrs 里可能是图片 URL，撤回后仍然可访问就等于没撤回）。
+     * 所以这里直接把两者抹掉，只留 {@code "recalled":true} 让客户端画「已撤回」占位。
+     *
+     * @param recalled 该 seq 是否已撤回（由存储层的 {@code recalledSeqs} 批量判定）
+     */
+    public Map<String, Object> frameMap(StoredMessage message, boolean recalled) {
         Map<String, Object> frame = new LinkedHashMap<>();
         frame.put("ver", VER);
         frame.put("type", TYPE_PUSH);
@@ -69,8 +182,118 @@ public class ClientFrames {
         frame.put("clientMsgId", message.clientMsgId());
         frame.put("from", message.from());
         frame.put("to", message.to());
+        if (recalled) {
+            frame.put("body", "");
+            frame.put("contentType", MessageEnvelope.CT_TEXT);
+            frame.put("recalled", true);
+            frame.put("ts", message.createdAt());
+            return frame;
+        }
         frame.put("body", message.body());
+        // 富媒体：类型 + 元数据。attrs 只在非空时下发，纯文本帧保持与旧版一致的长度与形状
+        frame.put("contentType", message.contentType());
+        if (message.attrs() != null && !message.attrs().isBlank()) {
+            frame.put("attrs", message.attrs());
+        }
         frame.put("ts", message.createdAt());
         return frame;
+    }
+
+    /**
+     * 一条已下发帧的定位信息（会话 + seq）。
+     *
+     * @param conversationId 会话 ID
+     * @param seq            会话内序号
+     */
+    public record FrameRef(String conversationId, long seq) {
+    }
+
+    /**
+     * 从离线队列里存的帧快照中取出「会话 + seq」。
+     *
+     * <p>离线队列存的是<b>发送时刻的帧</b>，它不知道后来发生的撤回/删除。所以补发出口处
+     * 必须按最新状态重新判定一次——这就需要先从帧里读回定位信息。
+     *
+     * @return 解析失败（脏帧/格式变化）返回 {@code null}，调用方按「原样下发」处理
+     */
+    public FrameRef refOf(String rawFrame) {
+        if (rawFrame == null || rawFrame.isBlank()) {
+            return null;
+        }
+        try {
+            JsonNode node = objectMapper.readTree(rawFrame);
+            String conversationId = node.path("conversationId").asString("");
+            long seq = node.path("seq").asLong(0);
+            return conversationId.isEmpty() || seq <= 0 ? null : new FrameRef(conversationId, seq);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 把帧快照改写成「已撤回」形态：抹掉 {@code body} 与 {@code attrs}，加 {@code recalled:true}。
+     *
+     * <p>为什么不重建一条 {@code StoredMessage}：快照里可能已经带上了当时的形状
+     * （老版本帧没有 contentType 等字段），重建反而会让「原样兼容」失效。
+     * 只在原 JSON 上做最小改写，剩下的字段（serverMsgId / clientMsgId / ts）保持不动。
+     */
+    public String recalledFrame(String rawFrame) {
+        try {
+            JsonNode node = objectMapper.readTree(rawFrame);
+            if (!(node instanceof ObjectNode object)) {
+                return rawFrame;
+            }
+            object.put("body", "");
+            object.remove("attrs");
+            object.put("contentType", MessageEnvelope.CT_TEXT);
+            object.put("recalled", true);
+            return objectMapper.writeValueAsString(object);
+        } catch (RuntimeException e) {
+            return rawFrame;
+        }
+    }
+
+    /**
+     * 群变更事件帧。
+     *
+     * @param change   {@link #GROUP_UPDATED} 等
+     * @param actorId  发起人（群主动作是群主，退群是本人）
+     * @param targetId 被操作的人（成员增删/角色/禁言时有值，其余为空串）
+     */
+    public String groupUpdateFrame(String groupId, String change, String actorId, String targetId, long ts) {
+        Map<String, Object> frame = new LinkedHashMap<>();
+        frame.put("ver", VER);
+        frame.put("type", TYPE_GROUP_UPDATE);
+        frame.put("groupId", groupId);
+        frame.put("change", change);
+        frame.put("actorId", actorId == null ? "" : actorId);
+        frame.put("targetId", targetId == null ? "" : targetId);
+        frame.put("ts", ts);
+        return objectMapper.writeValueAsString(frame);
+    }
+
+    /**
+     * 消息变更事件帧（撤回 / 本地删除）。
+     *
+     * <p>与 {@link #TYPE_STATE} 的分工：{@code msg.state} 是「这条消息走到了哪一步」
+     * （DELIVERED / READ，单调前进），{@code msg.update} 是「这条消息的内容/可见性变了」
+     * （RECALLED 会话级、DELETED 用户级，可以针对任意 seq，不单调）。
+     * 两者共用同一条下行通道（PushPort），但去重口径不同，所以是两个帧类型。
+     *
+     * @param change  {@link #CHANGE_RECALLED}（广播给会话内所有人）/ {@link #CHANGE_DELETED}（只给操作者自己的其他端）
+     * @param actorId 发起变更的人
+     */
+    public String updateFrame(String conversationId, String convType, long seq, String change,
+                              String actorId, long ts) {
+        Map<String, Object> frame = new LinkedHashMap<>();
+        frame.put("ver", VER);
+        frame.put("type", TYPE_UPDATE);
+        frame.put("conversationId", conversationId);
+        frame.put("convType", convType);
+        frame.put("seq", seq);
+        frame.put("change", change);
+        frame.put("actorId", actorId);
+        frame.put("ts", ts);
+        return objectMapper.writeValueAsString(frame);
     }
 }

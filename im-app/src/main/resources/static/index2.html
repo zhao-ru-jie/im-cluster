@@ -31,12 +31,26 @@
   <div class="row">
     <input id="to" placeholder="接收方 userId，如 bob" style="width:200px">
     <input id="body" placeholder="消息内容" style="width:260px">
+    <select id="contentType" style="padding:8px;border:1px solid #cbd5e1;border-radius:8px;font-size:13px">
+      <option value="TEXT">文本</option>
+      <option value="IMAGE">图片</option>
+      <option value="FILE">文件</option>
+      <option value="VOICE">语音</option>
+      <option value="VIDEO">视频</option>
+    </select>
+    <input id="attrs" placeholder='媒体元数据，如 {"url":"https://..."}' style="width:280px">
     <button id="sendBtn" onclick="send()" disabled>发送</button>
   </div>
   <div id="log"></div>
 
   <script>
     let ws = null;
+    let myUserId = '';
+    let lastSentTo = '';
+    // 各会话「已见过的最大 seq」。重连时上报给服务端，作为 seq 发号器的兜底下界：
+    // 万一 Redis 里的序号计数器整体丢失，服务端据此也不会发出比这里更小的 seq
+    // （否则新消息会被本端当成历史重复而丢弃）。
+    const watermarks = {};
     // 长连接由 Netty 独立监听（默认 8081），与本页面的 HTTP 端口(8080)不同；
     // 可用 ?wsPort=xxxx 覆盖，便于连到别的网关实例
     const WS_PORT = new URLSearchParams(location.search).get('wsPort') || '7003';
@@ -53,23 +67,115 @@
       el.scrollTop = el.scrollHeight;
     }
 
+    // 与服务端 MessageEnvelope.singleConversationId 保持同一规则：两个 userId 排序后拼接
+    function conversationIdOf(to) {
+      if (!myUserId || !to) return null;
+      return myUserId <= to ? 's:' + myUserId + ':' + to : 's:' + to + ':' + myUserId;
+    }
+
+    function raiseWatermark(conversationId, seq) {
+      if (!conversationId || !seq) return;
+      watermarks[conversationId] = Math.max(watermarks[conversationId] || 0, seq);
+    }
+
+    // 端到端 ACK：只有客户端真的收到 msg.push 才算「已送达」，攒批后回 msg.recv。
+    // 逐条回会把「消息数」放大成「RPC 数」，所以同会话压成一条 + 定时攒批一起发。
+    const pendingAcks = {};      // conversationId -> 已见最大 seq
+    let ackTimer = null;
+    const ACK_BATCH = 20;        // 攒够这么多个会话就立刻发
+    const ACK_DELAY_MS = 80;     // 否则等 80ms 一起发
+
+    function queueAck(conversationId, seq) {
+      if (!conversationId || !seq) return;
+      pendingAcks[conversationId] = Math.max(pendingAcks[conversationId] || 0, seq);
+      if (Object.keys(pendingAcks).length >= ACK_BATCH) { flushAcks(); return; }
+      if (!ackTimer) ackTimer = setTimeout(flushAcks, ACK_DELAY_MS);
+    }
+
+    // 与服务端 MessageDigests.placeholderOf 保持一致：媒体消息在列表/日志里显示占位而不是空串
+    function placeholderOf(contentType) {
+      switch (contentType) {
+        case 'IMAGE': return '[图片]';
+        case 'FILE': return '[文件]';
+        case 'VOICE': return '[语音]';
+        case 'VIDEO': return '[视频]';
+        default: return contentType ? '[消息]' : '';
+      }
+    }
+
+    // 已读上报：只有页面可见（用户真的在看）才报，切后台的标签页不该把消息标成已读
+    function reportRead(conversationId, seq) {
+      if (!conversationId || !seq || document.visibilityState !== 'visible') return;
+      if (!ws || ws.readyState !== 1) return;
+      ws.send(JSON.stringify({ ver: 1, type: 'msg.read', conversationId, seq }));
+    }
+
+    // 字段名用完整单词（conversationId / seq）：这张协议要抓包、进日志、贴进 issue，
+    // 省下的那点字节抵不上一次「c 是什么意思」的解释成本
+    function flushAcks() {
+      if (ackTimer) { clearTimeout(ackTimer); ackTimer = null; }
+      const conversations = Object.keys(pendingAcks);
+      if (conversations.length === 0) return;
+      const acks = conversations.map((conversationId) => ({ conversationId, seq: pendingAcks[conversationId] }));
+      conversations.forEach((conversationId) => delete pendingAcks[conversationId]);
+      // 断线就丢弃待发 ACK：重连后 sync 会重报 watermarks，水位只前进不会丢信息
+      if (!ws || ws.readyState !== 1) return;
+      ws.send(JSON.stringify({ ver: 1, type: 'msg.recv', acks: acks }));
+      log('已确认收到: ' + acks.map((a) => a.conversationId + '#' + a.seq).join(', '), 'ack');
+    }
+
+    // 上报水位；服务端会顺手补拉缺口，所以 sync 也是「主动对账」的入口
+    function syncWatermarks() {
+      if (!ws || ws.readyState !== 1) return;
+      const keys = Object.keys(watermarks);
+      if (keys.length === 0) return;
+      ws.send(JSON.stringify({ ver: 1, type: 'sync', watermarks: watermarks }));
+      log('已上报水位: ' + JSON.stringify(watermarks), 'sys');
+    }
+
     function connect() {
       const userId = document.getElementById('userId').value.trim();
       if (!userId) { alert('请填写 userId'); return; }
+      myUserId = userId;
       ws = new WebSocket(WS_URL_BASE + '?userId=' + encodeURIComponent(userId) + '&deviceId=web');
       ws.onopen = () => {
         log('已连接为 ' + userId, 'sys');
         document.getElementById('connectBtn').disabled = true;
         document.getElementById('disconnectBtn').disabled = false;
         document.getElementById('sendBtn').disabled = false;
+        syncWatermarks();
       };
       ws.onmessage = (e) => {
         let frame;
         try { frame = JSON.parse(e.data); } catch (_) { log('收到: ' + e.data, 'me'); return; }
         if (frame.type === 'msg.ack') {
+          raiseWatermark(conversationIdOf(lastSentTo), frame.seq);
           log('已受理: seq=' + frame.seq + ' serverMsgId=' + frame.serverMsgId, 'ack');
         } else if (frame.type === 'msg.push') {
-          log('收到 [' + frame.conversationId + ' #' + frame.seq + '] ' + frame.from + ': ' + frame.body, 'me');
+          raiseWatermark(frame.conversationId, frame.seq);
+          const ct = frame.contentType || 'TEXT';
+          let text = ct === 'TEXT' ? frame.body : placeholderOf(ct);
+          if (ct !== 'TEXT' && frame.attrs) {
+            try {
+              const attrs = JSON.parse(frame.attrs);
+              if (attrs.url) text += ' ' + attrs.url;
+            } catch (_) { /* 元数据不是合法 JSON 时只显示占位，别让一条脏数据打断日志 */ }
+          }
+          log('收到 [' + frame.conversationId + ' #' + frame.seq + '] ' + frame.from + ': ' + text, 'me');
+          // 收到即视为已送达：回端到端 ACK，服务端据此抬高补发起点，避免下次重连又发一遍
+          queueAck(frame.conversationId, frame.seq);
+          // 页面还在前台就顺手报已读——服务端会据此把「已读」回推给发送方
+          reportRead(frame.conversationId, frame.seq);
+        } else if (frame.type === 'msg.state') {
+          // 对方的状态回执：DELIVERED = 已送达，READ = 已读
+          log('对方' + (frame.state === 'READ' ? '已读' : '已送达') + ' ' + frame.conversationId + ' #' + frame.seq, 'ack');
+        } else if (frame.type === 'msg.update') {
+          // 消息变更事件：撤回是会话级（双方都看不到原文），删除只影响操作者自己
+          if (frame.change === 'RECALLED') {
+            log('撤回 [' + frame.conversationId + ' #' + frame.seq + '] 由 ' + frame.actorId, 'ack');
+          } else {
+            log('已在本账号其它端删除 [' + frame.conversationId + ' #' + frame.seq + ']', 'ack');
+          }
         } else if (frame.type === 'error') {
           log('错误 ' + frame.code + ': ' + frame.message, 'sys');
         } else if (frame.type === 'ping') {
@@ -83,6 +189,9 @@
       };
       ws.onclose = () => {
         log('连接已关闭', 'sys');
+        // 连接没了，待发 ACK 作废：重连时 syncWatermarks 会把 watermarks 重报一遍
+        if (ackTimer) { clearTimeout(ackTimer); ackTimer = null; }
+        Object.keys(pendingAcks).forEach((c) => delete pendingAcks[c]);
         document.getElementById('connectBtn').disabled = false;
         document.getElementById('disconnectBtn').disabled = true;
         document.getElementById('sendBtn').disabled = true;
@@ -90,17 +199,37 @@
       ws.onerror = () => log('连接出错', 'sys');
     }
 
-    function disconnect() { if (ws) ws.close(); }
+    function disconnect() {
+      // 主动断开前先把攒着的 ACK 发掉，别让它跟着连接一起消失
+      flushAcks();
+      if (ws) ws.close();
+    }
 
     function send() {
       const to = document.getElementById('to').value.trim();
       const body = document.getElementById('body').value.trim();
+      const contentType = document.getElementById('contentType').value;
+      const attrsRaw = document.getElementById('attrs').value.trim();
       if (!ws || ws.readyState !== 1) { alert('未连接'); return; }
-      if (!to || !body) { alert('请填写接收方和消息'); return; }
+      if (!to) { alert('请填写接收方'); return; }
+      // 文本消息必须有正文；媒体消息的正文可以空着（内容在 attrs.url 里）
+      if (!body && contentType === 'TEXT') { alert('请填写消息内容'); return; }
+      const frame = { ver: 1, type: 'msg.send', to: to, body: body, contentType: contentType };
+      if (attrsRaw) {
+        try {
+          JSON.parse(attrsRaw);
+        } catch (_) {
+          alert('attrs 必须是合法 JSON，如 {"url":"https://..."}');
+          return;
+        }
+        frame.attrs = attrsRaw;
+      }
       // clientMsgId 是幂等键：客户端重连重发时保持同一个值，服务端据此去重
       const clientMsgId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
-      ws.send(JSON.stringify({ ver: 1, type: 'msg.send', clientMsgId: clientMsgId, to: to, body: body }));
-      log('发送 -> ' + to + ': ' + body, 'sys');
+      frame.clientMsgId = clientMsgId;
+      lastSentTo = to;
+      ws.send(JSON.stringify(frame));
+      log('发送 -> ' + to + ': ' + (contentType === 'TEXT' ? body : placeholderOf(contentType)), 'sys');
     }
   </script>
 </body>

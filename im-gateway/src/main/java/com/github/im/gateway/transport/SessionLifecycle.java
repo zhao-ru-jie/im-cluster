@@ -9,17 +9,23 @@ import com.github.im.gateway.session.ClientSession;
 import com.github.im.gateway.session.ConnectionManager;
 import com.github.im.gateway.session.GatewayRegistry;
 import com.github.im.proto.ingress.v1.AckPendingRequest;
+import com.github.im.proto.ingress.v1.DeliveredAck;
+import com.github.im.proto.ingress.v1.DeliveredAckRequest;
+import com.github.im.proto.ingress.v1.MarkReadRequest;
 import com.github.im.proto.ingress.v1.PullPendingRequest;
 import com.github.im.proto.ingress.v1.PullPendingResponse;
 import com.github.im.proto.ingress.v1.SubmitMessageRequest;
 import com.github.im.proto.ingress.v1.SubmitMessageResponse;
+import io.grpc.Status;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.JsonNode;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -81,7 +87,8 @@ public class SessionLifecycle {
         }
         metrics.sessionOpened();
         // 连接状态落 Redis：IM 服务据此决定下行帧推到哪些网关实例（多端时是集合）
-        registry.bindUser(userId);
+        // 连带登记设备：多端同步要靠它判断「是否所有端都已补过某个位置」
+        registry.bindUser(userId, deviceKeyOf(session));
         log.info("user {} connected on gateway {} via {} device={} devices={}", userId,
                 registry.localInstanceId(), session.transport(), session.deviceId(),
                 connectionManager.deviceCount(userId));
@@ -116,6 +123,16 @@ public class SessionLifecycle {
         if (ClientFrames.TYPE_SYNC.equals(type)) {
             // 上报消费水位 + 顺带补拉缺口。放在 send 之前处理：它不改消息流，只更新服务端视图。
             pullPending(session, watermarksOf(node));
+            return;
+        }
+        if (ClientFrames.TYPE_RECV.equals(type)) {
+            // 端到端 ACK：客户端说「我收到了这几条」。只记录水位，不回包也不改消息流。
+            acknowledge(userId, session, node);
+            return;
+        }
+        if (ClientFrames.TYPE_READ.equals(type)) {
+            // 已读上报：客户端说「我看到第 N 条了」。与 /conv/{id}/read 走同一套语义。
+            reportRead(userId, session, node);
             return;
         }
         if (type != null && !ClientFrames.TYPE_SEND.equals(type)) {
@@ -154,8 +171,11 @@ public class SessionLifecycle {
 
         MessageEnvelope envelope;
         try {
+            // contentType / attrs 原样透传：网关不解析媒体元数据，也不校验 url 是否可达——
+            // 那是接入方与对象存储之间的事，网关多懂一点就多一处要跟着协议演进的地方
             envelope = new MessageEnvelope(userId, to, body, clientMsgId,
-                    text(node, "conversationId"), text(node, "convType"), longValue(node, "clientTs"));
+                    text(node, "conversationId"), text(node, "convType"), longValue(node, "clientTs"),
+                    text(node, "contentType"), text(node, "attrs"));
         } catch (IllegalArgumentException e) {
             session.send(frames.error(clientMsgId, 400, e.getMessage()));
             return;
@@ -184,19 +204,23 @@ public class SessionLifecycle {
             }
         } catch (RuntimeException e) {
             metrics.ingressFailed("submit", e);
-            log.warn("submit message from {} failed: traceId={} err={}", userId, traceId, e.getMessage());
-            session.send(frames.error(envelope.clientMsgId(), CODE_UNAVAILABLE, "im service unavailable"));
+            // 状态码 + 堆栈都要：
+            //   · 「超时 / 实例不可用 / 服务端业务异常」在这里都是一句 RuntimeException，
+            //     只有 Status 能一眼分开（DEADLINE_EXCEEDED / UNAVAILABLE / INTERNAL）；
+            //   · 只打 getMessage() 时连是哪一层抛的都不知道。
+            Status status = Status.fromThrowable(e);
+            log.warn("submit message from {} failed: traceId={} status={} err={}",
+                    userId, traceId, status.getCode(), e.getMessage(), e);
+            session.send(frames.error(envelope.clientMsgId(), CODE_UNAVAILABLE,
+                    "im service unavailable (" + status.getCode() + ")"));
         }
     }
 
     /**
-     * 拉取离线/漫游缺口，逐帧推给客户端；同时把客户端上报的水位透传给 IM 服务。
-     *
-     * <p>补发和「登记水位」共用一次 RPC：两者都是「连接建立/客户端主动 sync」时的必然动作，
-     * 分成两个接口只会多一次往返，且容易出现「只调了补发、忘了登记水位」的漏调。
-     */
-    /**
      * 拉取并补发该设备的离线/漫游缺口，<b>全部写成功之后才回确认</b>。
+     *
+     * <p>补发和「登记水位」共用一次 RPC：两者都是「连接建立 / 客户端主动 sync」时的必然动作，
+     * 分成两个接口只多一次往返，且容易出现「只调了补发、忘了登记水位」的漏调。
      *
      * <p>这里是「离线补发至少一次」的关键一环：服务端 {@code pullPending} 只读不删，
      * 它返回的帧必须真的写进连接才算消费掉。所以顺序是
@@ -227,12 +251,22 @@ public class SessionLifecycle {
             PullPendingResponse pending = ingress.pullPending(request.build());
             boolean allSent = true;
             for (String frame : pending.getFramesList()) {
-                if (!connectionManager.send(userId, frame)) {
+                // 只推给发起补发的这条连接，不是扇出到该用户所有设备：
+                // 每台设备都有自己的补发游标，会各自拉一遍；扇出会让「手机上线」把同一批
+                // 离线消息同时砸给网页，重复一遍而且让各端的未读数一起跳。
+                if (!connectionManager.sendTo(userId, session, frame)) {
                     allSent = false;
                     break;
                 }
             }
             if (allSent) {
+                // 「我发出去了」由网关自证，与客户端的端到端 ACK（msg.recv → AckDelivered）
+                // 不是同一件事，别把这里当成后者的重复实现：
+                //   · 这里推进补发游标（im:offline:cursor / gcur，用于裁剪离线队列、群锚点退休）；
+                //   · ACK 写的是 delivered 水位（im:wm:{userId}:{deviceId}），用于消息状态与补发起点。
+                // 不能只留 ACK：客户端可能永远不回（进程被杀、冻结、关机），等它才清队列等于让
+                // 队列无限堆积、每次重连重发同一批；而且用户说「没收到」时，正是靠
+                // 「游标动了没 / 水位动了没」区分「网关没写出去」还是「客户端没收到」。
                 ackPending(ingress, userId, deviceId, pending);
             } else {
                 // 不 ack = 服务端游标不动，下次重连重发同一批。绝不「先确认再写」。
@@ -244,12 +278,18 @@ public class SessionLifecycle {
             }
         } catch (RuntimeException e) {
             metrics.ingressFailed("pull", e);
-            log.warn("pull pending for {} failed: {}", userId, e.getMessage());
+            // 与 submit 同一个口径：补发失败也带状态码，否则「补发不到」和「超时」分不开
+            log.warn("pull pending for {} failed: status={} err={}",
+                    userId, Status.fromThrowable(e).getCode(), e.getMessage(), e);
         }
     }
 
     /**
      * 把「这批帧已经写进连接」告诉 IM 服务，让它推进该设备的游标。
+     *
+     * <p><b>不是</b>端到端 ACK 的重复实现：这里只回收资源（补发游标 + 群锚点），
+     * 消息「是否真的送达」记在 {@link #acknowledge} 的 delivered 水位里。两者的分工与
+     * 「为什么不能合并」见调用点 {@link #pullPending}。
      *
      * <p>失败只记日志不回抛：确认丢了最坏就是下次重连重复补发（客户端按 seq 去重），
      * 把补发失败升级成连接层错误反而会伤害真正稀缺的东西。
@@ -270,6 +310,123 @@ public class SessionLifecycle {
             log.warn("[offline] 补发确认失败（下次重连会重发同一批，客户端按 seq 去重）user={} device={} err={}",
                     userId, deviceId, e.getMessage());
         }
+    }
+
+    /**
+     * 端到端 ACK：客户端说它收到了这些 seq，转给 IM 服务推进 delivered 水位。
+     *
+     * <p>三个刻意的选择：
+     * <ul>
+     *   <li><b>异步发出去，不占本连接的串行队列</b>。ACK 幂等且只前进，乱序没有副作用；
+     *       而它要走一次 gRPC，塞进串行队列会让「后面那条消息的受理」排在一次纯记录性调用后面。
+     *       每连接的串行保证是为了消息保序，不是为了一条日志级别的确认。</li>
+     *   <li><b>失败不回错误帧</b>。客户端不需要知道 ACK 丢了——它下次 {@code sync} 会重报水位，
+     *       而水位只按 max 推进，重复上报无害。为一次可恢复的丢失给客户端加一个错误分支，
+     *       只会让它写一堆没用的重试逻辑。</li>
+     *   <li><b>不推进补发游标</b>。补发游标由「网关写成功」驱动（{@link #ackPending}）；
+     *       等客户端 ACK 才清队列，客户端一被杀进程队列就永远不释放。</li>
+     * </ul>
+     */
+    private void acknowledge(String userId, ClientSession session, JsonNode node) {
+        List<DeliveredAck> acks = deliveredAcksOf(node);
+        if (acks.isEmpty()) {
+            return;
+        }
+        MessageIngress ingress = ingressProvider.getIfAvailable();
+        if (ingress == null) {
+            return;
+        }
+        String deviceId = deviceKeyOf(session);
+        Thread.ofVirtual().name("delivered-ack-", 0).start(() -> {
+            try {
+                ingress.ackDelivered(DeliveredAckRequest.newBuilder()
+                        .setUserId(userId)
+                        .setDeviceId(deviceId)
+                        .addAllAcks(acks)
+                        .build());
+            } catch (RuntimeException e) {
+                metrics.ingressFailed("recv", e);
+                log.debug("[delivered] ACK 上报失败（下次 sync 会重报水位）user={} acks={} err={}",
+                        userId, acks.size(), e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * 已读上报：{@code {"ver":1,"type":"msg.read","conversationId":"s:a:b","seq":12}}。
+     *
+     * <p>字段名一律用完整单词：这张协议是要被抓包、写进日志、贴进 issue 的，
+     * {@code c}/{@code s} 省下的字节抵不上一次「这是啥」的解释成本。
+     *
+     * <p>和 ACK 一样异步发出去、失败不回错误帧：已读位置是「下次上报会覆盖」的状态，
+     * 丢一次最多让发送方的气泡晚一点变成「已读」，不值得让客户端为它写重试。
+     */
+    private void reportRead(String userId, ClientSession session, JsonNode node) {
+        ReadReceipt receipt = readReceiptOf(node);
+        if (receipt == null) {
+            return;
+        }
+        MessageIngress ingress = ingressProvider.getIfAvailable();
+        if (ingress == null) {
+            return;
+        }
+        Thread.ofVirtual().name("read-receipt-", 0).start(() -> {
+            try {
+                ingress.markRead(MarkReadRequest.newBuilder()
+                        .setUserId(userId)
+                        .setConversationId(receipt.conversationId())
+                        .setSeq(receipt.seq())
+                        .build());
+            } catch (RuntimeException e) {
+                metrics.ingressFailed("read", e);
+                log.debug("[read] 已读上报失败（下次进入会话会重报）user={} conv={} err={}",
+                        userId, receipt.conversationId(), e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * 解析 {@code msg.read} 的定位信息：会话 + 已读到第几条。
+     *
+     * <p>抽成静态方法是为了能被单测直接覆盖：这两个字段名是客户端与网关之间的契约，
+     * 一旦有人改回简写（{@code c}/{@code s}）就会「已读永远不生效」而不报错。
+     *
+     * @return 字段缺失/非法时返回 {@code null}——脏帧丢掉即可，不该影响连接的其余部分
+     */
+    static ReadReceipt readReceiptOf(JsonNode node) {
+        String conversationId = text(node, "conversationId");
+        long seq = longValue(node, "seq");
+        if (conversationId == null || conversationId.isBlank() || seq <= 0) {
+            return null;
+        }
+        return new ReadReceipt(conversationId, seq);
+    }
+
+    /** 一条已读上报的定位信息 */
+    record ReadReceipt(String conversationId, long seq) {
+    }
+
+    /**
+     * 解析 {@code {"acks":[{"conversationId":"s:a:b","seq":5}]}}。
+     *
+     * <p>只做「取出会话与序号」这一层最小解析，帧内容本身仍不碰——网关不理解业务，
+     * 但 ACK 的定位信息本来就在协议层，不解析就没法路由。
+     */
+    static List<DeliveredAck> deliveredAcksOf(JsonNode node) {
+        JsonNode acks = node.get("acks");
+        if (acks == null || !acks.isArray() || acks.isEmpty()) {
+            return List.of();
+        }
+        List<DeliveredAck> result = new ArrayList<>(acks.size());
+        for (JsonNode item : acks) {
+            String conversationId = text(item, "conversationId");
+            long seq = longValue(item, "seq");
+            if (conversationId == null || conversationId.isBlank() || seq <= 0) {
+                continue;
+            }
+            result.add(DeliveredAck.newBuilder().setConversationId(conversationId).setSeq(seq).build());
+        }
+        return result;
     }
 
     /**

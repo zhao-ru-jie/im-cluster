@@ -12,6 +12,11 @@ import org.springframework.stereotype.Component;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -53,15 +58,19 @@ public class ClientWatermarkStore {
      * <p>为什么必须只前进：客户端重连时会上报一批水位，网络乱序 + 多设备并发会让较小的值晚到；
      * 允许回退会让「已读位置」来回跳，未读数跟着抖。
      *
+     * <p>返回值是「这次真的前进了吗」（1/0）：重复上报（sync 与增量 ACK 重叠）是常态，
+     * 下游据此决定要不要给对端推一条 {@code msg.state} 已送达回执——没前进就没必要推。
+     *
      * <pre>KEYS[1] = im:wm:{userId}:{deviceId}；ARGV[1] = conversationId；ARGV[2] = seq；ARGV[3] = TTL 毫秒</pre>
      */
     private static final byte[] ADVANCE_WATERMARK = """
             local cur = tonumber(redis.call('HGET', KEYS[1], ARGV[1]) or '0')
+            redis.call('PEXPIRE', KEYS[1], ARGV[3])
             if tonumber(ARGV[2]) > cur then
                 redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+                return 1
             end
-            redis.call('PEXPIRE', KEYS[1], ARGV[3])
-            return 1
+            return 0
             """.getBytes(StandardCharsets.UTF_8);
 
     /** 水位只增不减：同一会话多次上报取最大值（进程内快路径） */
@@ -106,20 +115,30 @@ public class ClientWatermarkStore {
      *
      * <p>Redis 写失败只记 warn 不抛：水位是「兜底增益」而不是关键路径，
      * 让一次 Redis 抖动把整次 {@code pullPending} 打挂，等于用次要信息换掉了主流程。
+     *
+     * @return 本次<b>真的前进了</b>的会话（conversationId → 新水位）。
+     *         重复上报（sync 与增量 ACK 重叠、多端各报一次）不会出现在结果里——
+     *         端到端回执只应该在状态真的变化时推给对端，否则每条消息都会放大成 N 条回执。
      */
-    public void observe(String userId, String deviceId, Map<String, Long> reported) {
+    public Map<String, Long> observe(String userId, String deviceId, Map<String, Long> reported) {
         observe(reported);
         if (redis == null || userId == null || userId.isBlank() || reported == null || reported.isEmpty()) {
-            return;
+            return Map.of();
+        }
+        List<Map.Entry<String, Long>> valid = new ArrayList<>(reported.size());
+        for (Map.Entry<String, Long> entry : reported.entrySet()) {
+            if (!invalid(entry.getKey(), entry.getValue())) {
+                valid.add(entry);
+            }
+        }
+        if (valid.isEmpty()) {
+            return Map.of();
         }
         String key = keyOf(userId, deviceId);
         byte[] ttlMillis = String.valueOf(ttl.toMillis()).getBytes(StandardCharsets.UTF_8);
         try {
-            redis.executePipelined((RedisCallback<Object>) connection -> {
-                for (Map.Entry<String, Long> entry : reported.entrySet()) {
-                    if (invalid(entry.getKey(), entry.getValue())) {
-                        continue;
-                    }
+            List<Object> results = redis.executePipelined((RedisCallback<Object>) connection -> {
+                for (Map.Entry<String, Long> entry : valid) {
                     connection.scriptingCommands().eval(ADVANCE_WATERMARK, ReturnType.INTEGER, 1,
                             key.getBytes(StandardCharsets.UTF_8),
                             entry.getKey().getBytes(StandardCharsets.UTF_8),
@@ -128,9 +147,18 @@ public class ClientWatermarkStore {
                 }
                 return null;
             });
+            Map<String, Long> advanced = new LinkedHashMap<>();
+            for (int i = 0; i < valid.size() && i < results.size(); i++) {
+                // pipeline 里的脚本返回值是 1/0；只收集前进的那些（回执只在这些会话上推）
+                if (results.get(i) instanceof Number number && number.longValue() > 0) {
+                    advanced.put(valid.get(i).getKey(), valid.get(i).getValue());
+                }
+            }
+            return advanced;
         } catch (RuntimeException e) {
             log.warn("[watermark] 持久化客户端水位失败（不影响补发与发号）user={} device={} err={}",
                     userId, deviceId, e.getMessage());
+            return Map.of();
         }
     }
 
@@ -155,6 +183,41 @@ public class ClientWatermarkStore {
         }
     }
 
+    /**
+     * 批量读该设备已确认的水位（只查给定的会话）。
+     *
+     * <p>补发起点要用它：客户端已经 ACK 过的 seq 不该再补一遍。之所以只查给定的会话而不是
+     * 整张 Hash——一个长期用户可能有几百个会话，补发一次只关心其中二十几个（单轮处理上限）。
+     *
+     * @return conversationId → 已确认到的 seq；没确认过的不会出现在结果里
+     */
+    public Map<String, Long> deliveredSeqs(String userId, String deviceId, Collection<String> conversationIds) {
+        if (redis == null || userId == null || conversationIds == null || conversationIds.isEmpty()) {
+            return Map.of();
+        }
+        List<String> ids = List.copyOf(new LinkedHashSet<>(conversationIds));
+        byte[] key = keyOf(userId, deviceId).getBytes(StandardCharsets.UTF_8);
+        List<Object> raw = redis.executePipelined((RedisCallback<Object>) connection -> {
+            for (String conversationId : ids) {
+                connection.hashCommands().hGet(key, conversationId.getBytes(StandardCharsets.UTF_8));
+            }
+            return null;
+        });
+        Map<String, Long> result = new LinkedHashMap<>();
+        for (int i = 0; i < ids.size(); i++) {
+            Object value = raw.get(i);
+            if (value == null) {
+                continue;
+            }
+            try {
+                result.put(ids.get(i), Long.parseLong(String.valueOf(value).trim()));
+            } catch (NumberFormatException ignored) {
+                // 脏值当作「没确认过」，宁可多补一遍也不要把起点抬错
+            }
+        }
+        return result;
+    }
+
     /** @return 该会话已知的客户端水位（进程内）；{@code 0} = 从未上报过 */
     public long maxSeqOf(String conversationId) {
         return watermarks.getOrDefault(conversationId, 0L);
@@ -165,8 +228,9 @@ public class ClientWatermarkStore {
         return watermarks.size();
     }
 
-    private static String keyOf(String userId, String deviceId) {
-        return RedisKeys.CLIENT_WATERMARK_PREFIX + "{" + userId + "}:" + OfflineMessageStore.normalizeDevice(deviceId);
+    /** key 的单一来源：测试清理也用它构造，避免 key 格式改了以后测试静默失效 */
+    public static String keyOf(String userId, String deviceId) {
+        return RedisKeys.userWatermark(userId, OfflineMessageStore.normalizeDevice(deviceId));
     }
 
     private static boolean invalid(String conversationId, Long seq) {

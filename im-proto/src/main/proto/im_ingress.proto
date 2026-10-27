@@ -42,6 +42,36 @@ service MessageIngress {
   // 逐帧确认会把 RPC 次数放大到帧数级别；而客户端本身已有「按 seq 去重」的硬约定，
   // 批量确认最多导致重复补发，不会丢。
   rpc AckPending(AckPendingRequest) returns (AckPendingResponse);
+
+  // 客户端收到下行帧之后的**端到端确认**（delivered 的真正来源）。
+  //
+  // 在此之前只有两个"看起来像确认"的东西，但它们都不是端到端：
+  //   * AckPending —— 网关 writeAndFlush 成功就确认了。那只代表「进了 socket 缓冲区」，
+  //     客户端可能早就断网了；
+  //   * PullPending 里的 watermarks —— 客户端主动 sync 时才上报，是懒的、会话级的对账，
+  //     不是「刚收到这条就告诉你」。
+  //
+  // 这个接口补的就是那一环：客户端收到 msg.push 之后回 msg.recv，网关原样转上来，
+  // 服务端把该设备的 delivered 水位推进到这些 seq。水位落 Redis（im:wm:{userId}:{deviceId}），
+  // 于是「用户说没收到」这类问题第一次有了可以查的证据。
+  //
+  // 语义与 sync 的水位一致：报「我见到了 seq=N」，不是「1..N 我全收到了」。
+  // 中间的洞由客户端自己发现（看到 seq 跳号就去拉历史），服务端只按会话取 max。
+  rpc AckDelivered(DeliveredAckRequest) returns (DeliveredAckResponse);
+
+  // 拉取用户的会话列表（按最后一条消息时间倒序），每条带未读数。
+  //
+  // 未读数是算出来的：unread = last_seq - read_seq。存计数（每条消息给每个成员 INCR）
+  // 在群聊里是「消息数 × 成员数」的写放大，而且一次写失败就永久和真实值不一致；
+  // 两个游标相减天然自愈——任何一端漏写，下次读到的都是正确的差值。
+  rpc ListConversations(ListConversationsRequest) returns (ListConversationsResponse);
+
+  // 上报已读位置（进入会话、看到新消息时调用）。
+  //
+  // 已读是**用户级**的（一个人只有一个「我看到哪了」），所以这里不需要 device_id：
+  // 手机读完，网页的未读角标下次拉列表就是 0。这与补发水位（per-device 的传输语义）
+  // 是两件不同的事，不要合并。
+  rpc MarkRead(MarkReadRequest) returns (MarkReadResponse);
 }
 
 message SubmitMessageRequest {
@@ -55,6 +85,16 @@ message SubmitMessageRequest {
   string payload = 8;         // 业务消息体，网关不解析
   int64 client_ts = 9;        // 客户端发送时间（毫秒），仅作参考
   string gateway_instance = 10; // 上报方网关实例 ID，回推时优先走该实例
+
+  // 富媒体：消息类型 + 媒体元数据。
+  //
+  // 类型单独成字段（而不是塞进 payload 里的某个键）：会话列表要显示「[图片]」，
+  // 那需要在<b>不反序列化 body</b> 的前提下拿到类型，否则拉一页会话列表就得解析几十条历史。
+  //
+  // attrs 是 JSON 串（url/size/name/duration/width/height/thumb），网关与 IM 服务都不解析：
+  // 媒体元数据的演进速度远快于消息通道，逐字段建模会让每加一个属性都动一次协议和表结构。
+  string content_type = 11;   // TEXT（缺省）/ IMAGE / FILE / VOICE / VIDEO / CUSTOM
+  string attrs = 12;          // 媒体元数据 JSON，纯文本为空
 }
 
 message SubmitMessageResponse {
@@ -121,4 +161,58 @@ message AckPendingResponse {
   int32 code = 1;            // 0=已推进；其它值仅用于观测（确认失败不影响正确性，最多重复补发）
   string message = 2;
   int64 single_cursor = 3;   // 推进后的单聊游标，便于网关日志对账
+}
+
+// 客户端确认收到的一条下行消息（只保留「哪个会话、见到第几号」）
+message DeliveredAck {
+  string conversation_id = 1;
+  int64 seq = 2;
+}
+
+message DeliveredAckRequest {
+  string user_id = 1;
+  string device_id = 2;          // delivered 水位是设备级的：手机收到不代表网页收到
+  repeated DeliveredAck acks = 3; // 批量，客户端攒几条一起发（逐条 ACK 会把 RPC 次数打爆）
+}
+
+message DeliveredAckResponse {
+  int32 code = 1;
+  string message = 2;
+  int32 accepted = 3;            // 本次实际推进的会话数（同会话多条会被 max 压成一条）
+}
+
+message ListConversationsRequest {
+  string user_id = 1;
+  int32 limit = 2;           // 每页条数，0 表示默认值（50）
+}
+
+message ConversationSummary {
+  string conversation_id = 1;
+  string type = 2;           // SINGLE / GROUP
+  int64 last_seq = 3;        // 会话当前最大 seq（0 = 还没有消息）
+  int64 last_time = 4;       // 最后一条消息的服务端时间
+  string last_from = 5;      // 最后一条消息的发送方（列表里显示「谁说的」）
+  string last_digest = 6;    // 最后一条消息的摘要（截断，避免会话列表拖出大 payload）
+  int64 read_seq = 7;        // 该用户已读到哪（用户级，多端共用）
+  int64 unread = 8;          // last_seq - read_seq，客户端自行按「99+」截断显示
+  string last_msg_id = 9;
+  bool pinned = 10;          // 置顶：服务端只返回标记，排序由服务端做（置顶优先）
+  bool muted = 11;           // 免打扰：未读照算，只是客户端不响铃/不打角标
+}
+
+message ListConversationsResponse {
+  repeated ConversationSummary conversations = 1;
+}
+
+message MarkReadRequest {
+  string user_id = 1;
+  string conversation_id = 2;
+  int64 seq = 3;             // 读到哪个 seq（只前进，且服务端会 cap 到会话当前 last_seq）
+}
+
+message MarkReadResponse {
+  int32 code = 1;
+  string message = 2;
+  int64 read_seq = 3;        // 推进后的已读位置
+  int64 unread = 4;          // 推进后的未读数
 }
