@@ -2,12 +2,15 @@ package com.github.im.storage.jdbc;
 
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.github.im.server.group.GroupMemberRepository;
+import com.github.im.server.group.GroupRole;
 import com.github.im.storage.jdbc.entity.GroupMemberEntity;
 import com.github.im.storage.jdbc.mapper.GroupMemberMapper;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * MySQL 版群成员存储（{@code im.storage=jdbc}），基于 MyBatis-Plus。
@@ -54,6 +57,7 @@ public class JdbcGroupMemberRepository implements GroupMemberRepository {
         }
     }
 
+    /** 删行即同时清掉角色与禁言（三者本来就是同一行，这正是 JDBC 形态的便利） */
     @Override
     public void removeMember(String groupId, String userId) {
         mapper.delete(Wrappers.<GroupMemberEntity>lambdaQuery()
@@ -71,5 +75,102 @@ public class JdbcGroupMemberRepository implements GroupMemberRepository {
             members.add(row.getUserId());
         }
         return members;
+    }
+
+    /** O(1)：走 {@code uk_group_member} 唯一键的存在性查询，不拉全量成员 */
+    @Override
+    public boolean isMember(String groupId, String userId) {
+        if (groupId == null || userId == null) {
+            return false;
+        }
+        Long count = mapper.selectCount(Wrappers.<GroupMemberEntity>lambdaQuery()
+                .eq(GroupMemberEntity::getGroupId, groupId)
+                .eq(GroupMemberEntity::getUserId, userId));
+        return count != null && count > 0;
+    }
+
+    /**
+     * 反查「某用户加入了哪些群」，走 {@code idx_group_member_user (user_id)}。
+     *
+     * <p>这正是 JDBC 形态比 Redis 形态强的地方：Redis 版必须额外维护
+     * {@code im:group:user:{userId}} 这个反向 Set 才能做到同一件事。
+     */
+    @Override
+    public GroupRole roleOf(String groupId, String userId) {
+        if (groupId == null || userId == null) {
+            return null;
+        }
+        List<GroupMemberEntity> rows = mapper.selectList(Wrappers.<GroupMemberEntity>lambdaQuery()
+                .select(GroupMemberEntity::getRole)
+                .eq(GroupMemberEntity::getGroupId, groupId)
+                .eq(GroupMemberEntity::getUserId, userId)
+                .last("LIMIT 1"));
+        return rows.isEmpty() ? null : GroupRole.parse(rows.getFirst().getRole());
+    }
+
+    @Override
+    public void setRole(String groupId, String userId, GroupRole role) {
+        if (groupId == null || userId == null || role == null) {
+            return;
+        }
+        GroupMemberEntity patch = new GroupMemberEntity();
+        patch.setRole(role.name());
+        mapper.update(patch, Wrappers.<GroupMemberEntity>lambdaUpdate()
+                .eq(GroupMemberEntity::getGroupId, groupId)
+                .eq(GroupMemberEntity::getUserId, userId));
+    }
+
+    @Override
+    public Map<String, GroupRole> rolesOf(String groupId) {
+        List<GroupMemberEntity> rows = mapper.selectList(Wrappers.<GroupMemberEntity>lambdaQuery()
+                .select(GroupMemberEntity::getUserId, GroupMemberEntity::getRole)
+                .eq(GroupMemberEntity::getGroupId, groupId));
+        Map<String, GroupRole> roles = new LinkedHashMap<>(rows.size());
+        for (GroupMemberEntity row : rows) {
+            roles.put(row.getUserId(), GroupRole.parse(row.getRole()));
+        }
+        return roles;
+    }
+
+    @Override
+    public long mutedUntil(String groupId, String userId) {
+        if (groupId == null || userId == null) {
+            return 0L;
+        }
+        List<GroupMemberEntity> rows = mapper.selectList(Wrappers.<GroupMemberEntity>lambdaQuery()
+                .select(GroupMemberEntity::getMuteUntil)
+                .eq(GroupMemberEntity::getGroupId, groupId)
+                .eq(GroupMemberEntity::getUserId, userId)
+                .last("LIMIT 1"));
+        if (rows.isEmpty() || rows.getFirst().getMuteUntil() == null) {
+            return 0L;
+        }
+        long until = rows.getFirst().getMuteUntil();
+        // 过期的禁言按「未禁言」返回（列上留着不影响判定，由下一次 mute 覆盖）
+        return until > System.currentTimeMillis() ? until : 0L;
+    }
+
+    @Override
+    public void mute(String groupId, String userId, long untilMillis) {
+        if (groupId == null || userId == null) {
+            return;
+        }
+        GroupMemberEntity patch = new GroupMemberEntity();
+        patch.setMuteUntil(Math.max(untilMillis, 0L));
+        mapper.update(patch, Wrappers.<GroupMemberEntity>lambdaUpdate()
+                .eq(GroupMemberEntity::getGroupId, groupId)
+                .eq(GroupMemberEntity::getUserId, userId));
+    }
+
+    @Override
+    public List<String> groupsOf(String userId) {
+        List<GroupMemberEntity> rows = mapper.selectList(Wrappers.<GroupMemberEntity>lambdaQuery()
+                .select(GroupMemberEntity::getGroupId)
+                .eq(GroupMemberEntity::getUserId, userId));
+        List<String> groups = new ArrayList<>(rows.size());
+        for (GroupMemberEntity row : rows) {
+            groups.add(row.getGroupId());
+        }
+        return groups;
     }
 }

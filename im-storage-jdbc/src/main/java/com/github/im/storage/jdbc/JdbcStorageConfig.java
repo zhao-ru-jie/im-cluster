@@ -2,9 +2,15 @@ package com.github.im.storage.jdbc;
 
 import com.baomidou.mybatisplus.autoconfigure.ConfigurationCustomizer;
 import com.github.im.server.group.GroupMemberRepository;
+import com.github.im.server.group.GroupRepository;
+import com.github.im.server.relation.RelationRepository;
+import com.github.im.server.shard.ShardRouter;
 import com.github.im.server.message.MessageRepository;
 import com.github.im.storage.jdbc.mapper.GroupMemberMapper;
+import com.github.im.storage.jdbc.mapper.GroupMapper;
+import com.github.im.storage.jdbc.mapper.MessageDeleteMapper;
 import com.github.im.storage.jdbc.mapper.MessageMapper;
+import com.github.im.storage.jdbc.mapper.RelationMapper;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import org.apache.ibatis.session.SqlSessionFactory;
@@ -67,12 +73,18 @@ public class JdbcStorageConfig {
     public HikariDataSource imDataSource(@Value("${im.db.url}") String url,
                                          @Value("${im.db.username:root}") String username,
                                          @Value("${im.db.password:}") String password,
-                                         @Value("${im.db.pool-size:20}") int poolSize) {
+                                         @Value("${im.db.pool-size:200}") int poolSize) {
         HikariConfig config = new HikariConfig();
         config.setJdbcUrl(url);
         config.setUsername(username);
         config.setPassword(password);
         config.setMaximumPoolSize(poolSize);
+        config.setMinimumIdle(20);
+        config.setConnectionTimeout(30000);
+        config.setIdleTimeout(600000);
+        config.setMaxLifetime(1800000);
+        config.setKeepaliveTime(30000);
+        config.setValidationTimeout(5000);
         config.setPoolName("im-db");
         // 启动时就校验连通性：DB 配错要立刻暴露，而不是等第一条消息
         config.setInitializationFailTimeout(5_000);
@@ -92,8 +104,10 @@ public class JdbcStorageConfig {
 
     @Bean
     public MessageRepository messageRepository(MessageMapper messageMapper,
+                                               MessageDeleteMapper messageDeleteMapper,
                                                SqlSessionFactory sqlSessionFactory,
                                                DataSource dataSource,
+                                               ShardRouter shardRouter,
                                                @Value("${im.db.init-schema:true}") boolean initSchema,
                                                @Value("${im.db.batch-enabled:true}") boolean batchEnabled) {
         if (initSchema) {
@@ -101,11 +115,27 @@ public class JdbcStorageConfig {
             populator.execute(dataSource);
             log.info("[storage] 已执行 db/schema.sql（im.db.init-schema=false 可关闭）");
         }
-        return new JdbcMessageRepository(messageMapper, sqlSessionFactory, batchEnabled);
+        return new JdbcMessageRepository(messageMapper, messageDeleteMapper, sqlSessionFactory, batchEnabled,
+                shardRouter);
     }
 
     @Bean
     public GroupMemberRepository groupMemberRepository(GroupMemberMapper groupMemberMapper) {
         return new JdbcGroupMemberRepository(groupMemberMapper);
+    }
+
+    /** 群实体（群资料 + 群级开关）；Redis 形态下由 {@code RedisGroupRepository} 提供 */
+    @Bean
+    public GroupRepository groupRepository(GroupMapper groupMapper) {
+        return new JdbcGroupRepository(groupMapper);
+    }
+
+    /**
+     * 关系链（好友 / 黑名单）。Redis 形态下由 {@code RedisRelationRepository} 提供，
+     * 两者都实现同一端口，业务侧（{@code MessageAcl}）不感知介质。
+     */
+    @Bean
+    public RelationRepository relationRepository(RelationMapper relationMapper) {
+        return new JdbcRelationRepository(relationMapper);
     }
 }
