@@ -51,6 +51,10 @@
         im-benchmark    压测端（可执行 jar）：作为「真实客户端」用大量 WebSocket 长连接
                     压网关的建连 / 心跳 / 上行受理与下行推送，只依赖 Netty + Jackson，
                     刻意不依赖任何业务模块，避免压测机替被测代码背 GC 与类加载的锅。
+        im-client       客户端 SDK（库）：App / 桌面端接入用。走 TCP 上行（首帧 connect 认证），
+                    负责断线指数退避重连、本地消息表（待发重投 + 已收去重 + 水位恢复）、
+                    心跳应答与 msg.recv / msg.read 上报。只依赖 Jackson，
+                    既不含 Netty 也不含 Spring：SDK 的依赖会原样变成宿主的依赖。
 
       依赖方向（编译期单向，禁止反向）：
         im-app           -> im-gateway / im-server / im-rpc -> im-proto
@@ -68,6 +72,7 @@
         <module>im-gateway-boot</module>
         <module>im-server-boot</module>
         <module>im-benchmark</module>
+        <module>im-client</module>
     </modules>
 
     <dependencyManagement>
@@ -95,6 +100,11 @@
             <dependency>
                 <groupId>com.github</groupId>
                 <artifactId>im-storage-jdbc</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.github</groupId>
+                <artifactId>im-client</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
