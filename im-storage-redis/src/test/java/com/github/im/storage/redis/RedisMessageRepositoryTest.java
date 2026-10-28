@@ -1,5 +1,6 @@
-package com.github.im.server.message;
+package com.github.im.storage.redis;
 
+import com.github.im.server.message.StoredMessage;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -13,9 +14,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 /**
  * {@link RedisMessageRepository#maxSeq} 的回归测试。
  *
- * <p>要点：它是 {@link SeqAllocator} 的下界来源，<b>不能假设 List 尾部就是最大 seq</b>。
- * 多实例下 seq 在 Redis 里串行发号，但 {@code append} 的到达顺序可能不同（实例 A 拿到 5、
- * 实例 B 拿到 6，B 先落库），尾部会是 5。取错会让下界偏小、削弱防回绕保护。
+ * <p>要点：它是 im-server 里 seq 发号器（{@code SeqAllocator}）的下界来源，<b>不能假设 List 尾部
+ * 就是最大 seq</b>。多实例下 seq 在 Redis 里串行发号，但 {@code append} 的到达顺序可能不同
+ * （实例 A 拿到 5、实例 B 拿到 6，B 先落库），尾部会是 5。取错会让下界偏小、削弱防回绕保护。
+ *
+ * <p>随实现一起从 im-server 迁入本模块：介质相关的行为由介质模块自己守。
  */
 class RedisMessageRepositoryTest {
 

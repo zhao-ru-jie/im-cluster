@@ -8,8 +8,8 @@ import com.github.im.server.conversation.ConversationStore;
 import com.github.im.server.group.GroupMemberRepository;
 import com.github.im.server.group.GroupService;
 import com.github.im.server.metrics.MessageMetrics;
+import com.github.im.server.relation.InMemoryRelationRepository;
 import com.github.im.server.relation.MessageAcl;
-import com.github.im.server.relation.RedisRelationRepository;
 import com.github.im.server.relation.RelationRepository;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -60,6 +60,8 @@ class MessageAclTest {
     private final AtomicLong seq = new AtomicLong(0);
     private final List<String> userIds = new ArrayList<>();
     private final List<String> conversationIds = new ArrayList<>();
+    /** 每次 {@code service()} 都会重建 MessageService，关系链必须是同一个实例，否则刚加的好友会“丢” */
+    private RelationRepository relations;
 
     @BeforeEach
     void stubSeq() {
@@ -172,8 +174,16 @@ class MessageAclTest {
 
     // ==== 辅助 ====
 
+    /**
+     * 关系链用内存替身：Redis 实现已搬到 im-storage-redis，im-server 的测试不能反向依赖它
+     * （会构成 reactor 环）。本类要验的是「准入判定该拦谁」，与介质无关；
+     * 介质行为（双向写、pipeline、单向黑名单）由 im-storage-redis 侧守。
+     */
     private RelationRepository relations() {
-        return new RedisRelationRepository(TestRedis.template());
+        if (relations == null) {
+            relations = new InMemoryRelationRepository();
+        }
+        return relations;
     }
 
     private MessageService service(String mode, boolean requireFriend) {

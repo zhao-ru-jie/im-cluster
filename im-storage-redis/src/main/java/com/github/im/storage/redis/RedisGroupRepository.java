@@ -1,16 +1,16 @@
-package com.github.im.server.group;
+package com.github.im.storage.redis;
 
 import com.github.im.contract.RedisKeys;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import com.github.im.server.group.GroupInfo;
+import com.github.im.server.group.GroupRepository;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.stereotype.Component;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 
 /**
- * Redis 版群实体存储（{@code im.storage=redis}，默认）。
+ * Redis 版群实体存储（{@code im.storage=redis}，缺省形态）。
  *
  * <pre>im:group:{groupId}:info   Hash，群资料</pre>
  *
@@ -18,11 +18,12 @@ import java.util.Optional;
  * 都是<b>改一两个字段</b>，HSET 单字段不需要「读-改-写」整对象，
  * 并发改名与改公告不会互相覆盖。
  *
+ * <p>生产形态用 {@code im.storage=jdbc} 切到 {@code im_group} 表
+ * （{@code com.github.im.storage.jdbc.JdbcGroupRepository}）。
+ *
  * @author zhaorujie
  * @since 1.0.0
  */
-@Component
-@ConditionalOnProperty(name = "im.storage", havingValue = "redis", matchIfMissing = true)
 public class RedisGroupRepository implements GroupRepository {
 
     private static final String FIELD_NAME = "name";

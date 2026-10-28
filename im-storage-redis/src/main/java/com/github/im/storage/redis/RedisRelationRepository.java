@@ -1,12 +1,11 @@
-package com.github.im.server.relation;
+package com.github.im.storage.redis;
 
 import com.github.im.contract.RedisKeys;
+import com.github.im.server.relation.RelationRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
 import java.util.ArrayList;
@@ -16,7 +15,7 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * 关系链的 Redis 实现（默认形态：{@code im.storage=redis}）。
+ * 关系链的 Redis 实现（{@code im.storage=redis}，缺省形态）。
  *
  * <pre>
  * im:rel:friend:{userId}   Set，好友
@@ -32,11 +31,12 @@ import java.util.Set;
  * pipeline 不保证原子，但这个操作的失败后果只是「单向关系」，重试即收敛——
  * 为它引入分布式锁，代价远大于收益。
  *
+ * <p>生产形态用 {@code im.storage=jdbc} 切到 {@code im_relation} 表
+ * （{@code com.github.im.storage.jdbc.JdbcRelationRepository}）。
+ *
  * @author zhaorujie
  * @since 1.0.0
  */
-@Component
-@ConditionalOnProperty(name = "im.storage", havingValue = "redis", matchIfMissing = true)
 public class RedisRelationRepository implements RelationRepository {
 
     private static final Logger log = LoggerFactory.getLogger(RedisRelationRepository.class);
@@ -78,7 +78,6 @@ public class RedisRelationRepository implements RelationRepository {
         if (targets.isEmpty()) {
             return;
         }
-        String[] ids = targets.toArray(String[]::new);
         try {
             // 两次 SADD：跨 slot 不能进一个脚本，理由见类注释
             redis.executePipelined((RedisCallback<Object>) connection -> {

@@ -1,10 +1,10 @@
-package com.github.im.server.message;
+package com.github.im.storage.redis;
 
 import com.github.im.contract.RedisKeys;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import com.github.im.server.message.MessageRepository;
+import com.github.im.server.message.StoredMessage;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.stereotype.Component;
 import tools.jackson.databind.ObjectMapper;
 
 import java.nio.charset.StandardCharsets;
@@ -16,19 +16,23 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * Redis 版消息存储（默认实现）：{@code im:conv:msgs:{conversationId}} 存 {@link StoredMessage} 的 JSON。
+ * Redis 版消息存储（{@code im.storage=redis}，缺省形态）：
+ * {@code im:conv:msgs:{conversationId}} 存 {@link StoredMessage} 的 JSON。
  *
- * <pre>im:conv:msgs:{conversationId}   List，右进左出，只保留最近 N 条</pre>
+ * <pre>im:conv:msgs:{conversationId}   List，右进左出，只保留最近 N 条
+ * im:conv:recalled:{conversationId}  Set，已撤回的 seq
+ * im:user:deleted:{userId}:{conv}    Set，该用户在这个会话里本地删掉的 seq</pre>
  *
- * <p>定位：本地开发 / 联调 / 小规模。生产用 {@code com.github.im.storage.jdbc.JdbcMessageRepository}
- * （`im.storage=jdbc`，位于 im-storage-jdbc 模块）——
- * Redis List 无法做按时间分区、无法跨会话检索、容量受内存限制。
+ * <p>定位：本地开发 / 联调 / 小规模。生产用
+ * {@code com.github.im.storage.jdbc.JdbcMessageRepository}（{@code im.storage=jdbc}，位于
+ * im-storage-jdbc 模块）——Redis List 无法做按时间分区、无法跨会话检索、容量受内存限制。
+ *
+ * <p>放在 im-storage-redis 而不是 im-server：与 im-storage-jdbc 对称，介质相关的代码
+ * （Redis 键结构、List/Set 语义、pipeline 用法）不进入业务模块；切换只改 {@code im.storage}。
  *
  * @author zhaorujie
  * @since 1.0.0
  */
-@Component
-@ConditionalOnProperty(name = "im.storage", havingValue = "redis", matchIfMissing = true)
 public class RedisMessageRepository implements MessageRepository {
 
     /** 单会话保留条数上限，防止联调阶段 Redis 无限膨胀 */

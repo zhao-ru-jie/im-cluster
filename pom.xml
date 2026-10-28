@@ -35,9 +35,10 @@
                     自身不含任何消息持久化与业务逻辑。
         im-server   IM 服务（库）：消息存储、会话管理、消息路由、业务逻辑。
                     自身不感知 WebSocket / 连接 / 设备通道。
+        im-storage-redis 消息存储的 Redis 实现（im.storage=redis，或缺省不配时生效）。
         im-storage-jdbc  消息存储的 MySQL 实现 + DDL（im.storage=jdbc 时生效）。
-                    只依赖 im-server 的存储端口 MessageRepository，反向不依赖；
-                    默认 Redis 实现留在 im-server 内，两种形态同一份 jar 按配置切换。
+                    两者都只依赖 im-server 的存储端口 MessageRepository，反向不依赖；
+                    im-server 自身不含任何存储实现，部署入口按 im.storage 选一个。
         im-rpc      gRPC 适配层（客户端侧）：RemoteMessageIngress（网关→IM）、
                     RemoteGatewayPushPort（IM→网关）、在线路由只读、channel 复用。
                     只被「部署入口」依赖，业务模块不依赖它（保持业务无传输细节）。
@@ -60,13 +61,16 @@
         im-app           -> im-gateway / im-server / im-rpc -> im-proto
         im-gateway-boot  -> im-gateway / im-rpc             -> im-proto
         im-server-boot   -> im-server  / im-rpc             -> im-proto
-        im-gateway 与 im-server 互不依赖；业务模块不依赖 im-rpc。
+        im-storage-redis -> im-server                       -> im-proto
+        im-storage-jdbc  -> im-server                       -> im-proto
+        im-gateway 与 im-server 互不依赖；业务模块不依赖 im-rpc；两个 storage 模块之间互不依赖。
     -->
     <modules>
         <module>im-proto</module>
         <module>im-rpc</module>
         <module>im-gateway</module>
         <module>im-server</module>
+        <module>im-storage-redis</module>
         <module>im-storage-jdbc</module>
         <module>im-app</module>
         <module>im-gateway-boot</module>
@@ -95,6 +99,11 @@
             <dependency>
                 <groupId>com.github</groupId>
                 <artifactId>im-server</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.github</groupId>
+                <artifactId>im-storage-redis</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>

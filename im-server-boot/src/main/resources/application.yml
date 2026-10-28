@@ -1,6 +1,15 @@
 spring:
   application:
     name: im-server
+  # im-storage-jdbc 把 spring-boot-starter-jdbc 带进 classpath，而 Boot 的 DataSourceAutoConfiguration
+  # 只看「classpath 上有 DataSource + HikariCP、容器里没有 DataSource Bean」就去建连接池——
+  # 于是 im.storage=redis（默认）时也会因为没有任何 DSN 而启动失败：
+  # 「Failed to determine a suitable driver class」。两个存储形态的装配本来就由我们自己掌控：
+  # jdbc 的连接池在 JdbcStorageConfig 里显式创建（那种情形下该自动装配本来就会因
+  # @ConditionalOnMissingBean 退让），所以这里一次性排除，redis 形态才是真的零数据库依赖。
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration
   threads:
     virtual:
       enabled: true
@@ -47,7 +56,7 @@ im:
   # —— 消息存储形态 ——
   #   redis（默认）: Redis List，零外部数据库依赖，本地开发/联调
   #   jdbc         : MySQL（im-storage-jdbc 模块），生产形态；需要配下面 im.db.*
-  storage: ${IM_STORAGE:jdbc}
+  storage: ${IM_STORAGE:redis}
   db:
     url: ${IM_DB_URL:jdbc:mysql://127.0.0.1:3306/im-cluster?useSSL=true&useUnicode=true&characterEncoding=UTF-8&autoReconnect=true&failOverReadOnly=false}
     username: ${IM_DB_USERNAME:root}

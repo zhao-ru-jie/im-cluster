@@ -23,7 +23,12 @@
             <groupId>com.github</groupId>
             <artifactId>im-server</artifactId>
         </dependency>
-        <!-- MySQL 版消息存储：im.storage=jdbc 时生效，默认（redis）时既不加载也不建连接池 -->
+        <!-- Redis 版消息存储：im.storage=redis 或缺省时生效（本地/联调默认形态） -->
+        <dependency>
+            <groupId>com.github</groupId>
+            <artifactId>im-storage-redis</artifactId>
+        </dependency>
+        <!-- MySQL 版消息存储：im.storage=jdbc 时生效；redis 形态下不建连接池、不加载 MyBatis -->
         <dependency>
             <groupId>com.github</groupId>
             <artifactId>im-storage-jdbc</artifactId>

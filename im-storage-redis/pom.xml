@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.github</groupId>
+        <artifactId>im-cluster</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>im-storage-redis</artifactId>
+    <name>im-storage-redis</name>
+    <description>MessageRepository 的 Redis 实现（StringRedisTemplate，im.storage=redis 时生效，缺省形态）</description>
+
+    <dependencies>
+        <!-- 只需要 IM 服务的存储端口（MessageRepository / StoredMessage），不依赖任何业务实现 -->
+        <dependency>
+            <groupId>com.github</groupId>
+            <artifactId>im-server</artifactId>
+        </dependency>
+
+        <!-- StringRedisTemplate / Lettuce：消息体以 JSON 存进 List，撤回与删除用 Set -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
+        <!-- StoredMessage 的 JSON 编解码（对应 jdbc 形态里的 MyBatis 映射） -->
+        <dependency>
+            <groupId>tools.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+
+        <!-- RedisMessageRepositoryTest 需要一个真 Redis（不可用时自动 skip） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>

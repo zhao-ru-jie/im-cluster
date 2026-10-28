@@ -70,6 +70,8 @@ class MessageLifecycleTest {
     private final List<String> conversationIds = new ArrayList<>();
     private MessageUpdateNotifier notifier;
     private OfflineMessageStore offline;
+    /** 每次 {@code service()} 都会重建 MessageService，存储必须是同一个实例，否则数据会“丢” */
+    private MessageRepository messageRepository;
 
     @BeforeEach
     void stubSeq() {
@@ -225,8 +227,16 @@ class MessageLifecycleTest {
 
     // ==== 辅助 ====
 
+    /**
+     * 存储用内存替身：Redis 实现已搬到 im-storage-redis，im-server 的测试不能反向依赖它
+     * （会构成 reactor 环）。本类要验的是「撤回/删除在读写路径上的语义」，与介质无关；
+     * 介质行为由 im-storage-redis 自己的 {@code RedisMessageRepositoryTest} 守。
+     */
     private MessageRepository messages() {
-        return new RedisMessageRepository(TestRedis.template(), mapper);
+        if (messageRepository == null) {
+            messageRepository = new InMemoryMessageRepository();
+        }
+        return messageRepository;
     }
 
     private ClientFrames frames() {

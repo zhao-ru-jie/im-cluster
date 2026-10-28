@@ -1,4 +1,4 @@
-package com.github.im.storage.jdbc;
+package com.github.im.storage.jdbc.config;
 
 import com.baomidou.mybatisplus.autoconfigure.ConfigurationCustomizer;
 import com.github.im.server.group.GroupMemberRepository;
@@ -6,6 +6,10 @@ import com.github.im.server.group.GroupRepository;
 import com.github.im.server.relation.RelationRepository;
 import com.github.im.server.shard.ShardRouter;
 import com.github.im.server.message.MessageRepository;
+import com.github.im.storage.jdbc.JdbcGroupMemberRepository;
+import com.github.im.storage.jdbc.JdbcGroupRepository;
+import com.github.im.storage.jdbc.JdbcMessageRepository;
+import com.github.im.storage.jdbc.JdbcRelationRepository;
 import com.github.im.storage.jdbc.mapper.GroupMemberMapper;
 import com.github.im.storage.jdbc.mapper.GroupMapper;
 import com.github.im.storage.jdbc.mapper.MessageDeleteMapper;

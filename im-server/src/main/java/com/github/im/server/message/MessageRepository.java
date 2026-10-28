@@ -8,10 +8,16 @@ import java.util.Set;
 /**
  * 消息存储端口（IM 服务独占）。
  *
- * <p>阶段 4 的存储迁移就是用这个端口做的：业务侧只依赖 {@code append / recent}，
- * 实现从 {@link RedisMessageRepository}（默认，零外部数据库依赖）切到
- * {@code com.github.im.storage.jdbc.JdbcMessageRepository}（MySQL，生产形态，独立模块
- * im-storage-jdbc）只需改 {@code im.storage}。
+ * <p>本模块<b>不含任何实现</b>，两种介质各自独立成模块，由 {@code im.storage} 切换：
+ * <ul>
+ *   <li>{@code im-storage-redis}：{@code com.github.im.storage.redis.RedisMessageRepository}，
+ *       Redis List 存 JSON，缺省形态（零外部数据库依赖，本地/联调/小规模）；</li>
+ *   <li>{@code im-storage-jdbc}：{@code com.github.im.storage.jdbc.JdbcMessageRepository}，
+ *       MySQL，生产形态。</li>
+ * </ul>
+ *
+ * <p>业务侧只依赖 {@code append / recent / since} 这几个方法，换介质不改业务代码——
+ * 这是这个端口存在的唯一理由。
  *
  * <p><b>一致性约定</b>：{@code append} 必须先于下发（write-ahead）。
  * 实现抛异常 = 整条消息受理失败（返回可重试错误码），绝不允许「推成功但没落库」。

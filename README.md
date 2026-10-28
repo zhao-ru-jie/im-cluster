@@ -49,8 +49,9 @@ A 发给 B 的消息经 **Redis 在线路由表定位目标网关 + gRPC 实例�
 | `im-proto` | 契约层 | 两份 proto + 端口接口 `MessageIngress` / `PushPort` + `MessageEnvelope` + Redis key 契约 | 依赖 jar |
 | `im-rpc` | gRPC 适配（客户端侧） | 按方向分包：`rpc.common`（channel 复用与 TLS、地址解析）、`rpc.ingress`（网关→IM：`RemoteMessageIngress`）、`rpc.push`（IM→网关：`RemoteGatewayPushPort` + 在线路由只读视图） | 依赖 jar |
 | `im-gateway` | **长连接服务** | Netty 双通道接入、会话管理、心跳、上行转发、下行推送、优雅摘流、连接数指标 | 库 |
-| `im-server` | **IM 服务** | 消息受理（幂等 + seq）、存储、路由决策、离线兜底、历史消息、群成员 | 库 |
-| `im-storage-jdbc` | 存储实现插件 | `MessageRepository` / `GroupMemberRepository` 的 MySQL 实现 + DDL | 依赖 jar |
+| `im-server` | **IM 服务** | 消息受理（幂等 + seq）、路由决策、离线兜底、历史消息、群成员；**不含任何存储实现** | 库 |
+| `im-storage-redis` | 存储实现插件（缺省） | `MessageRepository` / `GroupRepository` / `GroupMemberRepository` / `RelationRepository` 的 Redis 实现 | 依赖 jar |
+| `im-storage-jdbc` | 存储实现插件（生产） | `MessageRepository` / `GroupMemberRepository` 的 MySQL 实现 + DDL | 依赖 jar |
 | `im-app` | 单体装配入口 | 同进程装配网关 + IM 服务，可执行 fat jar | fat jar |
 | `im-gateway-boot` | 拆分部署：长连接服务 | 只做接入，上行全走 gRPC | fat jar |
 | `im-server-boot` | 拆分部署：IM 服务 | 只承载业务与存储，暴露 `MessageIngress`，经 `RemoteGatewayPushPort` 下发 | fat jar |
@@ -62,16 +63,20 @@ im-app   ──> im-gateway ──┐
          ──> im-server ───┼──> im-proto
          ──> im-rpc ──────┘
 
-im-gateway-boot ──> im-gateway / im-rpc / im-storage-jdbc ──> im-proto
-im-server-boot  ──> im-server  / im-rpc / im-storage-jdbc ──> im-proto
+im-gateway-boot ──> im-gateway / im-rpc ──> im-proto
+im-server-boot  ──> im-server  / im-rpc / im-storage-redis / im-storage-jdbc ──> im-proto
+
+im-storage-redis ──> im-server ──> im-proto
+im-storage-jdbc  ──> im-server ──> im-proto
 ```
 
 三条硬约束：
 
 1. **`im-gateway` 与 `im-server` 互不依赖**，唯一共享物是 `im-proto`；
 2. 业务模块不依赖 `im-rpc`，保持「业务代码里看不到传输细节」；
-3. `im-storage-jdbc` 单向依赖 `im-server` 的存储端口，**反向不依赖**——换存储实现不改业务。
-   刻意不用 `spring-boot-starter-jdbc`，避免只用 Redis 的部署被自动装配出一个连不上的 DataSource。
+3. `im-storage-redis` / `im-storage-jdbc` 都只单向依赖 `im-server` 的存储端口，**反向不依赖**——换存储实现不改业务。
+   jdbc 模块刻意不用 `spring-boot-starter-jdbc`，避免只用 Redis 的部署被自动装配出一个连不上的 DataSource。
+   两者由 `im.storage` 二选一装配（`redis` 或缺省 / `jdbc`），互斥条件写在各自的 `*StorageConfig` 里。
 
 ### 运行时拓扑
 
@@ -720,7 +725,7 @@ List<StoredMessage> recent(String conversationId, int limit);
 
 | 实现 | 位置 | 介质 | 适用 |
 |------|------|------|------|
-| `RedisMessageRepository` | `im-server`（默认） | `im:conv:msgs:{conversationId}` List，JSON | 本地开发 / 联调，零外部数据库 |
+| `RedisMessageRepository` | `im-storage-redis`（默认） | `im:conv:msgs:{conversationId}` List，JSON | 本地开发 / 联调，零外部数据库 |
 | `JdbcMessageRepository` | `im-storage-jdbc` | MySQL `im_message` | 生产形态，支持按会话 + 序号漫游 |
 
 切换只需配置（`im.storage=jdbc` 时才装配连接池，默认形态完全不碰数据库）：
@@ -1118,7 +1123,8 @@ IM_GRPC_PORT=9090 IM_GRPC_HOST=127.0.0.1 \
 
 | 模块 | 用例 | 依赖 |
 |---|---|---|
-| `im-server` | `SeqAllocatorTest`（冷启动 / 客户端水位 / Redis 回退到旧快照 / 多实例顺序 / 8 线程并发 / DB 下界查询摊薄）、`RedisMessageRepositoryTest`（落库乱序时 `maxSeq` 仍取真正最大值） | **真实 Redis** |
+| `im-server` | `SeqAllocatorTest`（冷启动 / 客户端水位 / Redis 回退到旧快照 / 多实例顺序 / 8 线程并发 / DB 下界查询摊薄） | **真实 Redis** |
+| `im-storage-redis` | `RedisMessageRepositoryTest`（落库乱序时 `maxSeq` 仍取真正最大值）、`RedisStorageConfigTest`（`im.storage` 缺省落 Redis、配 `jdbc` 时本模块不建 Bean） | **真实 Redis**（配置测试除外） |
 | `im-rpc` | `GrpcChannelFactoryHealthTest`（NOT_SERVING 实例被摘出轮询、无健康服务的对端仍可用、waitForReady 等到 deadline、关开关回到旧行为） | 真实 gRPC 服务端（进程内起） |
 | `im-gateway` | `HmacTokenAuthenticatorTest`（越权冒用 / 过期 / 篡改过期时间 / 换密钥伪造 / 格式错误）、`AuthGuardTest`（off 全放行、warn 只记录不误伤、enforce 拒绝、缺 secret 启动失败）、`SerialExecutorTest`（串行 / 保序 / 高水位暂停只触发一次且不丢帧 / 低水位才恢复 / 未到阈值不触发 / 控制任务不参与背压 / 指标监听收到暂停+恢复 / 单任务异常不中断） | 无 |
 | `im-server-boot` | `GrpcHealthEndpointTest`（健康服务确实被绑定且最终 SERVING） | Spring 上下文 + Redis |
@@ -1338,8 +1344,7 @@ im-cluster/
 │   ├── message/DeliveryDispatcher.java       # 异步投递 + 失败落离线（把推送挪出 ack 关键路径）
 │   ├── message/SeqAllocator.java             # seq 发号：幂等查询与 INCR 合成一个 Lua（一次 RTT）
 │   ├── message/MessageRouter.java            # 投递目标决策（含群聊扇出），唯一依赖 PushPort
-│   ├── message/MessageRepository.java        # 存储端口
-│   ├── message/RedisMessageRepository.java   # 默认存储实现
+│   ├── message/MessageRepository.java        # 存储端口（本模块不含任何实现）
 │   ├── message/StoredMessage.java            # 结构化存储记录
 │   ├── message/OfflineMessageStore.java      # 离线消息
 │   ├── message/ClientFrames.java             # 下行 msg.push / msg.state 帧序列化（实时与历史同构）
@@ -1347,11 +1352,18 @@ im-cluster/
 │   ├── message/MessageUpdateNotifier.java    # 变更事件：撤回广播全会话、删除只推操作者自己的端
 │   ├── message/MessageDigests.java           # 会话摘要与媒体占位符（列表与通知共用同一份文案）
 │   ├── push/HttpVendorPush.java              # 厂商推送（离线通知）：HTTP 中转，默认关闭
-│   ├── group/GroupMemberRepository.java      # 群成员端口 + Redis 实现
+│   ├── group/GroupMemberRepository.java      # 群成员端口（实现见 im-storage-*）
 │   ├── relation/MessageAcl.java              # 投递前准入：群成员 + 黑名单 + 可选好友（三档开关）
 │   ├── relation/RelationRepository.java      # 关系链端口（好友双向 / 黑名单单向）
 │   ├── grpc/MessageIngressGrpcService.java   # @GrpcService：供远程网关上行
 │   └── controller/                           # /send、/conv/{conversationId}/messages、/group/...
+│
+├── im-storage-redis/            # 存储实现插件（Redis，缺省形态）
+│   ├── RedisStorageConfig.java               # 条件装配：im.storage=redis 或未配置（四个端口一起）
+│   ├── RedisMessageRepository.java           # List 存 JSON + 撤回/删除用 Set
+│   ├── RedisGroupRepository.java             # 群资料 Hash（单字段改，避免并发覆盖）
+│   ├── RedisGroupMemberRepository.java       # 群成员 Set + 反向索引 + 角色/禁言
+│   └── RedisRelationRepository.java          # 好友双向两份 / 黑名单单向
 │
 ├── im-storage-jdbc/             # 存储实现插件（MySQL）
 │   ├── JdbcStorageConfig.java                # 条件装配：仅 im.storage=jdbc

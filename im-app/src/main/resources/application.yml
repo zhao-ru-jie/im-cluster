@@ -1,6 +1,14 @@
 spring:
   application:
     name: im-app
+  # im-storage-jdbc 把 spring-boot-starter-jdbc 带进 classpath，而 Boot 的 DataSourceAutoConfiguration
+  # 只看「classpath 上有 DataSource + HikariCP、容器里没有 DataSource Bean」就去建连接池，
+  # 于是 im.storage=redis（默认）时也会因为没有 DSN 而启动失败：
+  # 「Failed to determine a suitable driver class」。jdbc 形态的连接池由 JdbcStorageConfig 显式创建
+  # （那种情形下该自动装配本来就会 @ConditionalOnMissingBean 退让），故这里一次性排除。
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration
   # 开启虚拟线程（JDK 21+）
   threads:
     virtual:

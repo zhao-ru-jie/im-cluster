@@ -1,9 +1,9 @@
-package com.github.im.server.group;
+package com.github.im.storage.redis;
 
 import com.github.im.contract.RedisKeys;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import com.github.im.server.group.GroupMemberRepository;
+import com.github.im.server.group.GroupRole;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -13,7 +13,7 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Redis 版群成员存储（默认实现）。
+ * Redis 版群成员存储（{@code im.storage=redis}，缺省形态）。
  *
  * <pre>
  * im:group:members:{groupId}   Set，成员 userId
@@ -31,8 +31,6 @@ import java.util.Set;
  * @author zhaorujie
  * @since 1.0.0
  */
-@Component
-@ConditionalOnProperty(name = "im.storage", havingValue = "redis", matchIfMissing = true)
 public class RedisGroupMemberRepository implements GroupMemberRepository {
 
     private final StringRedisTemplate redis;
