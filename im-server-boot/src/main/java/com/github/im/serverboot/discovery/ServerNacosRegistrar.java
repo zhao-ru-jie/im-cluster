@@ -151,7 +151,7 @@ public class ServerNacosRegistrar {
     private static String firstNonLoopbackIp() {
         try {
             Enumeration<NetworkInterface> nets = NetworkInterface.getNetworkInterfaces();
-            while (nets != null && nets.hasMoreElements()) {
+            while (nets.hasMoreElements()) {
                 NetworkInterface ni = nets.nextElement();
                 if (ni.isLoopback() || !ni.isUp()) {
                     continue;

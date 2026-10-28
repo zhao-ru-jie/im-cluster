@@ -92,10 +92,17 @@ public class IngressTargets {
         if (!StringUtils.hasText(addresses)) {
             return List.of();
         }
-        return Arrays.stream(addresses.split(","))
+
+        List<String> list = Arrays.stream(addresses.split(","))
                 .map(String::trim)
                 .filter(s -> !s.isEmpty())
                 .toList();
+        for (String address : list) {
+            if (address.contains("127.0.0.1") || address.contains("localhost")) {
+                log.warn("[nacos] 上行地址包含 localhost，请检查 im.server.address 配置");
+            }
+        }
+        return list;
     }
 
     @PostConstruct
@@ -136,6 +143,7 @@ public class IngressTargets {
     /** 订阅地址变更：注册时立刻推一次当前值，之后每次变更推一次 */
     public void addListener(Consumer<List<String>> listener) {
         listeners.add(listener);
+        // accept 会调用this::publish 这个方法
         listener.accept(current());
     }
 

@@ -719,7 +719,7 @@ public class MessageService implements MessageIngress {
             ClientFrames.FrameRef ref = frames.refOf(raw);
             refs.add(ref);
             if (ref != null) {
-                seqsByConversation.computeIfAbsent(ref.conversationId(), key -> new LinkedHashSet<>())
+                seqsByConversation.computeIfAbsent(ref.conversationId(), _ -> new LinkedHashSet<>())
                         .add(ref.seq());
             }
         }

@@ -381,12 +381,9 @@ public class OfflineMessageStore {
         long ackSeq = 0L;
         for (Tuple tuple : tuples) {
             byte[] member = tuple.getValue();
-            if (member == null) {
-                continue;
-            }
             frames.add(new String(member, StandardCharsets.UTF_8));
             Double score = tuple.getScore();
-            if (score != null && (long) (double) score > ackSeq) {
+            if ((long) (double) score > ackSeq) {
                 ackSeq = (long) (double) score;
             }
         }

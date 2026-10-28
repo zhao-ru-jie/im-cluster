@@ -358,8 +358,7 @@ public class ConversationStore {
         if (pinned == null && muted == null) {
             return flag(userId, conversationId);
         }
-        int current = readFlags(userId, conversationId);
-        int next = current;
+        int next = readFlags(userId, conversationId);
         if (pinned != null) {
             next = pinned ? (next | FLAG_PINNED) : (next & ~FLAG_PINNED);
         }

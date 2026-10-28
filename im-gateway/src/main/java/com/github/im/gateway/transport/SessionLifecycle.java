@@ -279,7 +279,7 @@ public class SessionLifecycle {
         } catch (RuntimeException e) {
             metrics.ingressFailed("pull", e);
             // 与 submit 同一个口径：补发失败也带状态码，否则「补发不到」和「超时」分不开
-            log.warn("pull pending for {} failed: status={} err={}",
+            log.error("pull pending for {} failed: status={} err={}",
                     userId, Status.fromThrowable(e).getCode(), e.getMessage(), e);
         }
     }
@@ -307,7 +307,7 @@ public class SessionLifecycle {
                     .build());
         } catch (RuntimeException e) {
             metrics.ingressFailed("ack", e);
-            log.warn("[offline] 补发确认失败（下次重连会重发同一批，客户端按 seq 去重）user={} device={} err={}",
+            log.error("[offline] 补发确认失败（下次重连会重发同一批，客户端按 seq 去重）user={} device={} err={}",
                     userId, deviceId, e.getMessage());
         }
     }
@@ -354,9 +354,6 @@ public class SessionLifecycle {
 
     /**
      * 已读上报：{@code {"ver":1,"type":"msg.read","conversationId":"s:a:b","seq":12}}。
-     *
-     * <p>字段名一律用完整单词：这张协议是要被抓包、写进日志、贴进 issue 的，
-     * {@code c}/{@code s} 省下的字节抵不上一次「这是啥」的解释成本。
      *
      * <p>和 ACK 一样异步发出去、失败不回错误帧：已读位置是「下次上报会覆盖」的状态，
      * 丢一次最多让发送方的气泡晚一点变成「已读」，不值得让客户端为它写重试。
