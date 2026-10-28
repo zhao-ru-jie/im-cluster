@@ -60,7 +60,34 @@ class RedisMessageRepositoryTest {
         assertEquals(7L, repository.maxSeq(conversationId));
     }
 
+    @Test
+    @DisplayName("翻页：beforeSeq 是排他的 seq，落库乱序也按 seq 升序切片")
+    void beforeSlicesBySeqNotByAppendOrder() {
+        RedisMessageRepository repository = repository();
+        String conversationId = conversation();
+
+        // 乱序落库：List 的物理顺序 ≠ seq 顺序（多实例下 append 到达顺序可能乱）
+        for (long seq : new long[]{3, 1, 5, 2, 4}) {
+            repository.append(message(conversationId, seq));
+        }
+
+        assertEquals(List.of(4L, 5L), seqs(repository.before(conversationId, 0L, 2)),
+                "beforeSeq=0 表示第一页：最新的两条");
+        assertEquals(List.of(2L, 3L), seqs(repository.before(conversationId, 4L, 2)),
+                "seq < 4 的两条，且游标是排他的（不含 4 本身）");
+        assertEquals(List.of(1L), seqs(repository.before(conversationId, 2L, 2)),
+                "更早的只剩一条，返回条数少于 limit 即表示到头了");
+    }
+
     // ==== 辅助 ====
+
+    private static List<Long> seqs(List<StoredMessage> messages) {
+        List<Long> seqs = new ArrayList<>(messages.size());
+        for (StoredMessage message : messages) {
+            seqs.add(message.seq());
+        }
+        return seqs;
+    }
 
     private static RedisMessageRepository repository() {
         return new RedisMessageRepository(TestRedis.template(), JsonMapper.builder().build());

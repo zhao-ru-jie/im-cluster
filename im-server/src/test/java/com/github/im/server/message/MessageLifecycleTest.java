@@ -110,7 +110,7 @@ class MessageLifecycleTest {
 
         assertEquals(0, service().recall(conversation, messageSeq, alice).code());
 
-        List<Map<String, Object>> history = service().history(bob, conversation, 50);
+        List<Map<String, Object>> history = service().history(bob, conversation, 0L, 50).messages();
         assertEquals(1, history.size(), "撤回不是删除：seq 仍然占位，否则客户端会当成空洞去反复拉齐");
         Map<String, Object> frame = history.get(0);
         assertEquals("", frame.get("body"));
@@ -177,9 +177,9 @@ class MessageLifecycleTest {
 
         assertEquals(0, service().deleteForUser(conversation, messageSeq, alice).code());
 
-        assertEquals(0, service().history(alice, conversation, 50).size(),
+        assertEquals(0, service().history(alice, conversation, 0L, 50).messages().size(),
                 "删了就不该在重装 App 后又冒出来");
-        assertEquals(1, service().history(bob, conversation, 50).size(),
+        assertEquals(1, service().history(bob, conversation, 0L, 50).messages().size(),
                 "删除是用户级动作，不该让对方也失去这条消息");
     }
 

@@ -51,7 +51,9 @@ class ImClientWebSocketTest {
             }
         })) {
             Recorder recorder = new Recorder();
-            try (ImClient client = new ImClient(wsConfig(7003), recorder)) {
+            // 必须用桩服务端实际绑定的端口（new ServerSocket(0) 是随机端口）：
+            // 硬编码 7003 会连上本机常驻网关，断言拿到的是真实 serverMsgId，测试变成看运气
+            try (ImClient client = new ImClient(wsConfig(gateway.port()), recorder)) {
                 client.connect();
                 assertTrue(recorder.connected.await(5, TimeUnit.SECONDS), "握手成功后应回调 onConnected");
 

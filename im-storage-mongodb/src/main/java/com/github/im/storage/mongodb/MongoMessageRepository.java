@@ -87,13 +87,22 @@ public class MongoMessageRepository implements MessageRepository {
         return last == null ? 0L : last.getSeq();
     }
 
+    /**
+     * 向上翻页：{@code seq < beforeSeq} 的升序区间（{@code beforeSeq <= 0} = 取最新一页）。
+     *
+     * <p>先按 seq 倒序取 limit 条再反转：命中 {@code uk_msg_conv_seq} 的索引区间，
+     * 代价只与「这一页多少条」相关，和会话总消息量无关。
+     */
     @Override
-    public List<StoredMessage> recent(String conversationId, int limit) {
+    public List<StoredMessage> before(String conversationId, long beforeSeq, int limit) {
         if (limit <= 0) {
             return List.of();
         }
-        // 先按 seq 倒序取最近 limit 条，再反转成升序返回（与另两种形态的返回约定一致）
-        Query query = Query.query(Criteria.where("conversationId").is(conversationId))
+        Criteria criteria = Criteria.where("conversationId").is(conversationId);
+        if (beforeSeq > 0) {
+            criteria = criteria.and("seq").lt(beforeSeq);
+        }
+        Query query = Query.query(criteria)
                 .with(Sort.by(Sort.Direction.DESC, "seq"))
                 .limit(limit);
         List<StoredMessage> messages = toMessages(mongo.find(query, MessageEntity.class));

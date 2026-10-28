@@ -43,8 +43,10 @@ import java.util.Map;
  *
  * <h2>翻页</h2>
  *
- * <p>当前服务端只支持「最近 N 条」（历史）与「首页 N 条」（会话列表），没有 cursor/beforeSeq。
- * SDK 不假装有翻页能力：{@link #history} 的注释直接写明这一点。
+ * <p>历史消息支持<b>游标翻页</b>：{@link #history(String, long, int)} 返回 {@link HistoryPage}，
+ * 里面带 {@code nextBeforeSeq}（下一页游标）与 {@code hasMore}。游标是排他的 seq，
+ * 不是 offset——翻页期间来了新消息也不会重复或漏消息。
+ * 会话列表仍然只有「首页 N 条」，暂无 cursor。
  *
  * <h2>幂等与回执</h2>
  *
@@ -100,15 +102,31 @@ public final class ImHttpClient implements AutoCloseable {
     }
 
     /**
-     * 历史消息：<b>最近 N 条</b>，按 seq 升序返回。
+     * 历史消息<b>第一页</b>（最近 N 条，按 seq 升序）。
      *
-     * <p>注意服务端目前<b>没有</b> beforeSeq/cursor，所以「上滑加载更早」这件事当前做不到，
-     * SDK 不提供假接口。返回的元素与长连接 {@code msg.push} 同一个结构
-     * （撤回过的条目 {@code body} 为空、{@code recalled=true}）。
+     * <p>等价于 {@code history(conversationId, 0, limit).messages()}；要上滑加载更早的，
+     * 用 {@link #history(String, long, int)} 拿 {@link HistoryPage#nextBeforeSeq()}。
      */
     public List<DownlinkFrame.Push> history(String conversationId, int limit) {
+        return history(conversationId, 0L, limit).messages();
+    }
+
+    /**
+     * 历史消息（游标翻页）。
+     *
+     * <p>{@code beforeSeq} 传上一页的 {@link HistoryPage#nextBeforeSeq()}；传 {@code 0} 或不传
+     * 表示第一页（最新的一页）。返回的帧与长连接 {@code msg.push} 同构
+     * （撤回过的条目 {@code body} 为空、{@code recalled=true}）。
+     *
+     * <p>服务端单页上限 200 条（超出会被夹取，实际值见 {@link HistoryPage#limit()}）。
+     * 游标始终会前进，即使整页都被「本地删除」过滤掉——所以客户端不会卡在同一页，
+     * 遇到空页继续按 {@code nextBeforeSeq} 上滑即可。
+     */
+    public HistoryPage history(String conversationId, long beforeSeq, int limit) {
         JsonNode root = execute("GET", "/conv/" + segment(conversationId) + "/messages",
-                params("userId", userId, "limit", limit > 0 ? limit : null), null);
+                params("userId", userId,
+                        "limit", limit > 0 ? limit : null,
+                        "beforeSeq", beforeSeq > 0 ? beforeSeq : null), null);
         List<DownlinkFrame.Push> messages = new ArrayList<>();
         for (JsonNode node : root.path("messages")) {
             // 走 Frames 而不是直接 treeToObject：帧形状只在一个地方定义，认不出的帧当作不存在
@@ -116,7 +134,10 @@ public final class ImHttpClient implements AutoCloseable {
                 messages.add(push);
             }
         }
-        return messages;
+        return new HistoryPage(messages,
+                root.path("nextBeforeSeq").asLong(0L),
+                root.path("hasMore").asBoolean(false),
+                root.path("limit").asInt(limit));
     }
 
     /** 上报已读（用户级、只前进，服务端会 cap 到会话的 lastSeq） */

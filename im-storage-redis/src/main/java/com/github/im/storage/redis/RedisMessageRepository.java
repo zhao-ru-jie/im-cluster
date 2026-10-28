@@ -9,6 +9,7 @@ import tools.jackson.databind.ObjectMapper;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -78,17 +79,42 @@ public class RedisMessageRepository implements MessageRepository {
         return max;
     }
 
+    /**
+     * 向上翻页：{@code seq < beforeSeq} 的升序区间（{@code beforeSeq <= 0} = 取最新一页）。
+     *
+     * <p>不能像「取最新 N 条」那样用下标区间 {@code LRANGE -limit -1}：List 的物理顺序不等于
+     * seq 顺序（多实例下 {@code append} 的到达顺序可能乱，理由同 {@link #maxSeq}），
+     * 下标区间无法对应 seq 区间。所以先全取（{@code trim} 已把保留量压在
+     * {@value #MAX_LENGTH} 条，成本有上限），再按 seq 筛、排序、取尾部 limit 条。
+     *
+     * <p>生产形态不背这个成本：{@code JdbcMessageRepository} / {@code MongoMessageRepository}
+     * 都是「按 seq 倒序 + LIMIT」，命中索引区间。
+     */
     @Override
-    public List<StoredMessage> recent(String conversationId, int limit) {
-        List<String> rows = redis.opsForList().range(RedisKeys.convMessages(conversationId), -limit, -1);
+    public List<StoredMessage> before(String conversationId, long beforeSeq, int limit) {
+        if (limit <= 0) {
+            return List.of();
+        }
+        List<String> rows = redis.opsForList().range(RedisKeys.convMessages(conversationId), 0, -1);
         if (rows == null || rows.isEmpty()) {
             return List.of();
         }
-        List<StoredMessage> messages = new ArrayList<>(rows.size());
+        List<StoredMessage> matched = new ArrayList<>(rows.size());
         for (String row : rows) {
-            messages.add(objectMapper.readValue(row, StoredMessage.class));
+            if (row == null || row.isBlank()) {
+                continue;
+            }
+            StoredMessage message = objectMapper.readValue(row, StoredMessage.class);
+            if (beforeSeq <= 0 || message.seq() < beforeSeq) {
+                matched.add(message);
+            }
         }
-        return messages;
+        matched.sort(Comparator.comparingLong(StoredMessage::seq));
+        if (matched.size() <= limit) {
+            return matched;
+        }
+        // 只要最新的一页：游标翻页要的是「紧挨着 beforeSeq 往前的那 limit 条」
+        return new ArrayList<>(matched.subList(matched.size() - limit, matched.size()));
     }
 
     /**

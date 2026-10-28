@@ -98,6 +98,28 @@ class ImHttpClientTest {
     }
 
     @Test
+    @DisplayName("历史翻页：beforeSeq 原样带上去，nextBeforeSeq / hasMore 透传给调用方")
+    void historyPagingCarriesCursor() {
+        stub.respond(200, """
+                {"conversationId":"s:alice:bob","limit":2,"count":2,"nextBeforeSeq":11,"hasMore":true,"messages":[
+                  {"ver":1,"type":"msg.push","conversationId":"s:alice:bob","convType":"SINGLE",
+                   "seq":12,"serverMsgId":"srv-12","clientMsgId":"c-12","from":"bob","to":"alice",
+                   "body":"m12","contentType":"TEXT","ts":1700000000000},
+                  {"ver":1,"type":"msg.push","conversationId":"s:alice:bob","convType":"SINGLE",
+                   "seq":13,"serverMsgId":"srv-13","clientMsgId":"c-13","from":"alice","to":"bob",
+                   "body":"m13","contentType":"TEXT","ts":1700000001000}]}
+                """);
+
+        HistoryPage page = client.history("s:alice:bob", 13L, 2);
+
+        assertEquals(2, page.messages().size());
+        assertEquals(11L, page.nextBeforeSeq(), "游标要能直接用于下一次请求");
+        assertTrue(page.hasMore(), "还有更早的消息，客户端应继续上滑");
+        assertEquals(2, page.limit(), "服务端实际生效的条数要回显");
+        assertTrue(stub.lastRequest().contains("beforeSeq=13"), "游标必须带上去：" + stub.lastRequest());
+    }
+
+    @Test
     @DisplayName("业务错误是 HTTP 200 + code：必须按 code 判成功，而不是看状态码")
     void recallPropagatesBusinessCode() {
         stub.respond(200, """

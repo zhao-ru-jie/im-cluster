@@ -103,14 +103,20 @@ public class JdbcMessageRepository implements MessageRepository, AutoCloseable {
         return rows.getFirst().getSeq();
     }
 
+    /**
+     * 向上翻页：{@code seq < beforeSeq} 的升序区间（{@code beforeSeq <= 0} = 取最新一页）。
+     *
+     * <p>SQL 先倒序取 limit 条再在内存里反转——{@code ORDER BY seq DESC LIMIT n} 才能让
+     * {@code uk_msg_conv_seq} 直接从索引尾部往前扫；改成正序取前 n 条会变成「从会话开头扫」。
+     */
     @Override
-    public List<StoredMessage> recent(String conversationId, int limit) {
+    public List<StoredMessage> before(String conversationId, long beforeSeq, int limit) {
         if (limit <= 0) {
             return List.of();
         }
-        // 先按 seq 倒序取最近 limit 条，再反转成升序返回
         List<MessageEntity> rows = mapper.selectList(Wrappers.<MessageEntity>lambdaQuery()
                 .eq(MessageEntity::getConversationId, conversationId)
+                .lt(beforeSeq > 0, MessageEntity::getSeq, beforeSeq)
                 .orderByDesc(MessageEntity::getSeq)
                 .last("LIMIT " + limit));
         List<StoredMessage> messages = new ArrayList<>(rows.size());

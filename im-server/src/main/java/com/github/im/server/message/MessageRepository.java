@@ -15,10 +15,10 @@ import java.util.Set;
  *   <li>{@code im-storage-jdbc}：{@code com.github.im.storage.jdbc.JdbcMessageRepository}，
  *       MySQL，强关系与事务形态；</li>
  *   <li>{@code im-storage-mongodb}：{@code com.github.im.storage.mongodb.MongoMessageRepository}，
- *       MongoDB 文档形态（{@code _id} 即「会话 + seq」，保序与幂等由唯一索引兜住）。</li>
+ *       MongoDB 文档形态（{@code _id} = serverMsgId，保序与去重由 {@code (conversationId, seq)} 唯一索引兜住）。</li>
  * </ul>
  *
- * <p>业务侧只依赖 {@code append / recent / since} 这几个方法，换介质不改业务代码——
+ * <p>业务侧只依赖 {@code append / before / since} 这几个方法，换介质不改业务代码——
  * 这是这个端口存在的唯一理由。
  *
  * <p><b>一致性约定</b>：{@code append} 必须先于下发（write-ahead）。
@@ -32,8 +32,19 @@ public interface MessageRepository {
     /** 追加一条已受理消息（同 conversationId+seq 重复写入视为实现层错误） */
     void append(StoredMessage message);
 
-    /** 取会话最近 limit 条，按 seq 升序返回 */
-    List<StoredMessage> recent(String conversationId, int limit);
+    /**
+     * 向上翻页：取会话中 {@code seq < beforeSeq} 的至多 {@code limit} 条，按 seq 升序返回。
+     *
+     * <p>{@code beforeSeq <= 0} 表示「不设上界」，即取最新的一页——历史消息的第一页就走这个分支。
+     *
+     * <p>为什么游标是<b>排他的 seq</b>而不是 {@code offset}：seq 是会话内单调的落库序号，
+     * 翻页期间新消息只会追加在更大的 seq 上，用 {@code seq < 游标} 切片天然不受「翻页时来了新消息」
+     * 影响；{@code offset} 则会因为前面插入而整体错位，表现为「上滑时看到重复或漏掉的消息」。
+     *
+     * <p>返回条数 {@code < limit} 代表「更早的已经没有了」。调用方通常多要一条用来判断
+     * {@code hasMore}（见 {@code MessageService.history}），实现无需关心这一点。
+     */
+    List<StoredMessage> before(String conversationId, long beforeSeq, int limit);
 
     /**
      * 取会话中 {@code seq > afterSeq} 的至多 {@code limit} 条，按 seq 升序返回。

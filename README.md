@@ -346,8 +346,22 @@ TCP      : IdleStateHandler(按原始字节计时) → LengthFieldBasedFrameDeco
 ```
 POST /conv/{conversationId}/messages/{seq}/recall?operatorId=alice
 POST /conv/{conversationId}/messages/{seq}/delete?userId=alice
-GET  /conv/{conversationId}/messages?userId=alice&limit=50   ← 带 userId 才会按他的删除记录过滤
+GET  /conv/{conversationId}/messages?userId=alice&limit=50            ← 第一页（最新）
+GET  /conv/{conversationId}/messages?userId=alice&limit=50&beforeSeq=   ← 上滑翻页
+     带 userId 才会按他的删除记录过滤
 ```
+
+**历史翻页用排他的 seq 游标，不用 offset。** 响应除了 `messages` 还带两个字段：
+
+| 字段 | 含义 |
+|------|------|
+| `nextBeforeSeq` | 下一页游标（取 `seq < 它`）；原样带回来即可继续上滑，`0` 表示到头了 |
+| `hasMore` | 存储里是否还有更早的消息（服务端用「多要一条」探测，不额外做 count） |
+| `limit` | 服务端实际生效的条数（不传 → 50，超限 → 夹到 200） |
+
+seq 单调且只追加，所以「翻页期间来了新消息」不会让切片错位；offset 会整体偏移，表现为上滑时重复或漏消息。
+另一个关键细节：`nextBeforeSeq` 取的是**本页从存储里读到的最老一条**，不是「本页可见的最老一条」——
+整页都被本地删除过滤掉时游标仍然前进，客户端最多滑过几个空页，不会卡在同一页反复请求。
 
 **最关键的一条：脱敏必须在读路径上做，而不只是广播事件。** 撤回有三处会「把原文端出来」的入口，
 全部都要过同一道处理：
@@ -722,7 +736,11 @@ K8s 的 `terminationGracePeriodSeconds` 必须大于 `timeout-ms`。
 
 ```java
 void append(StoredMessage message);
-List<StoredMessage> recent(String conversationId, int limit);
+// 向上翻页：seq < beforeSeq 的至多 limit 条，升序返回；beforeSeq <= 0 表示第一页（最新）
+List<StoredMessage> before(String conversationId, long beforeSeq, int limit);
+// 离线补发：seq > afterSeq 的升序区间
+List<StoredMessage> since(String conversationId, long afterSeq, int limit);
+long maxSeq(String conversationId);
 ```
 
 落库的是**结构化记录**（不是已序列化好的下行帧），帧在读取时按需重建。三种实现：
@@ -1151,9 +1169,9 @@ IM_GRPC_PORT=9090 IM_GRPC_HOST=127.0.0.1 \
 
 | 模块 | 用例 | 依赖 |
 |---|---|---|
-| `im-server` | `SeqAllocatorTest`（冷启动 / 客户端水位 / Redis 回退到旧快照 / 多实例顺序 / 8 线程并发 / DB 下界查询摊薄） | **真实 Redis** |
-| `im-storage-redis` | `RedisMessageRepositoryTest`（落库乱序时 `maxSeq` 仍取真正最大值）、`RedisStorageConfigTest`（`im.storage` 缺省落 Redis、配 `jdbc` 时本模块不建 Bean） | **真实 Redis**（配置测试除外） |
-| `im-storage-mongodb` | `MongoEntityMappingTest`（模型 ↔ 实体无损往返、`_id` 语义、索引注解解析出的名字与唯一性）、`MongoQueryMappingTest`（`id`/`serverMsgId` → `_id` 的查询与更新映射、`from`/`recalledAt` 等字段不被改名）、`MongoStorageConfigTest`（`im.storage=mongodb` 才装配四个端口、宿主已有客户端时不重复创建、其它形态下一律不建）、`MongoSchemaIndexTest`（复现「遗留 `uk_msg_server_id` 导致第二条消息撞 `dup key: null`」，并验证启动收敛会删掉它） | 前三个不需要 Mongo；`MongoSchemaIndexTest` 要真实 Mongo（连不上自动跳过） |
+| `im-server` | `SeqAllocatorTest`（冷启动 / 客户端水位 / Redis 回退到旧快照 / 多实例顺序 / 8 线程并发 / DB 下界查询摊薄）、`MessageHistoryPagingTest`（翻页不重不漏 / 整页被删游标仍前进 / limit 夹取） | **真实 Redis**（`MessageHistoryPagingTest` 除外） |
+| `im-storage-redis` | `RedisMessageRepositoryTest`（落库乱序时 `maxSeq` 仍取真正最大值；`before` 按 seq 而非物理顺序切片）、`RedisStorageConfigTest`（`im.storage` 缺省落 Redis、配 `jdbc` 时本模块不建 Bean） | **真实 Redis**（配置测试除外） |
+| `im-storage-mongodb` | `MongoEntityMappingTest`（模型 ↔ 实体无损往返、`_id` 语义、索引注解解析出的名字与唯一性）、`MongoQueryMappingTest`（`id`/`serverMsgId` → `_id` 的查询与更新映射、`from`/`recalledAt` 等字段不被改名）、`MongoStorageConfigTest`（`im.storage=mongodb` 才装配四个端口、宿主已有客户端时不重复创建、其它形态下一律不建）、`MongoSchemaIndexTest`（复现「遗留 `uk_msg_server_id` 导致第二条消息撞 `dup key: null`」，并验证启动收敛会删掉它）、`MongoMessageRepositoryPagingTest`（`before` 的 seq 排他 / 升序 / 跨会话隔离） | 前三个不需要 Mongo；后两个要真实 Mongo（连不上自动跳过） |
 | `im-rpc` | `GrpcChannelFactoryHealthTest`（NOT_SERVING 实例被摘出轮询、无健康服务的对端仍可用、waitForReady 等到 deadline、关开关回到旧行为） | 真实 gRPC 服务端（进程内起） |
 | `im-gateway` | `HmacTokenAuthenticatorTest`（越权冒用 / 过期 / 篡改过期时间 / 换密钥伪造 / 格式错误）、`AuthGuardTest`（off 全放行、warn 只记录不误伤、enforce 拒绝、缺 secret 启动失败）、`SerialExecutorTest`（串行 / 保序 / 高水位暂停只触发一次且不丢帧 / 低水位才恢复 / 未到阈值不触发 / 控制任务不参与背压 / 指标监听收到暂停+恢复 / 单任务异常不中断） | 无 |
 | `im-server-boot` | `GrpcHealthEndpointTest`（健康服务确实被绑定且最终 SERVING）、`ImServerApplicationScanTest`（三种介质的包都在扫描白名单里）、`StorageWiringTest`（`im.storage=redis` 时装配 Redis 实现，且不建 DataSource / MongoClient / MongoTemplate；两个上下文用例都显式钉住 `im.storage=redis`，不跟随部署侧默认值） | Spring 上下文 + Redis |

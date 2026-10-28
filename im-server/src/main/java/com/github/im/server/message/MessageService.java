@@ -91,6 +91,16 @@ public class MessageService implements MessageIngress {
     /** 会话列表默认页大小 */
     private static final int DEFAULT_CONVERSATION_LIMIT = 50;
 
+    /** 历史消息默认页大小（客户端不传 limit 时） */
+    private static final int HISTORY_DEFAULT_LIMIT = 50;
+    /**
+     * 历史消息单页上限。
+     *
+     * <p>与离线补拉量级（{@code DEFAULT_PULL_MAX}）对齐：一次请求最多重建 200 条帧，
+     * 再多就是「一条 HTTP 请求拖垮客户端」的典型写法。要更多可以翻页，游标就是为这个准备的。
+     */
+    private static final int HISTORY_MAX_LIMIT = 200;
+
     private final StringRedisTemplate redis;
     private final MessageRepository messageRepository;
     private final OfflineMessageStore offlineMessageStore;
@@ -474,7 +484,7 @@ public class MessageService implements MessageIngress {
     }
 
     /**
-     * 会话历史（漫游）：带「本地删除过滤」与「撤回脱敏」的读路径。
+     * 会话历史（漫游 + 游标翻页）：带「本地删除过滤」与「撤回脱敏」的读路径。
      *
      * <p>这两个动作都必须在这里生效，否则功能是假的：
      * <ul>
@@ -482,17 +492,43 @@ public class MessageService implements MessageIngress {
      *   <li>撤回只广播了事件、读时不脱敏 —— 断线重连拉历史就把原文重新拉回来了。</li>
      * </ul>
      *
-     * @param userId 视角用户；为空时不做删除过滤（服务端调试视角）
+     * <h2>翻页游标为什么用 seq，而不是 offset</h2>
+     *
+     * <p>seq 是会话内单调的落库序号，新消息只会追加在更大的 seq 上，{@code seq < 游标} 切片天然
+     * 不受「翻页期间来了新消息」影响；用 {@code offset} 会因前面插入而整体错位，
+     * 表现是「上滑时看到重复或漏掉的消息」。
+     *
+     * <h2>{@code nextBeforeSeq} 取的是「本页从存储里读到的最老一条」，不是「本页可见的最老一条」</h2>
+     *
+     * <p>差别在整页都被本地删除过滤掉的情形：如果游标跟着<b>可见</b>消息走，游标永远不动，
+     * 客户端会无限重试同一页（看起来像卡死）。跟着<b>存储</b>走则游标一定前进，
+     * 客户端最多看到几个空页，一滑就过去了。
+     *
+     * <p>{@code hasMore} 用「多要一条」探测（{@code limit + 1}）：比在存储侧做 count 便宜，
+     * 而且不受过滤影响——它的语义是「更早的存储里还有没有」，客户端据此决定还要不要继续上滑。
+     *
+     * @param userId    视角用户；为空时不做删除过滤（服务端调试视角）
+     * @param beforeSeq 取 {@code seq < beforeSeq} 的一页；{@code <= 0} 表示第一页（最新的一页）
+     * @return 本页帧（按 seq 升序）+ 下一页游标 + 是否还有更早的
      */
-    public List<Map<String, Object>> history(String userId, String conversationId, int limit) {
-        List<StoredMessage> messages = messageRepository.recent(conversationId, limit);
-        if (messages.isEmpty()) {
-            return List.of();
+    public HistoryPage history(String userId, String conversationId, long beforeSeq, int limit) {
+        int effectiveLimit = limit <= 0 ? HISTORY_DEFAULT_LIMIT : Math.min(limit, HISTORY_MAX_LIMIT);
+        // 多要一条用来判断 hasMore，不额外做一次 count 查询
+        List<StoredMessage> fetched = messageRepository.before(conversationId, beforeSeq, effectiveLimit + 1);
+        boolean hasMore = fetched.size() > effectiveLimit;
+        if (hasMore) {
+            // before() 返回升序，多出来的那条在头部（最老的一条）
+            fetched = fetched.subList(1, fetched.size());
         }
+        if (fetched.isEmpty()) {
+            return new HistoryPage(List.of(), 0L, false, effectiveLimit);
+        }
+        long nextBeforeSeq = fetched.get(0).seq();
+
         Set<Long> deleted = StringUtils.hasText(userId)
                 ? messageRepository.deletedSeqs(userId, conversationId) : Set.of();
-        Set<Long> visible = new LinkedHashSet<>(messages.size());
-        for (StoredMessage message : messages) {
+        Set<Long> visible = new LinkedHashSet<>(fetched.size());
+        for (StoredMessage message : fetched) {
             if (!deleted.contains(message.seq())) {
                 visible.add(message.seq());
             }
@@ -500,13 +536,24 @@ public class MessageService implements MessageIngress {
         Set<Long> recalled = visible.isEmpty()
                 ? Set.of() : messageRepository.recalledSeqs(conversationId, visible);
         List<Map<String, Object>> frames = new ArrayList<>(visible.size());
-        for (StoredMessage message : messages) {
+        for (StoredMessage message : fetched) {
             if (deleted.contains(message.seq())) {
                 continue;
             }
             frames.add(this.frames.frameMap(message, recalled.contains(message.seq())));
         }
-        return frames;
+        return new HistoryPage(frames, nextBeforeSeq, hasMore, effectiveLimit);
+    }
+
+    /**
+     * 一页历史消息。
+     *
+     * @param messages     本页帧（按 seq 升序；与实时 {@code msg.push} 同构，撤回的条目已脱敏）
+     * @param nextBeforeSeq 下一页游标（取 {@code seq < 它}）；{@code 0} = 本页之后没有了
+     * @param hasMore      存储里是否还有更早的消息
+     * @param limit        服务端实际生效的条数上限（客户端传 0 或超限时被夹取）
+     */
+    public record HistoryPage(List<Map<String, Object>> messages, long nextBeforeSeq, boolean hasMore, int limit) {
     }
 
     /** 变更事件的接收方：单聊双方，群聊全体成员 */

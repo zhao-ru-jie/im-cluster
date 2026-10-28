@@ -26,20 +26,26 @@ public final class MessageEnvelopes {
                                                  String deviceId,
                                                  String gatewayInstance,
                                                  String traceId) {
+        // protobuf 的 setter 不接受 null（会直接 NPE），而 deviceId / gatewayInstance / traceId
+        // 在「无连接上下文」的入口（如 REST 测试通路）本来就是空，这里统一收敛成空串
         SubmitMessageRequest.Builder builder = SubmitMessageRequest.newBuilder()
-                .setTraceId(traceId)
-                .setClientMsgId(envelope.clientMsgId())
-                .setFromUserId(envelope.from())
-                .setDeviceId(deviceId)
-                .setConversationId(envelope.conversationId())
-                .setConvType(envelope.convType())
-                .setReceiverId(envelope.to())
-                .setPayload(envelope.body() == null ? "" : envelope.body())
+                .setTraceId(nullToEmpty(traceId))
+                .setClientMsgId(nullToEmpty(envelope.clientMsgId()))
+                .setFromUserId(nullToEmpty(envelope.from()))
+                .setDeviceId(nullToEmpty(deviceId))
+                .setConversationId(nullToEmpty(envelope.conversationId()))
+                .setConvType(nullToEmpty(envelope.convType()))
+                .setReceiverId(nullToEmpty(envelope.to()))
+                .setPayload(nullToEmpty(envelope.body()))
                 .setClientTs(envelope.clientTs())
-                .setContentType(envelope.contentType())
-                .setAttrs(envelope.attrs() == null ? "" : envelope.attrs())
-                .setGatewayInstance(gatewayInstance);
+                .setContentType(nullToEmpty(envelope.contentType()))
+                .setAttrs(nullToEmpty(envelope.attrs()))
+                .setGatewayInstance(nullToEmpty(gatewayInstance));
         return builder.build();
+    }
+
+    private static String nullToEmpty(String value) {
+        return value == null ? "" : value;
     }
 
     public static MessageEnvelope toEnvelope(SubmitMessageRequest request) {

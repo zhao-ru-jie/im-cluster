@@ -33,12 +33,14 @@ final class InMemoryMessageRepository implements MessageRepository {
     }
 
     @Override
-    public List<StoredMessage> recent(String conversationId, int limit) {
+    public List<StoredMessage> before(String conversationId, long beforeSeq, int limit) {
         NavigableMap<Long, StoredMessage> all = messages.get(conversationId);
         if (all == null || all.isEmpty() || limit <= 0) {
             return List.of();
         }
-        List<StoredMessage> ordered = new ArrayList<>(all.values());
+        // headMap 是排他的：beforeSeq <= 0 时不设上界（取最新一页）
+        NavigableMap<Long, StoredMessage> head = beforeSeq > 0 ? all.headMap(beforeSeq, false) : all;
+        List<StoredMessage> ordered = new ArrayList<>(head.values());
         return new ArrayList<>(ordered.subList(Math.max(0, ordered.size() - limit), ordered.size()));
     }
 
