@@ -62,6 +62,24 @@ public interface ImClientListener {
     }
 
     /**
+     * 会话里的某个人正在输入（或停止输入）。
+     *
+     * <p>这是<b>状态</b>不是消息：不会落本地表、不占 seq、丢了也不需要补。
+     * 宿主按 {@code (conversationId, userId)} 更新「xxx 正在输入…」即可，
+     * {@code typing=false} 时立刻收起。
+     */
+    default void onTyping(DownlinkFrame.Typing typing) {
+    }
+
+    /** 好友的在线状态变化（只推好友；重复的 online=true 可安全覆盖） */
+    default void onPresence(DownlinkFrame.Presence presence) {
+    }
+
+    /** {@code queryPresence} 的应答：一次拿到一批人的在线状态 */
+    default void onPresenceSnapshot(DownlinkFrame.PresenceSnapshot snapshot) {
+    }
+
+    /**
      * 服务端错误帧（上行被拒、协议错误、服务暂不可用）。
      *
      * <p>SDK 已按 {@code code} 处理过本地消息表（503 安排重投，4xx 标记失败），

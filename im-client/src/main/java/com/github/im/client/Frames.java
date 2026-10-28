@@ -67,6 +67,16 @@ public final class Frames {
     public static final String T_PONG = "pong";
     public static final String T_ERROR = "error";
     public static final String T_MIGRATE = "session.migrate";
+    /** 上行：我正在输入（按节流上报，停止输入时发 typing=false） */
+    public static final String T_TYPING = "typing";
+    /** 下行：某人正在输入（会话里的其他人） */
+    public static final String T_TYPING_PUSH = "typing.push";
+    /** 上行：查询在线状态 */
+    public static final String T_PRESENCE_GET = "presence.get";
+    /** 下行：在线状态查询应答（只回给发起查询的那条连接） */
+    public static final String T_PRESENCE_SNAPSHOT = "presence.snapshot";
+    /** 下行：好友的在线状态变化 */
+    public static final String T_PRESENCE_PUSH = "presence.push";
 
     private final ObjectMapper mapper;
 
@@ -180,6 +190,45 @@ public final class Frames {
         return write(frame);
     }
 
+    /**
+     * 上报输入状态。
+     *
+     * <p>会话与对端<b>至少要给一个</b>：单聊给 {@code to} 最省事（服务端按消息路径同一套规则
+     * 生成会话 ID），群聊给 {@code conversationId = "g:" + groupId}（或给 {@code to = groupId}
+     * 并置 {@code convType = "GROUP"}）。
+     *
+     * <p>服务端会对 {@code typing=true} 去抖（默认 3 秒），所以宿主可以放心地「边打字边报」，
+     * 不必自己算节流——但 {@code typing=false} 一定要发：那是对方那三个点熄灭的唯一信号。
+     *
+     * @return 本帧是否真的写进了连接（没连上时为 false，不需要排队重发）
+     */
+    public String typing(String conversationId, String to, String convType, boolean typing) {
+        Map<String, Object> frame = base(T_TYPING);
+        if (conversationId != null && !conversationId.isBlank()) {
+            frame.put("conversationId", conversationId);
+        }
+        if (to != null && !to.isBlank()) {
+            frame.put("to", to);
+        }
+        if (convType != null && !convType.isBlank()) {
+            frame.put("convType", convType);
+        }
+        frame.put("typing", typing);
+        return write(frame);
+    }
+
+    /**
+     * 查询在线状态（批量）。
+     *
+     * <p>应答是 {@code presence.snapshot} 帧，经 {@link ImClientListener#onPresenceSnapshot} 回调。
+     * 好友列表那种「一次几十上百人」的查询建议走 HTTP {@code GET /presence}（可缓存、可重试）。
+     */
+    public String presenceGet(Collection<String> userIds) {
+        Map<String, Object> frame = base(T_PRESENCE_GET);
+        frame.put("userIds", userIds == null ? List.of() : new ArrayList<>(userIds));
+        return write(frame);
+    }
+
     /** 主动探测（也用于 NAT 保活）：服务端会回 pong */
     public String ping() {
         Map<String, Object> frame = base(T_PING);
@@ -248,6 +297,14 @@ public final class Frames {
             case T_MIGRATE -> new DownlinkFrame.Migrate(
                     text(root, "reason"), root.path("retryAfterMs").asLong(0),
                     root.path("ts").asLong(0));
+            case T_TYPING_PUSH -> new DownlinkFrame.Typing(
+                    text(root, "conversationId"), text(root, "convType"), text(root, "userId"),
+                    root.path("typing").asBoolean(false), root.path("ts").asLong(0));
+            case T_PRESENCE_PUSH -> new DownlinkFrame.Presence(
+                    text(root, "userId"), root.path("online").asBoolean(false),
+                    root.path("ts").asLong(0));
+            case T_PRESENCE_SNAPSHOT -> new DownlinkFrame.PresenceSnapshot(
+                    presenceEntriesOf(root), root.path("ts").asLong(0));
             default -> new DownlinkFrame.Unknown(type, root);
         };
     }
@@ -268,6 +325,33 @@ public final class Frames {
     private static String text(JsonNode node, String field) {
         JsonNode value = node.get(field);
         return value == null || value.isNull() ? null : value.asString();
+    }
+
+    /**
+     * 解析 {@code presence.snapshot} 的 {@code states[]}。
+     *
+     * <p>跳过缺 userId 的项而不是整帧报错：这是一个展示型应答，
+     * 一条脏数据不该让整个好友列表变成空白。
+     */
+    private static List<DownlinkFrame.PresenceEntry> presenceEntriesOf(JsonNode root) {
+        JsonNode states = root.get("states");
+        if (states == null || !states.isArray()) {
+            return List.of();
+        }
+        List<DownlinkFrame.PresenceEntry> entries = new ArrayList<>(states.size());
+        for (JsonNode item : states) {
+            String userId = text(item, "userId");
+            if (userId == null || userId.isBlank()) {
+                continue;
+            }
+            entries.add(new DownlinkFrame.PresenceEntry(
+                    userId,
+                    item.path("online").asBoolean(false),
+                    item.path("gateways").asInt(0),
+                    item.path("devices").asInt(0),
+                    item.path("lastSeen").asLong(0)));
+        }
+        return entries;
     }
 
     /** {@code msg.recv} 里的一条：我见到这个会话的 seq = N */

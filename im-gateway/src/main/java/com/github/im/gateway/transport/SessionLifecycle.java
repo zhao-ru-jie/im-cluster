@@ -3,6 +3,7 @@ package com.github.im.gateway.transport;
 import com.github.im.contract.MessageEnvelope;
 import com.github.im.contract.MessageEnvelopes;
 import com.github.im.contract.MessageIngress;
+import com.github.im.contract.PresencePort;
 import com.github.im.gateway.metrics.GatewayMetrics;
 import com.github.im.gateway.protocol.ClientFrames;
 import com.github.im.gateway.session.ClientSession;
@@ -16,6 +17,10 @@ import com.github.im.proto.ingress.v1.PullPendingRequest;
 import com.github.im.proto.ingress.v1.PullPendingResponse;
 import com.github.im.proto.ingress.v1.SubmitMessageRequest;
 import com.github.im.proto.ingress.v1.SubmitMessageResponse;
+import com.github.im.proto.presence.v1.GetPresenceRequest;
+import com.github.im.proto.presence.v1.GetPresenceResponse;
+import com.github.im.proto.presence.v1.PresenceReport;
+import com.github.im.proto.presence.v1.TypingRequest;
 import io.grpc.Status;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -59,17 +64,21 @@ public class SessionLifecycle {
     private final GatewayRegistry registry;
     private final ClientFrames frames;
     private final ObjectProvider<MessageIngress> ingressProvider;
+    /** 可空：状态上报（typing / presence）是可选能力，没装配就整体静默 */
+    private final ObjectProvider<PresencePort> presenceProvider;
     private final GatewayMetrics metrics;
 
     public SessionLifecycle(ConnectionManager connectionManager,
                             GatewayRegistry registry,
                             ClientFrames frames,
                             ObjectProvider<MessageIngress> ingressProvider,
+                            ObjectProvider<PresencePort> presenceProvider,
                             GatewayMetrics metrics) {
         this.connectionManager = connectionManager;
         this.registry = registry;
         this.frames = frames;
         this.ingressProvider = ingressProvider;
+        this.presenceProvider = presenceProvider;
         this.metrics = metrics;
     }
 
@@ -92,6 +101,13 @@ public class SessionLifecycle {
         log.info("user {} connected on gateway {} via {} device={} devices={}", userId,
                 registry.localInstanceId(), session.transport(), session.deviceId(),
                 connectionManager.deviceCount(userId));
+        // 上线边沿：本实例上这个用户的第一个设备。
+        // 只判「本地第一台」而不是「全局第一台」：后者要么多一次 Redis 往返，要么留一个
+        // 「刚查完就被别的实例抢先」的竞争窗口。重复上报 harmless（服务端按状态幂等覆盖），
+        // 漏报却会让好友列表一直不亮，所以这里选择「宁可重复」。
+        if (connectionManager.deviceCount(userId) == 1) {
+            reportPresence(userId, deviceKeyOf(session), true);
+        }
         pullPending(session, Map.of());
     }
 
@@ -135,6 +151,16 @@ public class SessionLifecycle {
             reportRead(userId, session, node);
             return;
         }
+        if (ClientFrames.TYPE_TYPING.equals(type)) {
+            // 输入状态：同样是「上报就完事」，失败不回错误帧（客户端不需要知道它丢了）
+            reportTyping(userId, session, node);
+            return;
+        }
+        if (ClientFrames.TYPE_PRESENCE_GET.equals(type)) {
+            // 在线状态查询：唯一一个「上行要回包」的状态类帧，所以它必须回给这条连接
+            presenceSnapshot(session, node);
+            return;
+        }
         if (type != null && !ClientFrames.TYPE_SEND.equals(type)) {
             // 未知帧类型显式报错，而不是当消息投递出去（否则脏帧会被存进消息表）
             session.send(frames.error(text(node, "clientMsgId"), 400, "unsupported frame type: " + type));
@@ -155,6 +181,11 @@ public class SessionLifecycle {
         // 本地已无该用户会话时才清路由，避免把新连接刚写好的路由删掉（那会让消息被误判离线）
         if (!connectionManager.isLocal(userId)) {
             registry.unbindUser(userId);
+            // 下线边沿：本实例上最后一台设备。
+            // 顺序不能反——先摘路由再上报，IM 服务复核时才能查到「真的没有实例还连着」；
+            // 反过来的话它读到「本实例仍在线」就会跳过广播，好友列表永远不熄灯。
+            // 其它实例上是否还有连接由 IM 服务复核，网关不做全局判断（它看不到全局）。
+            reportPresence(userId, deviceKeyOf(session), false);
         }
         metrics.sessionClosed();
         log.info("user {} disconnected from gateway {} via {}", userId, registry.localInstanceId(), session.transport());
@@ -403,6 +434,166 @@ public class SessionLifecycle {
     record ReadReceipt(String conversationId, long seq) {
     }
 
+    // ==== 状态上报（typing / presence） ====
+
+    /**
+     * 输入状态上报：{@code {"ver":1,"type":"typing","conversationId":"s:a:b","typing":true}}。
+     *
+     * <p>和 ACK / 已读同一个口径：<b>异步发出去、失败静默</b>。输入状态是装饰性信息，
+     * 丢了最多让对方少看一次三个点；为它阻塞这条连接的串行队列，或者给客户端加一个
+     * 重试分支，都是拿主链路换装饰品。
+     *
+     * <p>会话与对端<b>至少要有一个</b>：两者都没有的帧没有任何投递对象，
+     * 送去 IM 服务也只会得到一次注定失败的分辨。脏帧直接丢弃，不回错误帧
+     * （客户端拿这个 400 什么也做不了）。
+     */
+    private void reportTyping(String userId, ClientSession session, JsonNode node) {
+        TypingState state = typingOf(node);
+        if (state == null) {
+            log.debug("[typing] 丢弃无收件人的输入状态 user={}", userId);
+            return;
+        }
+        PresencePort port = presenceProvider == null ? null : presenceProvider.getIfAvailable();
+        if (port == null) {
+            return;
+        }
+        TypingRequest request = TypingRequest.newBuilder()
+                .setUserId(userId)
+                .setConversationId(state.conversationId())
+                .setConvType(state.convType())
+                .setReceiverId(state.receiverId())
+                .setTyping(state.typing())
+                .setDeviceId(deviceKeyOf(session))
+                .setClientTs(longValue(node, "clientTs"))
+                .setTraceId(traceIdOf(node))
+                .build();
+        Thread.ofVirtual().name("typing-", 0).start(() -> {
+            try {
+                port.reportTyping(request);
+            } catch (RuntimeException e) {
+                metrics.ingressFailed("typing", e);
+                log.debug("[typing] 上报失败（下一条会覆盖）user={} conv={} err={}",
+                        userId, request.getConversationId(), e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * 在线状态查询：{@code {"ver":1,"type":"presence.get","userIds":["bob"]}}。
+     *
+     * <p>这是状态类帧里<b>唯一会回包</b>的一个，而且必须回给<b>发起查询的那条连接</b>
+     * （不是扇出到该用户的所有设备）：多端场景下，网页刷新的好友列表没有理由让手机也闪一下。
+     *
+     * <p>查询失败回 {@code error 503} 而不是静默：与 typing 不同，这里客户端正在等一个答案，
+     * 让它一直等到超时才是更差的结果。
+     */
+    private void presenceSnapshot(ClientSession session, JsonNode node) {
+        List<String> userIds = presenceUserIdsOf(node);
+        if (userIds.isEmpty()) {
+            session.send(frames.error(null, 400, "'userIds' is required"));
+            return;
+        }
+        PresencePort port = presenceProvider == null ? null : presenceProvider.getIfAvailable();
+        if (port == null) {
+            session.send(frames.error(null, CODE_UNAVAILABLE, "im service unavailable"));
+            return;
+        }
+        Thread.ofVirtual().name("presence-get-", 0).start(() -> {
+            try {
+                GetPresenceResponse response = port.presence(GetPresenceRequest.newBuilder()
+                        .addAllUserIds(userIds)
+                        .build());
+                session.send(frames.presenceSnapshot(response.getStatesList()));
+            } catch (RuntimeException e) {
+                metrics.ingressFailed("presence", e);
+                log.debug("[presence] 查询失败 user={} targets={} err={}",
+                        session.userId(), userIds.size(), e.getMessage());
+                session.send(frames.error(null, CODE_UNAVAILABLE, "presence query failed"));
+            }
+        });
+    }
+
+    /**
+     * 上报在线状态边沿（首个设备上线 / 最后一个设备下线）。
+     *
+     * <p>异步且失败静默：连接本身已经建立/释放完毕，状态上报失败最多让好友列表的亮点晚一点更新，
+     * 绝不能因为它把 {@code onOpen} / {@code onClose} 变成异常路径。
+     */
+    private void reportPresence(String userId, String deviceId, boolean online) {
+        PresencePort port = presenceProvider == null ? null : presenceProvider.getIfAvailable();
+        if (port == null) {
+            return;
+        }
+        PresenceReport report = PresenceReport.newBuilder()
+                .setUserId(userId)
+                .setOnline(online)
+                .setDeviceId(deviceId == null ? "" : deviceId)
+                .setGatewayInstance(registry.localInstanceId())
+                .setTs(System.currentTimeMillis())
+                .build();
+        Thread.ofVirtual().name("presence-report-", 0).start(() -> {
+            try {
+                port.reportPresence(report);
+            } catch (RuntimeException e) {
+                metrics.ingressFailed("presence-report", e);
+                log.debug("[presence] 边沿上报失败 user={} online={} err={}",
+                        userId, online, e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * 解析 {@code {"conversationId":"s:a:b","to":"bob","convType":"SINGLE","typing":true}}。
+     *
+     * <p>抽成静态方法是为了能被单测直接覆盖：这几个字段名是客户端与网关之间的契约，
+     * 一旦漂移，表现不是报错而是「对方永远看不到我在输入」。
+     *
+     * <p>{@code typing} 缺省为 {@code true}：客户端发这条帧的意图本来就是「我在打字」，
+     * 缺字段时当 false 会让那三个点永远不出现。
+     *
+     * @return 会话与对端都没有时返回 {@code null}——没有投递对象的帧直接丢弃
+     */
+    static TypingState typingOf(JsonNode node) {
+        String conversationId = text(node, "conversationId");
+        String receiverId = text(node, "to");
+        if (isBlank(conversationId) && isBlank(receiverId)) {
+            return null;
+        }
+        String convType = text(node, "convType");
+        return new TypingState(conversationId == null ? "" : conversationId,
+                receiverId == null ? "" : receiverId,
+                convType == null ? "" : convType,
+                boolValue(node, "typing", true));
+    }
+
+    /** 一条输入状态的定位信息（会话 / 对端 / 群聊标记 / 是否在输入） */
+    record TypingState(String conversationId, String receiverId, String convType, boolean typing) {
+    }
+
+    /**
+     * 解析 {@code {"userIds":["bob","carol"]}}。
+     *
+     * <p>宽容解析：非数组、空项、非字符串项一律跳过。抽成静态方法是为了让单测直接覆盖
+     * 字段名契约——这个名字一旦和客户端约定漂移，表现是「查询永远返回空」而不是报错。
+     */
+    static List<String> presenceUserIdsOf(JsonNode node) {
+        JsonNode userIds = node.get("userIds");
+        if (userIds == null || !userIds.isArray() || userIds.isEmpty()) {
+            return List.of();
+        }
+        List<String> result = new ArrayList<>(userIds.size());
+        for (JsonNode item : userIds) {
+            if (item == null || item.isNull()) {
+                continue;
+            }
+            String userId = item.asString();
+            if (userId != null && !userId.isBlank()) {
+                result.add(userId);
+            }
+        }
+        return result;
+    }
+
     /**
      * 解析 {@code {"acks":[{"conversationId":"s:a:b","seq":5}]}}。
      *
@@ -485,5 +676,15 @@ public class SessionLifecycle {
     private static long longValue(JsonNode node, String field) {
         JsonNode value = node.get(field);
         return value == null || value.isNull() ? 0L : value.asLong();
+    }
+
+    /** 布尔字段：缺失时用调用方给的缺省值（不同帧的「缺省」语义相反，见调用点） */
+    private static boolean boolValue(JsonNode node, String field, boolean fallback) {
+        JsonNode value = node.get(field);
+        return value == null || value.isNull() ? fallback : value.asBoolean();
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
     }
 }

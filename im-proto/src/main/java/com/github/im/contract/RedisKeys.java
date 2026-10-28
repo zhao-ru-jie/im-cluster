@@ -229,6 +229,20 @@ public final class RedisKeys {
     }
 
     /**
+     * 最近一次下线时间（毫秒时间戳，String，带 TTL）：presence 查询里的 {@code lastSeen}。
+     *
+     * <p>只写「真的下线」这一刻，不写心跳：它回答的是「他上次在线是什么时候」，
+     * 而不是「我们最后一次看见他是什么时候」。TTL 到期即视为「太久没上线，不必展示」——
+     * 一个半年前的用户显示「5 分钟前在线」比不显示更误导。
+     *
+     * <p>用它而不是去扫路由/设备表：那两张表分别是「现在」和「有哪些端」，
+     * 都不记录时间点，也都不该为了展示需求去改语义。
+     */
+    public static String presenceLastSeen(String userId) {
+        return root + ":presence:seen:" + tag(userId);
+    }
+
+    /**
      * 在线路由 key 的 SCAN 匹配模式（用于清理「已下线实例」的残留绑定）。
      *
      * <p>Redis 的 glob 只把 {@code * ? [ ] \\} 当特殊字符，{@code {} 不需要转义，

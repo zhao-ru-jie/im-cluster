@@ -9,6 +9,7 @@ import tools.jackson.databind.ObjectMapper;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -99,6 +100,71 @@ class SessionLifecycleFrameParsingTest {
                 "没有 acks 字段时返回空");
         assertTrue(SessionLifecycle.deliveredAcksOf(parse(
                 "{\"type\":\"msg.recv\",\"acks\":{}}")).isEmpty(), "acks 不是数组时返回空");
+    }
+
+    // ==== typing / presence.get（状态类上行） ====
+
+    @Test
+    @DisplayName("typing：conversationId / to / convType / typing 全部解析")
+    void typingIsParsed() {
+        SessionLifecycle.TypingState state = SessionLifecycle.typingOf(parse(
+                "{\"ver\":1,\"type\":\"typing\",\"conversationId\":\"s:alice:bob\","
+                        + "\"to\":\"bob\",\"convType\":\"SINGLE\",\"typing\":false}"));
+
+        assertNotNull(state, "会话与对端都在，必须能解析");
+        assertEquals("s:alice:bob", state.conversationId());
+        assertEquals("bob", state.receiverId());
+        assertEquals("SINGLE", state.convType());
+        assertFalse(state.typing(), "停止输入必须被如实解析，否则那三个点会一直亮着");
+    }
+
+    @Test
+    @DisplayName("typing：只给对端（单聊最简单写法）也能解析")
+    void typingWithReceiverOnly() {
+        SessionLifecycle.TypingState state = SessionLifecycle.typingOf(parse(
+                "{\"ver\":1,\"type\":\"typing\",\"to\":\"bob\"}"));
+
+        assertNotNull(state, "单聊只要知道发给谁就够了，会话 ID 由 IM 服务补");
+        assertEquals("", state.conversationId());
+        assertEquals("bob", state.receiverId());
+    }
+
+    @Test
+    @DisplayName("typing：缺 typing 字段时按「正在输入」处理")
+    void typingDefaultsToTrue() {
+        SessionLifecycle.TypingState state = SessionLifecycle.typingOf(parse(
+                "{\"type\":\"typing\",\"to\":\"bob\"}"));
+
+        assertNotNull(state);
+        assertTrue(state.typing(), "客户端发这条帧的意图就是打字；缺字段当 false 会让三个点永远不出现");
+    }
+
+    @Test
+    @DisplayName("typing：会话与对端都缺时返回 null（脏帧丢弃，不猜收件人）")
+    void typingWithoutTargetIsDropped() {
+        assertNull(SessionLifecycle.typingOf(parse("{\"type\":\"typing\",\"typing\":true}")));
+        assertNull(SessionLifecycle.typingOf(parse("{\"type\":\"typing\",\"to\":\"  \"}")),
+                "空白字符串等同于没给");
+    }
+
+    @Test
+    @DisplayName("presence.get：userIds 数组按顺序解析，脏项只跳过自己")
+    void presenceUserIdsAreParsed() {
+        List<String> userIds = SessionLifecycle.presenceUserIdsOf(parse(
+                "{\"ver\":1,\"type\":\"presence.get\",\"userIds\":[\"bob\",\"\",\"carol\"]}"));
+
+        assertEquals(List.of("bob", "carol"), userIds, "空串项跳过，合法项保持顺序");
+    }
+
+    @Test
+    @DisplayName("presence.get：缺失/非数组时返回空，不抛异常")
+    void presenceUserIdsToleratesBadInput() {
+        assertTrue(SessionLifecycle.presenceUserIdsOf(parse("{\"type\":\"presence.get\"}")).isEmpty());
+        assertTrue(SessionLifecycle.presenceUserIdsOf(parse(
+                "{\"type\":\"presence.get\",\"userIds\":\"bob\"}")).isEmpty(),
+                "字符串不是数组，硬转会得到一个字符一个人的诡异结果");
+        assertTrue(SessionLifecycle.presenceUserIdsOf(parse(
+                "{\"type\":\"presence.get\",\"userIds\":[]}")).isEmpty());
     }
 
     private JsonNode parse(String json) {

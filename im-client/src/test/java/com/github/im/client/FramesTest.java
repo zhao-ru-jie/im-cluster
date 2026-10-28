@@ -216,4 +216,77 @@ class FramesTest {
         assertEquals(12, read.path("seq").asLong());
         assertTrue(read.path("seq").isNumber());
     }
+
+    // ==== presence / typing ====
+
+    @Test
+    @DisplayName("typing 上行：空字段不下发，typing 是布尔而不是字符串")
+    void typingFrame() {
+        JsonNode node = mapper.readTree(frames.typing("s:alice:bob", null, null, true));
+        assertEquals("typing", node.path("type").asString());
+        assertEquals("s:alice:bob", node.path("conversationId").asString());
+        assertTrue(node.path("typing").isBoolean(), "typing 必须是布尔：服务端用 asBoolean 读");
+        assertTrue(node.path("typing").asBoolean());
+        assertFalse(node.has("to"), "给了会话就不该再带 to，两个都带只会让服务端多一次判定");
+
+        JsonNode stop = mapper.readTree(frames.typing(null, "bob", null, false));
+        assertEquals("bob", stop.path("to").asString());
+        assertFalse(stop.path("typing").asBoolean(), "typing=false 必须如实编码，它是对方三个点熄灭的唯一信号");
+        assertFalse(stop.has("conversationId"));
+    }
+
+    @Test
+    @DisplayName("presence.get 上行：userIds 是数组")
+    void presenceGetFrame() {
+        JsonNode node = mapper.readTree(frames.presenceGet(List.of("bob", "carol")));
+        assertEquals("presence.get", node.path("type").asString());
+        assertTrue(node.path("userIds").isArray(), "字符串会被服务端当成「一个人一个字符」");
+        assertEquals(2, node.path("userIds").size());
+        assertEquals("bob", node.path("userIds").get(0).asString());
+    }
+
+    @Test
+    @DisplayName("typing.push 下行：解析出会话、用户与开/关")
+    void typingPushParsed() {
+        DownlinkFrame frame = frames.parse("""
+                {"ver":1,"type":"typing.push","conversationId":"s:alice:bob","convType":"SINGLE",
+                 "userId":"alice","typing":true,"ts":1750000000000}
+                """);
+        assertTrue(frame instanceof DownlinkFrame.Typing);
+        DownlinkFrame.Typing typing = (DownlinkFrame.Typing) frame;
+        assertEquals("s:alice:bob", typing.conversationId());
+        assertEquals("alice", typing.userId());
+        assertTrue(typing.typing());
+    }
+
+    @Test
+    @DisplayName("presence.push 下行：只带 userId 与 online（设备数属于隐私，不下发好友）")
+    void presencePushParsed() {
+        DownlinkFrame frame = frames.parse("""
+                {"ver":1,"type":"presence.push","userId":"bob","online":false,"ts":1750000000000}
+                """);
+        assertTrue(frame instanceof DownlinkFrame.Presence);
+        DownlinkFrame.Presence presence = (DownlinkFrame.Presence) frame;
+        assertEquals("bob", presence.userId());
+        assertFalse(presence.online());
+    }
+
+    @Test
+    @DisplayName("presence.snapshot 下行：states 解析成条目，脏项跳过")
+    void presenceSnapshotParsed() {
+        DownlinkFrame frame = frames.parse("""
+                {"ver":1,"type":"presence.snapshot","states":[
+                  {"userId":"bob","online":true,"gateways":1,"devices":2,"lastSeen":0},
+                  {"online":true},
+                  {"userId":"carol","online":false,"gateways":0,"devices":1,"lastSeen":1750000000000}
+                ],"ts":1750000000000}
+                """);
+        assertTrue(frame instanceof DownlinkFrame.PresenceSnapshot);
+        DownlinkFrame.PresenceSnapshot snapshot = (DownlinkFrame.PresenceSnapshot) frame;
+        assertEquals(2, snapshot.states().size(), "缺 userId 的项没有意义，跳过而不是整帧报错");
+        assertTrue(snapshot.online("bob"));
+        assertFalse(snapshot.online("carol"));
+        assertEquals(2, snapshot.states().get(0).devices());
+        assertEquals(1_750_000_000_000L, snapshot.states().get(1).lastSeen());
+    }
 }

@@ -96,6 +96,35 @@ public class ClientFrames {
     /** 群已解散 */
     public static final String GROUP_DISMISSED = "DISMISSED";
 
+    /**
+     * 「正在输入」状态（{@code typing.push}）。
+     *
+     * <pre>
+     * {"ver":1,"type":"typing.push","conversationId":"s:a:b","convType":"SINGLE",
+     *  "userId":"alice","typing":true,"ts":1750000000000}
+     * </pre>
+     *
+     * <p>为什么不能复用 {@code msg.state}：那个帧的定位是「某条消息走到了哪一步」，
+     * 主体是 {@code seq}；typing 没有消息、没有 seq，主体是「某个人曾经/正在输入」。
+     * 混进去就会让客户端为了画三个小点去解析一个不存在的序号。
+     *
+     * <p>为什么不落库、不进离线队列：一条 5 秒前的「正在输入」现在送出去只会误导
+     * （他可能早就发完消息了）。这类帧的正确性由「下一条覆盖上一条」保证，而不是由投递保证。
+     */
+    public static final String TYPE_TYPING = "typing.push";
+    /**
+     * 在线状态变化（{@code presence.push}），推给<b>好友</b>。
+     *
+     * <pre>
+     * {"ver":1,"type":"presence.push","userId":"bob","online":true,"ts":1750000000000}
+     * </pre>
+     *
+     * <p>与 {@code typing.push} 一样是「状态」而不是「事件」：重复收到 {@code online:true}
+     * 是无害的（客户端幂等覆盖），但<b>错的 offline 有害</b>（好友头像会一直灰着）。
+     * 因此下线判定从严：只有确认「路由表里已经没有这个用户」才推。
+     */
+    public static final String TYPE_PRESENCE = "presence.push";
+
     /** 撤回：会话级，广播给会话内所有人（含发送方自己的其他端） */
     public static final String CHANGE_RECALLED = "RECALLED";
     /** 本地删除：用户级，只推给操作者自己的其他端；对端不受影响 */
@@ -268,6 +297,43 @@ public class ClientFrames {
         frame.put("change", change);
         frame.put("actorId", actorId == null ? "" : actorId);
         frame.put("targetId", targetId == null ? "" : targetId);
+        frame.put("ts", ts);
+        return objectMapper.writeValueAsString(frame);
+    }
+
+    /**
+     * 「正在输入」帧。
+     *
+     * @param conversationId 会话 ID（客户端按会话定位输入状态，单个会话同一时刻只显示最后一个人）
+     * @param convType       SINGLE / GROUP
+     * @param userId         谁在输入（收件人据此决定「是不是对方」而不是自己）
+     * @param typing         true=正在输入，false=停止（停止必须及时下发，否则那三个点会一直闪）
+     */
+    public String typingFrame(String conversationId, String convType, String userId, boolean typing, long ts) {
+        Map<String, Object> frame = new LinkedHashMap<>();
+        frame.put("ver", VER);
+        frame.put("type", TYPE_TYPING);
+        frame.put("conversationId", conversationId);
+        frame.put("convType", convType);
+        frame.put("userId", userId);
+        frame.put("typing", typing);
+        frame.put("ts", ts);
+        return objectMapper.writeValueAsString(frame);
+    }
+
+    /**
+     * 在线状态变化帧（推给好友）。
+     *
+     * <p>只带 {@code online} 布尔值，不带「几台设备」：好友列表要的是「亮/不亮」，
+     * 多端细节是用户自己的隐私（几台手机在线不该被好友看见），
+     * 需要设备数的只有用户自己，那走 REST 的 {@code /presence}。
+     */
+    public String presenceFrame(String userId, boolean online, long ts) {
+        Map<String, Object> frame = new LinkedHashMap<>();
+        frame.put("ver", VER);
+        frame.put("type", TYPE_PRESENCE);
+        frame.put("userId", userId);
+        frame.put("online", online);
         frame.put("ts", ts);
         return objectMapper.writeValueAsString(frame);
     }

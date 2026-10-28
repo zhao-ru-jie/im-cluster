@@ -1,5 +1,6 @@
 package com.github.im.server.message;
 
+import com.github.im.contract.MessageEnvelope;
 import com.github.im.contract.PushPort;
 import com.github.im.proto.push.v1.PushTask;
 import jakarta.annotation.PreDestroy;
@@ -131,26 +132,13 @@ public class MessageStateNotifier {
     /**
      * 单聊会话 ID 是 {@code s:{a}:{b}}（两个 userId 排序后拼接），从中取出对端。
      *
+     * <p>解析逻辑已收敛到契约层（{@link MessageEnvelope#peerOf}）：输入状态、回执、
+     * 会话列表都要做同一件事，各写一份就会在某次协议微调后只有一半的地方生效。
+     *
      * @return 对端 userId；群聊 / 格式不合法 / actor 不属于这个会话时返回 {@code null}
      */
     static String peerOf(String conversationId, String actorUserId) {
-        if (conversationId == null || actorUserId == null || !conversationId.startsWith("s:")) {
-            return null;
-        }
-        String rest = conversationId.substring(2);
-        int sep = rest.indexOf(':');
-        if (sep <= 0 || sep == rest.length() - 1) {
-            return null;
-        }
-        String a = rest.substring(0, sep);
-        String b = rest.substring(sep + 1);
-        if (actorUserId.equals(a)) {
-            return b;
-        }
-        if (actorUserId.equals(b)) {
-            return a;
-        }
-        return null;
+        return MessageEnvelope.peerOf(conversationId, actorUserId);
     }
 
     /** @return true = 这是该会话该状态的新高，值得推一条 */

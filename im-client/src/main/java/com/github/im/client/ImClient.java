@@ -2,6 +2,7 @@ package com.github.im.client;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -434,6 +435,56 @@ public final class ImClient implements AutoCloseable {
         return sendControl(frames.read(conversationId, seq));
     }
 
+    /**
+     * 上报「我在输入 / 停止输入」。
+     *
+     * <p><b>不落本地表、不重投</b>：输入状态只在「此刻」有意义，断线期间攒下的
+     * 「他在输入」重连后补发出去只会误导对方。所以这里没连上就直接返回 false。
+     *
+     * <p>宿主不需要自己做节流：服务端对 {@code typing=true} 有 3 秒去抖。
+     * 但 <b>{@code typing=false} 必须发</b>——它是对方那三个点熄灭的唯一信号。
+     *
+     * @param conversationId 会话 ID（单聊 {@code s:a:b} / 群聊 {@code g:xxx}）
+     */
+    public boolean sendTyping(String conversationId, boolean typing) {
+        ensureOpen();
+        if (conversationId == null || conversationId.isBlank()) {
+            return false;
+        }
+        return sendControl(frames.typing(conversationId, null, null, typing));
+    }
+
+    /** 单聊简写：只给对端，会话 ID 由服务端按消息路径同一套规则生成 */
+    public boolean sendTypingTo(String to, boolean typing) {
+        ensureOpen();
+        if (to == null || to.isBlank()) {
+            return false;
+        }
+        return sendControl(frames.typing(null, to, null, typing));
+    }
+
+    /** 群聊简写：把 groupId 拼成 {@code g:} 前缀的会话 ID（这层约定不该让宿主自己记） */
+    public boolean sendGroupTyping(String groupId, boolean typing) {
+        ensureOpen();
+        if (groupId == null || groupId.isBlank()) {
+            return false;
+        }
+        return sendControl(frames.typing("g:" + groupId, groupId, "GROUP", typing));
+    }
+
+    /**
+     * 查询一批用户的在线状态；应答经 {@link ImClientListener#onPresenceSnapshot} 回调。
+     *
+     * @return 本帧是否发出（没连上为 false——状态查询不值得排队）
+     */
+    public boolean queryPresence(Collection<String> userIds) {
+        ensureOpen();
+        if (userIds == null || userIds.isEmpty()) {
+            return false;
+        }
+        return sendControl(frames.presenceGet(userIds));
+    }
+
     /** 立即上报一次会话水位（正常由重连自动触发；宿主也可以在切后台前手动调） */
     public void sendSync() {
         sendControl(frames.sync(table.inboundWatermarks()));
@@ -495,6 +546,11 @@ public final class ImClient implements AutoCloseable {
             case DownlinkFrame.Update update -> notifyListener(() -> listener.onUpdate(update));
             case DownlinkFrame.GroupUpdate groupUpdate ->
                     notifyListener(() -> listener.onGroupUpdate(groupUpdate));
+            // 状态类帧（输入中 / 在线状态）：不写本地表、不参与去重，直接交给宿主渲染
+            case DownlinkFrame.Typing typingFrame -> notifyListener(() -> listener.onTyping(typingFrame));
+            case DownlinkFrame.Presence presence -> notifyListener(() -> listener.onPresence(presence));
+            case DownlinkFrame.PresenceSnapshot snapshot ->
+                    notifyListener(() -> listener.onPresenceSnapshot(snapshot));
             case DownlinkFrame.Error error -> handleError(error);
             // 服务端探测必须立刻回：网关 90s 收不到任何上行就断开，
             // 而「回 pong」本身也证明连接是可写的（半开连接靠这个暴露）

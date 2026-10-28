@@ -1,0 +1,105 @@
+syntax = "proto3";
+
+package im.presence.v1;
+
+option java_package = "com.github.im.proto.presence.v1";
+option java_multiple_files = true;
+option java_outer_classname = "ImPresenceProto";
+
+// ============================================================================
+// 「在线状态（presence）」与「正在输入（typing）」的上行契约：
+// 长连接服务(im-gateway) -> IM 业务服务(im-server)
+//
+// 为什么单独一个 service，而不是塞进 MessageIngress：
+//   * 可靠性模型相反。消息是 at-least-once（落库 + 幂等 + 离线兜底 + 按 seq 拉齐）；
+//     typing / 上下线是 **best-effort**：丢了不影响任何正确性，绝不能落离线队列，
+//     也不能让客户端为它写重试；
+//   * 生命周期不同。消息有 server_msg_id 与 seq；typing 没有 ID、没有序号、有时效
+//     （一条 5 秒前的「正在输入」现在送出只会让人困惑）。
+//   把两者放在同一个接口里，调用方迟早会按「消息」的方式去处理「状态」，那才是真正的错。
+//
+// 上下行数据流：
+//   客户端 --typing帧--> 网关 --ReportTyping--> IM 服务 --typing.push--> 会话其他成员
+//   客户端 --presence.get帧--> 网关 --GetPresence--> IM 服务 --presence.snapshot--> 请求方
+//   网关（连接建立/断开边沿）--ReportPresence--> IM 服务 --presence.push--> 好友
+// ============================================================================
+service PresenceIngress {
+  // 转发一条「正在输入」状态。
+  //
+  // 语义是「这个人此刻在输入框里敲字」，不是「他发了消息」：客户端按节流（如 3~5 秒）
+  // 在打字期间重复上报，停止输入或发送后上报 typing=false。
+  //
+  // 服务端只做两件事：解析出真正的收件人（单聊对端 / 群成员），以及**去抖**——
+  // 同一个会话里同一个人 3 秒内重复的 typing=true 只扇出一次，否则一个打字的用户
+  // 就能用每帧几百字节的扇出把群成员全刷一遍。
+  rpc ReportTyping(TypingRequest) returns (TypingResponse);
+
+  // 批量查询在线状态（好友列表 / 会话列表刷新时调用）。
+  //
+  // 为什么是「批量」而不是 per-user：这是一个典型的 N+1 场景——打开好友列表要查几十到几百人，
+  // 一次一条 RPC 会把「打开一个页面」放大成几百次网络往返。
+  rpc GetPresence(GetPresenceRequest) returns (GetPresenceResponse);
+
+  // 网关上报「这个用户的在线状态发生了边沿变化」（首个设备上线 / 最后一个设备下线）。
+  //
+  // 为什么判定边沿的是网关而不是 IM 服务：只有网关知道「本机上还有没有这个用户的连接」，
+  // 也只有在连接建立/断开的时刻它才知道。IM 服务只读在线路由表（Redis），
+  // 读到的永远是「现在的状态」，读不出「刚刚从 1 台变成 0 台」这种事件。
+  //
+  // 为什么不在网关侧直接广播给好友：好友关系是 IM 服务的领域数据（关系表在 im-server），
+  // 网关不认识它；把关系读进网关会把网关变成第二个业务服务。
+  rpc ReportPresence(PresenceReport) returns (PresenceReportAck);
+}
+
+message TypingRequest {
+  string user_id = 1;          // 谁在输入（网关按连接身份填，客户端不可伪造）
+  string conversation_id = 2;  // 会话 ID；为空时由服务端按 (user_id, receiver_id) 规范生成
+  string conv_type = 3;        // SINGLE / GROUP（空则按 conversation_id 前缀判定）
+  string receiver_id = 4;      // 单聊对端；群聊留空（群成员由 IM 服务解析）
+  bool typing = 5;             // true=正在输入，false=停止输入（必须转发，不做去抖）
+  string device_id = 6;        // 输入端设备；同一用户多端时用于回声抑制（不收件人自己）
+  int64 client_ts = 7;         // 客户端时间，仅作参考
+  string trace_id = 8;         // 链路追踪 ID，便于两端日志对齐同一次输入
+}
+
+message TypingResponse {
+  int32 code = 1;    // 0=已处理；其它值仅供观测（调用方不需要重试）
+  string message = 2;
+  int32 delivered = 3; // 实际推送的在线用户数（0 = 对方不在线，客户端不必在意）
+}
+
+message GetPresenceRequest {
+  // 待查询用户；服务端会夹取单次上限（超出的部分不返回，避免一次查询拖出几百次 Redis 往返）
+  repeated string user_ids = 1;
+}
+
+// 一个用户的在线状态快照。
+//
+// 「在线」的判定只有一条：网关在 Redis 里写的路由集合非空（{@code im:gateway:user:{userId}}）。
+// 这条规则的好处是不需要额外的「在线表」去和连接状态对账——路由本来就是为了下行推送存在的，
+// 它一旦不准，消息就已经推不到了，presence 准不准反而次要。
+message PresenceState {
+  string user_id = 1;
+  bool online = 2;      // 是否有任意设备在线
+  int32 gateways = 3;   // 在线网关实例数（多端分散在多个实例上时 > 1）
+  int32 devices = 4;    // 该用户注册过的设备数（含离线设备，TTL 30 天）
+  int64 last_seen = 5;  // 最近一次下线时间（毫秒，0 = 从未下线过或已过保留期）
+}
+
+message GetPresenceResponse {
+  repeated PresenceState states = 1;
+}
+
+message PresenceReport {
+  string user_id = 1;
+  bool online = 2;             // true=首个设备上线；false=最后一个设备下线
+  string device_id = 3;
+  string gateway_instance = 4;
+  int64 ts = 5;
+}
+
+message PresenceReportAck {
+  int32 code = 1;
+  string message = 2;
+  bool broadcast = 3; // true=这次边沿真的产生了下行（false 说明「其它实例还有连接」或没有好友在线）
+}

@@ -1,10 +1,12 @@
 package com.github.im.gatewayboot.config;
 
 import com.github.im.contract.MessageIngress;
+import com.github.im.contract.PresencePort;
 import com.github.im.gatewayboot.discovery.IngressNameResolverProvider;
 import com.github.im.gatewayboot.discovery.IngressTargets;
 import com.github.im.rpc.common.GrpcChannelFactory;
 import com.github.im.rpc.ingress.RemoteMessageIngress;
+import com.github.im.rpc.presence.RemotePresenceIngress;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -96,5 +98,24 @@ public class GatewayWiringConfig {
         // 打开的实例个数由 NameResolver 的地址数决定，其余实例在后台陆续建连（不影响可用性）。
         channels.warmUp(target);
         return new RemoteMessageIngress(channels, target, timeoutMs, waitForReady);
+    }
+
+    /**
+     * 状态上报（typing / presence）的上行实现。
+     *
+     * <p>和 {@link #messageIngress} 共用同一个 channel 与 target，但<b>不共享超时策略</b>：
+     * 这里刻意不传 {@code waitForReady}——状态类请求只在「此刻」有意义，
+     * 等实例就绪再送出去的「正在输入」已经过期了（详见 {@code RemotePresenceIngress} 的类注释）。
+     *
+     * <p>单独一个 bean 而不是塞进 {@link MessageIngress}：两条路的可靠性模型相反
+     * （消息至少一次，状态 best-effort），混在一个端口里早晚会有人按消息的方式处理状态。
+     */
+    @Bean
+    public PresencePort presencePort(GrpcChannelFactory channels,
+                                     IngressTargets targets,
+                                     @Value("${im.presence.timeout-ms:500}") long timeoutMs) {
+        String target = IngressNameResolverProvider.SCHEME + ":///" + targets.serviceName();
+        log.info("[presence] 状态上报走远程 gRPC target={}（timeout={}ms，失败即丢）", target, timeoutMs);
+        return new RemotePresenceIngress(channels, target, timeoutMs);
     }
 }

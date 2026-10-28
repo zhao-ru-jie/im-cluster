@@ -3,96 +3,556 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>IM 节点测试客户端</title>
+  <title>IM 测试客户端</title>
   <style>
     * { box-sizing: border-box; }
-    body { font-family: system-ui, "Segoe UI", Arial, sans-serif; margin: 0; padding: 16px;
-           background: #f7f8fa; color: #1f2937; }
-    h2 { margin: 0 0 12px; font-size: 16px; font-weight: 500; }
-    .row { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
-    input { padding: 8px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 13px; }
-    button { padding: 8px 14px; border: 0; border-radius: 8px; background: #185fa5; color: #fff;
+    body { font-family: system-ui, "Segoe UI", Arial, sans-serif; margin: 0; padding: 14px;
+           background: #f7f8fa; color: #1f2937; font-size: 13px; }
+    h2 { margin: 0 0 10px; font-size: 15px; font-weight: 600; }
+    h3 { margin: 14px 0 6px; font-size: 13px; font-weight: 600; color: #334155; }
+    .layout { display: flex; gap: 14px; align-items: flex-start; }
+    .main { flex: 1 1 62%; min-width: 520px; }
+    .side { flex: 1 1 38%; min-width: 380px; position: sticky; top: 14px; }
+    .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+    .row { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; align-items: center; }
+    input, select { padding: 7px 8px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 13px;
+                    background: #fff; color: #1f2937; }
+    input:disabled, select:disabled { background: #f1f5f9; }
+    button { padding: 7px 12px; border: 0; border-radius: 8px; background: #185fa5; color: #fff;
              font-size: 13px; cursor: pointer; }
-    button:disabled { opacity: .5; cursor: not-allowed; }
-    #log { margin-top: 12px; height: 320px; overflow: auto; background: #fff; border: 1px solid #e2e8f0;
-           border-radius: 8px; padding: 10px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+    button.ghost { background: #e2e8f0; color: #334155; }
+    button.warn { background: #b91c1c; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .tabs { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
+    .tabs button { background: #e2e8f0; color: #334155; }
+    .tabs button.active { background: #185fa5; color: #fff; }
+    .pane { display: none; }
+    .pane.active { display: block; }
+    #log { height: calc(100vh - 120px); overflow: auto; background: #fff; border: 1px solid #e2e8f0;
+           border-radius: 10px; padding: 10px; line-height: 1.55; white-space: pre-wrap;
+           font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12px; }
     .me { color: #185fa5; }
     .sys { color: #64748b; }
     .ack { color: #0f766e; }
+    .api { color: #7c3aed; }
+    .evt { color: #b45309; }
+    .err { color: #b91c1c; }
+    .hint { color: #94a3b8; font-size: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid #eef2f7; }
+    th { color: #64748b; font-weight: 500; }
+    tr.pick { cursor: pointer; }
+    tr.pick:hover { background: #f1f5f9; }
+    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #cbd5e1;
+           margin-right: 6px; vertical-align: middle; }
+    .dot.on { background: #16a34a; }
+    .badge { display: inline-block; padding: 1px 6px; border-radius: 6px; background: #e2e8f0;
+             color: #475569; font-size: 11px; margin-left: 4px; }
+    .badge.unread { background: #fee2e2; color: #b91c1c; }
+    .typing { color: #b45309; min-height: 18px; }
+    .status-line { color: #475569; }
+    .status-line b { color: #16a34a; }
+    .banner { background: #fef2f2; border: 1px solid #fca5a5; color: #991b1b; border-radius: 10px;
+              padding: 10px 12px; margin-bottom: 12px; line-height: 1.7; }
+    .banner code { background: #fff; padding: 1px 5px; border-radius: 5px; }
   </style>
 </head>
 <body>
-  <h2>IM 节点测试客户端（当前节点：<span id="nodeUrl"></span>）</h2>
-  <div class="row">
-    <input id="userId" placeholder="你的 userId，如 alice" style="width:200px">
-    <button id="connectBtn" onclick="connect()">连接</button>
-    <button id="disconnectBtn" onclick="disconnect()" disabled>断开</button>
+  <div id="banner" class="banner" style="display:none"></div>
+  <h2>IM 测试客户端 · 页面来源 <span id="pageOrigin"></span> · REST <span id="httpBase"></span> · WS <span id="nodeUrl"></span></h2>
+
+  <div class="layout">
+    <div class="main">
+      <div class="card">
+        <div class="row">
+          <input id="userId" placeholder="你的 userId，如 alice" style="width:170px">
+          <input id="deviceId" placeholder="deviceId" value="web" style="width:110px">
+          <input id="token" placeholder="token（im.auth.mode=off 时留空）" style="width:220px">
+          <button id="connectBtn" onclick="connect()">连接</button>
+          <button id="disconnectBtn" class="ghost" onclick="disconnect()" disabled>断开</button>
+          <button class="ghost" onclick="ping()">ping</button>
+          <span id="connState" class="status-line">未连接</span>
+        </div>
+        <div class="row">
+          <span class="hint">REST 地址</span>
+          <input id="apiBase" placeholder="留空=同源；如 http://127.0.0.1:8080" style="width:250px">
+          <span class="hint">WS 端口</span>
+          <input id="wsPort" value="8081" style="width:78px">
+          <button class="ghost" onclick="probeRest(true)">检测 REST</button>
+        </div>
+        <div class="hint">
+          本页必须由 IM 服务自身提供（<code>http://主机:端口/index.html</code>）。
+          若通过 IDE 内置服务器等其它静态服务器打开，<code>/conv</code> 这类 REST 会 404，
+          点「检测 REST」可自动找并把地址填到上面。
+        </div>
+        <div class="row">
+          <input id="to" placeholder="对端 userId，如 bob" style="width:170px">
+          <button class="ghost" onclick="pickPeer()">用「我 ↔ 对端」的会话</button>
+          <input id="convId" placeholder="当前会话 ID，如 s:alice:bob / g:xxxx" style="flex:1;min-width:220px">
+        </div>
+      </div>
+
+      <div class="tabs">
+        <button class="active" onclick="tab('msg', this)">消息</button>
+        <button onclick="tab('conv', this)">会话</button>
+        <button onclick="tab('group', this)">群组</button>
+        <button onclick="tab('social', this)">关系 / 在线</button>
+        <button onclick="tab('ops', this)">运维</button>
+      </div>
+
+      <!-- ================= 消息 ================= -->
+      <div id="pane-msg" class="pane active">
+        <div class="card">
+          <h3>发送消息（WS · msg.send）</h3>
+          <div class="row">
+            <input id="body" placeholder="消息内容" style="flex:1;min-width:200px">
+            <select id="contentType">
+              <option value="TEXT">文本</option>
+              <option value="IMAGE">图片</option>
+              <option value="FILE">文件</option>
+              <option value="VOICE">语音</option>
+              <option value="VIDEO">视频</option>
+              <option value="CUSTOM">自定义</option>
+            </select>
+            <button id="sendBtn" onclick="send()" disabled>发送</button>
+          </div>
+          <div class="row">
+            <input id="attrs" placeholder='媒体元数据，如 {"url":"https://...","size":1024}' style="flex:1;min-width:240px">
+          </div>
+          <div class="typing" id="typingLine"></div>
+        </div>
+
+        <div class="card">
+          <h3>正在输入（WS · typing / typing.push）</h3>
+          <div class="row">
+            <label><input type="checkbox" id="autoTyping" checked> 输入框打字时自动上报（3s 节流，停手 2s 发 false）</label>
+          </div>
+          <div class="row">
+            <button class="ghost" onclick="sendTyping(true)">上报 typing=true</button>
+            <button class="ghost" onclick="sendTyping(false)">上报 typing=false</button>
+            <span class="hint">服务端对 true 有 3s 去抖；false 一定下发</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>REST 直投（POST /send，绕过长连接）</h3>
+          <div class="row">
+            <input id="restFrom" placeholder="from" style="width:110px">
+            <input id="restTo" placeholder="to" style="width:110px">
+            <input id="restBody" placeholder="body" style="flex:1;min-width:160px">
+            <button class="ghost" onclick="restSend()">发送</button>
+          </div>
+          <div class="hint">同一条消息链路的另一入口（幂等 + seq + 落库 + 推送 + 离线兜底），用于没有长连接时验证。</div>
+        </div>
+      </div>
+
+      <!-- ================= 会话 ================= -->
+      <div id="pane-conv" class="pane">
+        <div class="card">
+          <h3>会话列表（GET /conv）</h3>
+          <div class="row">
+            <input id="convLimit" type="number" value="50" style="width:80px">
+            <button class="ghost" onclick="loadConversations()">刷新列表</button>
+            <span class="hint">点一行即选中该会话</span>
+          </div>
+          <div id="convTable"><div class="hint">还没拉取</div></div>
+        </div>
+
+        <div class="card">
+          <h3>历史消息（GET /conv/{id}/messages）</h3>
+          <div class="row">
+            <input id="histBefore" type="number" placeholder="beforeSeq（0=最新）" value="0" style="width:170px">
+            <input id="histLimit" type="number" placeholder="limit" value="20" style="width:90px">
+            <button class="ghost" onclick="loadHistory(true)">拉一页</button>
+            <button class="ghost" onclick="loadHistory(false)">下一页（用 nextBeforeSeq）</button>
+            <span id="histCursor" class="hint"></span>
+          </div>
+          <div id="histList"><div class="hint">还没拉取</div></div>
+        </div>
+
+        <div class="card">
+          <h3>已读 / 撤回 / 删除 / 标记</h3>
+          <div class="row">
+            <input id="opSeq" type="number" placeholder="seq" style="width:100px">
+            <span class="hint">默认填最近一条的 seq</span>
+          </div>
+          <div class="row">
+            <button class="ghost" onclick="markReadHttp()">REST 已读</button>
+            <button class="ghost" onclick="markReadWs()">WS 已读</button>
+            <button class="ghost" onclick="recall()">撤回</button>
+            <button class="ghost" onclick="deleteMsg()">本地删除</button>
+          </div>
+          <div class="row">
+            <select id="flagPinned">
+              <option value="">置顶：不改</option>
+              <option value="true">置顶</option>
+              <option value="false">取消置顶</option>
+            </select>
+            <select id="flagMuted">
+              <option value="">免打扰：不改</option>
+              <option value="true">免打扰</option>
+              <option value="false">取消免打扰</option>
+            </select>
+            <button class="ghost" onclick="setFlag()">保存标记</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ================= 群组 ================= -->
+      <div id="pane-group" class="pane">
+        <div class="card">
+          <h3>建群 / 查资料（POST /group、GET /group/{id}）</h3>
+          <div class="row">
+            <input id="groupName" placeholder="群名" style="width:160px">
+            <input id="groupMax" type="number" placeholder="maxMembers（0=默认）" value="0" style="width:170px">
+            <button class="ghost" onclick="createGroup()">建群（我是群主）</button>
+          </div>
+          <div class="row">
+            <input id="groupId" placeholder="groupId（建群后自动填入）" style="flex:1;min-width:220px">
+            <button class="ghost" onclick="groupDetail()">查资料</button>
+            <button class="ghost" onclick="groupMembers()">查成员</button>
+            <button class="ghost" onclick="useGroupConv()">设为当前会话</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>成员 / 角色 / 禁言</h3>
+          <div class="row">
+            <input id="groupTargets" placeholder="要加/踢的 userId，逗号分隔" style="flex:1;min-width:200px">
+            <button class="ghost" onclick="groupAddMembers()">加人</button>
+            <button class="ghost" onclick="groupKick()">踢人</button>
+            <button class="ghost" onclick="groupLeave()">退群</button>
+          </div>
+          <div class="row">
+            <select id="groupRole">
+              <option value="ADMIN">ADMIN</option>
+              <option value="MEMBER">MEMBER</option>
+            </select>
+            <button class="ghost" onclick="groupSetRole()">设角色</button>
+            <input id="muteSeconds" type="number" value="600" style="width:100px">
+            <button class="ghost" onclick="groupMute()">单人禁言（秒）</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>治理动作</h3>
+          <div class="row">
+            <input id="groupNewName" placeholder="新群名" style="width:150px">
+            <button class="ghost" onclick="groupRename()">改名</button>
+            <input id="groupAnnounce" placeholder="公告文本" style="flex:1;min-width:160px">
+            <button class="ghost" onclick="groupAnnouncement()">发公告</button>
+          </div>
+          <div class="row">
+            <input id="groupNewMax" type="number" placeholder="人数上限" style="width:120px">
+            <button class="ghost" onclick="groupMaxMembers()">改上限</button>
+            <button class="ghost" onclick="groupMuteAll(true)">全员禁言</button>
+            <button class="ghost" onclick="groupMuteAll(false)">解除全员禁言</button>
+            <button class="warn" onclick="groupDisband()">解散群</button>
+          </div>
+          <div class="hint">每个动作都会让群成员收到 group.update 事件（见右侧日志）。</div>
+        </div>
+      </div>
+
+      <!-- ================= 关系 / 在线 ================= -->
+      <div id="pane-social" class="pane">
+        <div class="card">
+          <h3>好友 / 黑名单（/relation）</h3>
+          <div class="row">
+            <input id="relationTargets" placeholder="userId，逗号分隔" style="flex:1;min-width:200px">
+            <button class="ghost" onclick="friendsGet()">查好友</button>
+            <button class="ghost" onclick="friendsAdd()">加好友</button>
+            <button class="ghost" onclick="friendsRemove()">删好友</button>
+          </div>
+          <div class="row">
+            <button class="ghost" onclick="blocksGet()">查黑名单</button>
+            <button class="ghost" onclick="blocksAdd()">拉黑</button>
+            <button class="ghost" onclick="blocksRemove()">取消拉黑</button>
+          </div>
+          <div class="hint">presence.push 只推给好友；被拉黑的人仍可能收到对方的上线事件（关系表没有反向索引）。</div>
+        </div>
+
+        <div class="card">
+          <h3>在线状态（WS · presence.get / presence.snapshot，REST · /presence）</h3>
+          <div class="row">
+            <input id="presenceTargets" placeholder="要查的 userId，逗号分隔（空=对端+我）" style="flex:1;min-width:200px">
+            <button class="ghost" onclick="presenceGetWs()">WS 查询</button>
+            <button class="ghost" onclick="presenceGetHttp()">REST 查询</button>
+          </div>
+          <div id="presenceList"><div class="hint">还没查过</div></div>
+        </div>
+      </div>
+
+      <!-- ================= 运维 ================= -->
+      <div id="pane-ops" class="pane">
+        <div class="card">
+          <h3>网关状态（GET /admin/status）</h3>
+          <div class="row">
+            <button class="ghost" onclick="adminStatus()">查状态</button>
+            <span class="hint">连接数 / WS·TCP 占比 / 被背压暂停的连接 / 是否在摘流</span>
+          </div>
+          <div id="adminBox"><div class="hint">还没查过</div></div>
+        </div>
+
+        <div class="card">
+          <h3>摘流（POST /admin/drain）</h3>
+          <div class="row">
+            <input id="drainReason" placeholder="reason" value="manual" style="width:180px">
+            <button class="warn" onclick="adminDrain()">开始摘流</button>
+            <span class="hint">发版/缩容前用：先通知客户端迁移（session.migrate 帧），超时再强断</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>影子双跑报告（GET /shadow/stats，仅单体装配进程有）</h3>
+          <div class="row">
+            <button class="ghost" onclick="shadowStats()">查报告</button>
+            <span class="hint">matchRate 需稳定 1.0 且 shadowErrors 不增长才可切流</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="side">
+      <div class="row">
+        <button class="ghost" onclick="document.getElementById('log').textContent=''">清空日志</button>
+        <span class="hint">所有收发帧与 REST 调用都记在这里</span>
+      </div>
+      <div id="log"></div>
+    </div>
   </div>
-  <div class="row">
-    <input id="to" placeholder="接收方 userId，如 bob" style="width:200px">
-    <input id="body" placeholder="消息内容" style="width:260px">
-    <select id="contentType" style="padding:8px;border:1px solid #cbd5e1;border-radius:8px;font-size:13px">
-      <option value="TEXT">文本</option>
-      <option value="IMAGE">图片</option>
-      <option value="FILE">文件</option>
-      <option value="VOICE">语音</option>
-      <option value="VIDEO">视频</option>
-    </select>
-    <input id="attrs" placeholder='媒体元数据，如 {"url":"https://..."}' style="width:280px">
-    <button id="sendBtn" onclick="send()" disabled>发送</button>
-  </div>
-  <div id="log"></div>
 
   <script>
+    // ============================================================================
+    // 这个页面是「服务端能力的全量对接清单」，不是示例代码的一半：
+    //   上行帧：msg.send / msg.recv / msg.read / sync / typing / presence.get / ping / pong
+    //   下行帧：connected / msg.ack / msg.push / msg.state / msg.update / group.update /
+    //          typing.push / presence.push / presence.snapshot / error / ping / pong / session.migrate
+    //   REST  ：/send、/conv（列表/已读/撤回/删除/标记）、/conv/{id}/messages、/group 全套、
+    //          /relation、/presence
+    // 每一条都能在右侧日志里看到原始帧或 HTTP 响应，便于对着服务端日志核对。
+    // ============================================================================
+
     let ws = null;
     let myUserId = '';
     let lastSentTo = '';
+
     // 各会话「已见过的最大 seq」。重连时上报给服务端，作为 seq 发号器的兜底下界：
-    // 万一 Redis 里的序号计数器整体丢失，服务端据此也不会发出比这里更小的 seq
-    // （否则新消息会被本端当成历史重复而丢弃）。
+    // 万一 Redis 里的序号计数器整体丢失，服务端据此也不会发出比这里更小的 seq。
     const watermarks = {};
-    // 长连接由 Netty 独立监听（默认 8081），与本页面的 HTTP 端口(8080)不同；
-    // 可用 ?wsPort=xxxx 覆盖，便于连到别的网关实例
-    const WS_PORT = new URLSearchParams(location.search).get('wsPort') || '8081';
-    const WS_PROTO = location.protocol === 'https:' ? 'wss' : 'ws';
-    const WS_URL_BASE = WS_PROTO + '://' + location.hostname + ':' + WS_PORT + '/ws';
-    document.getElementById('nodeUrl').textContent = location.hostname + ':' + WS_PORT;
+
+    // 端到端 ACK：只有客户端真的收到 msg.push 才算「已送达」，攒批后回 msg.recv。
+    const pendingAcks = {};
+    let ackTimer = null;
+    const ACK_BATCH = 20;
+    const ACK_DELAY_MS = 80;
+
+    // 会话 -> 最近一次见到的 seq（撤回/删除按钮的默认值）
+    const lastSeqByConv = {};
+    // 历史分页游标
+    let histCursor = 0;
+    // userId -> { online, gateways, devices, lastSeen }
+    const presenceMap = {};
+    // "conversationId|userId" -> setTimeout（「正在输入」5s 后自动消失）
+    const typingTimers = {};
+
+    // ==== 地址配置 ====
+    //
+    // 这个页面只应该由 IM 服务自己提供（http://主机:端口/index.html）。一旦是通过别的
+    // 静态服务器打开的（IDE 内置服务器会给你 localhost:63342/...），相对路径的 REST 就会
+    // 打到那台静态服务器上，于是 /conv 返回 404——而那个 404 是静态服务器的 HTML，
+    // 不是 IM 服务的 JSON，很容易被误判成「服务端没这个接口」。
+    //
+    // 所以 REST 基地址与 WS 端口都做成可配置 + 自动探测，探不到就把原因直接写在页面顶部。
+    const API_STORAGE_KEY = 'im.testClient.apiBase';
+    const WS_PORT_STORAGE_KEY = 'im.testClient.wsPort';
+
+    // 用作「这台服务器到底是不是 IM 服务」的探针：单用户在线查询对任意 userId 都存在，
+    // 永远回 JSON（不会 404），拿它探测不会产生误导性错误
+    const REST_PROBE_PATH = '/presence/__probe__';
+
+    /** REST 基地址；空串 = 与页面同源 */
+    function apiBase() {
+      const raw = document.getElementById('apiBase').value.trim();
+      return raw ? raw.replace(/\/+$/, '') : '';
+    }
+
+    function wsPort() {
+      return document.getElementById('wsPort').value.trim() || '8081';
+    }
+
+    // 长连接由 Netty 独立监听（默认 8081），与本页面 HTTP 端口不同
+    function wsUrl() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      return proto + '://' + location.hostname + ':' + wsPort() + '/ws';
+    }
+
+    function refreshHeader() {
+      document.getElementById('pageOrigin').textContent = location.origin;
+      document.getElementById('httpBase').textContent = apiBase() || (location.origin + '（同源）');
+      document.getElementById('nodeUrl').textContent = location.hostname + ':' + wsPort();
+    }
+
+    function persistConfig() {
+      try {
+        localStorage.setItem(API_STORAGE_KEY, document.getElementById('apiBase').value.trim());
+        localStorage.setItem(WS_PORT_STORAGE_KEY, document.getElementById('wsPort').value.trim());
+      } catch (_) { /* 隐私模式下 localStorage 可能不可用，配置不持久化也能用 */ }
+      refreshHeader();
+    }
+
+    function showBanner(html) {
+      const banner = document.getElementById('banner');
+      banner.innerHTML = html;
+      banner.style.display = 'block';
+    }
+
+    function hideBanner() {
+      document.getElementById('banner').style.display = 'none';
+    }
+
+    /**
+     * 找一个真的能响应 REST 的基地址。
+     *
+     * <p>顺序：用户填的 → 同源 → 常见端口（8080 / 8180）。探测成功就写回输入框并落盘，
+     * 一个都不通则把「为什么不通」写清楚——最常见的原因是跨源被浏览器的 CORS 拦下，
+     * 那种情况下控制台只会看到 TypeError，页面上必须说清楚。
+     *
+     * @param announce 用户手动点击时为 true，会打日志（自动探测不吵）
+     */
+    async function probeRest(announce) {
+      const host = location.hostname || '127.0.0.1';
+      const candidates = [];
+      if (apiBase()) candidates.push(apiBase());
+      candidates.push('');
+      if (location.protocol.startsWith('http')) {
+        // 常见端口各试一次：im-app 默认 8080，验证实例常用 8180。
+        // 端口不同也正常，用户在「REST 地址」里填对即可——探测只是省事，不是唯一出路。
+        ['8080', '8180'].forEach((port) => candidates.push('http://' + host + ':' + port));
+      }
+      const attempts = [];
+      for (const base of candidates) {
+        const label = base || ('同源 ' + location.origin);
+        const url = base + REST_PROBE_PATH;
+        try {
+          const res = await fetch(url, { headers: { Accept: 'application/json' } });
+          const text = await res.text();
+          // 成功必须同时满足「2xx」与「JSON」：只判 JSON 的话，服务端别的地方回的
+          // JSON 404（{"timestamp":...,"status":404}）会被误认成「找到了 IM 服务」
+          if (res.ok && /^\s*[{[]/.test(text)) {
+            document.getElementById('apiBase').value = base;
+            persistConfig();
+            hideBanner();
+            log('REST 可用：' + (base || location.origin), 'sys');
+            return true;
+          }
+          attempts.push(label + ' → HTTP ' + res.status
+              + (/^\s*</.test(text) ? '（HTML，这是个静态服务器，不是 IM 服务）' : '（非预期响应）'));
+        } catch (e) {
+          // 端口不通与跨源被 CORS 拦下，浏览器给的都只是 TypeError，JS 侧无法区分
+          attempts.push(label + ' → 连不上或被 CORS 拦下（' + e.message + '）');
+        }
+      }
+      showBanner('REST 探测失败，试过的地址：<br>· '
+          + attempts.join('<br>· ')
+          + '<br><br>页面来源是 <code>' + location.origin + '</code>。'
+          + '<br>解决办法（任选其一）：'
+          + '<br>1) 直接用 IM 服务的地址打开本页：<code>http://' + host + ':8080/index.html</code>'
+          + '（换成你实际的 im-app HTTP 端口，同源即免配置）；'
+          + '<br>2) 把上面「REST 地址」填成 im-app 的地址（如 <code>http://' + host + ':8080</code>）后点「检测 REST」；'
+          + '<br>3) 若那段是「连不上或被 CORS 拦下」且地址本身没错，说明服务端没开跨源：'
+          + '确认 <code>im.http.cors.allowed-origins</code>（默认 <code>*</code>）没被关掉。');
+      if (announce) log('REST 探测失败，详见页面顶部提示', 'err');
+      return false;
+    }
+
+    // ==== 日志 ====
 
     function log(text, cls) {
       const el = document.getElementById('log');
       const div = document.createElement('div');
       div.className = cls || '';
-      div.textContent = text;
+      const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+      div.textContent = time + ' ' + text;
       el.appendChild(div);
       el.scrollTop = el.scrollHeight;
     }
 
+    function truncate(text, max) {
+      if (text == null) return '';
+      return text.length <= max ? text : text.slice(0, max) + '…(' + text.length + 'B)';
+    }
+
+    // ==== 通用 REST 调用：统一打日志，方便和服务端日志对齐 ====
+
+    async function api(method, path, body) {
+      const url = apiBase() + path;
+      const options = { method, headers: {} };
+      if (body !== undefined && body !== null) {
+        options.headers['Content-Type'] = 'application/json';
+        options.body = JSON.stringify(body);
+      }
+      try {
+        const res = await fetch(url, options);
+        const text = await res.text();
+        // 收到 HTML 说明这个请求打到了静态服务器（IDE 内置服务器、nginx 之类），
+        // 而不是 IM 服务——这类失败长得像「接口不存在」，必须当场点明
+        if (/^\s*<(?:!doctype|html)/i.test(text)) {
+          log(method + ' ' + url + ' -> ' + res.status + '（HTML 响应，不是 IM 服务）', 'err');
+          showBanner('请求 <code>' + url + '</code> 收到的是 HTML，不是 JSON：'
+              + '这台服务器上没有 IM 的 REST 接口。请把上方「REST 地址」指向 im-app 的 HTTP 端口'
+              + '（<code>http://' + location.hostname + ':8080</code>），'
+              + '或者直接用 <code>http://' + location.hostname + ':8080/index.html</code> 打开本页。');
+          return { ok: false, status: res.status, data: null };
+        }
+        let data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (_) { data = text; }
+        log(method + ' ' + url + ' -> ' + res.status + ' ' + truncate(text, 500),
+            res.ok ? 'api' : 'err');
+        return { ok: res.ok, status: res.status, data };
+      } catch (e) {
+        // 跨源被拦时浏览器只给 TypeError（拿不到状态码），提示指向 CORS 而不是「服务没起」
+        log(method + ' ' + url + ' 请求失败: ' + e.message, 'err');
+        showBanner('请求 <code>' + url + '</code> 失败：' + e.message
+            + '。常见原因：服务没起、端口填错，或跨源被 CORS 拦截'
+            + '（页面来源 <code>' + location.origin + '</code>）。');
+        return { ok: false, status: 0, data: null };
+      }
+    }
+
+    // ==== 小工具 ====
+
+    function me() {
+      return document.getElementById('userId').value.trim() || myUserId;
+    }
+
+    function convInput() {
+      return document.getElementById('convId').value.trim();
+    }
+
     // 与服务端 MessageEnvelope.singleConversationId 保持同一规则：两个 userId 排序后拼接
     function conversationIdOf(to) {
-      if (!myUserId || !to) return null;
-      return myUserId <= to ? 's:' + myUserId + ':' + to : 's:' + to + ':' + myUserId;
+      const self = me();
+      if (!self || !to) return null;
+      return self <= to ? 's:' + self + ':' + to : 's:' + to + ':' + self;
+    }
+
+    function splitIds(raw) {
+      return (raw || '').split(',').map((s) => s.trim()).filter((s) => s.length > 0);
     }
 
     function raiseWatermark(conversationId, seq) {
       if (!conversationId || !seq) return;
       watermarks[conversationId] = Math.max(watermarks[conversationId] || 0, seq);
+      lastSeqByConv[conversationId] = Math.max(lastSeqByConv[conversationId] || 0, seq);
+      const opSeq = document.getElementById('opSeq');
+      if (!opSeq.value) opSeq.value = lastSeqByConv[conversationId];
     }
 
-    // 端到端 ACK：只有客户端真的收到 msg.push 才算「已送达」，攒批后回 msg.recv。
-    // 逐条回会把「消息数」放大成「RPC 数」，所以同会话压成一条 + 定时攒批一起发。
-    const pendingAcks = {};      // conversationId -> 已见最大 seq
-    let ackTimer = null;
-    const ACK_BATCH = 20;        // 攒够这么多个会话就立刻发
-    const ACK_DELAY_MS = 80;     // 否则等 80ms 一起发
-
-    function queueAck(conversationId, seq) {
-      if (!conversationId || !seq) return;
-      pendingAcks[conversationId] = Math.max(pendingAcks[conversationId] || 0, seq);
-      if (Object.keys(pendingAcks).length >= ACK_BATCH) { flushAcks(); return; }
-      if (!ackTimer) ackTimer = setTimeout(flushAcks, ACK_DELAY_MS);
+    function connected() {
+      return ws && ws.readyState === 1;
     }
 
-    // 与服务端 MessageDigests.placeholderOf 保持一致：媒体消息在列表/日志里显示占位而不是空串
+    // 与服务端 MessageDigests.placeholderOf 保持一致：媒体消息显示占位而不是空串
     function placeholderOf(contentType) {
       switch (contentType) {
         case 'IMAGE': return '[图片]';
@@ -103,100 +563,79 @@
       }
     }
 
-    // 已读上报：只有页面可见（用户真的在看）才报，切后台的标签页不该把消息标成已读
-    function reportRead(conversationId, seq) {
-      if (!conversationId || !seq || document.visibilityState !== 'visible') return;
-      if (!ws || ws.readyState !== 1) return;
-      ws.send(JSON.stringify({ ver: 1, type: 'msg.read', conversationId, seq }));
+    function renderTextOfFrame(frame) {
+      const ct = frame.contentType || 'TEXT';
+      if (frame.recalled) return '(已撤回)';
+      let text = ct === 'TEXT' ? (frame.body || '') : placeholderOf(ct);
+      if (ct !== 'TEXT' && frame.attrs) {
+        try {
+          const attrs = JSON.parse(frame.attrs);
+          if (attrs.url) text += ' ' + attrs.url;
+        } catch (_) { /* 元数据不是合法 JSON 时只显示占位 */ }
+      }
+      return text;
     }
 
-    // 字段名用完整单词（conversationId / seq）：这张协议要抓包、进日志、贴进 issue，
-    // 省下的那点字节抵不上一次「c 是什么意思」的解释成本
-    function flushAcks() {
-      if (ackTimer) { clearTimeout(ackTimer); ackTimer = null; }
-      const conversations = Object.keys(pendingAcks);
-      if (conversations.length === 0) return;
-      const acks = conversations.map((conversationId) => ({ conversationId, seq: pendingAcks[conversationId] }));
-      conversations.forEach((conversationId) => delete pendingAcks[conversationId]);
-      // 断线就丢弃待发 ACK：重连后 sync 会重报 watermarks，水位只前进不会丢信息
-      if (!ws || ws.readyState !== 1) return;
-      ws.send(JSON.stringify({ ver: 1, type: 'msg.recv', acks: acks }));
-      log('已确认收到: ' + acks.map((a) => a.conversationId + '#' + a.seq).join(', '), 'ack');
+    // ==== 标签页 ====
+
+    function tab(name, btn) {
+      ['msg', 'conv', 'group', 'social', 'ops'].forEach((key) => {
+        document.getElementById('pane-' + key).classList.toggle('active', key === name);
+      });
+      document.querySelectorAll('.tabs button').forEach((b) => b.classList.remove('active'));
+      if (btn) btn.classList.add('active');
     }
 
-    // 上报水位；服务端会顺手补拉缺口，所以 sync 也是「主动对账」的入口
-    function syncWatermarks() {
-      if (!ws || ws.readyState !== 1) return;
-      const keys = Object.keys(watermarks);
-      if (keys.length === 0) return;
-      ws.send(JSON.stringify({ ver: 1, type: 'sync', watermarks: watermarks }));
-      log('已上报水位: ' + JSON.stringify(watermarks), 'sys');
-    }
+    // ==== 连接 ====
 
     function connect() {
       const userId = document.getElementById('userId').value.trim();
+      const deviceId = document.getElementById('deviceId').value.trim() || 'web';
+      const token = document.getElementById('token').value.trim();
       if (!userId) { alert('请填写 userId'); return; }
       myUserId = userId;
-      ws = new WebSocket(WS_URL_BASE + '?userId=' + encodeURIComponent(userId) + '&deviceId=web');
+      if (!document.getElementById('restFrom').value) document.getElementById('restFrom').value = userId;
+      if (!document.getElementById('restTo').value) document.getElementById('restTo').value = document.getElementById('to').value.trim();
+
+      // WS 的 userId/deviceId/token 都在握手 query 里带（握手成功即认证完成），
+      // 不像 TCP 那样需要先发一帧 connect：这是两种承载最容易搞混的地方
+      let url = wsUrl() + '?userId=' + encodeURIComponent(userId)
+          + '&deviceId=' + encodeURIComponent(deviceId);
+      if (token) url += '&token=' + encodeURIComponent(token);
+      log('正在连接 ' + url.replace(/token=[^&]+/, 'token=***'), 'sys');
+      ws = new WebSocket(url);
+
       ws.onopen = () => {
-        log('已连接为 ' + userId, 'sys');
-        document.getElementById('connectBtn').disabled = true;
-        document.getElementById('disconnectBtn').disabled = false;
-        document.getElementById('sendBtn').disabled = false;
+        // WS 在 HTTP 握手阶段就完成认证，服务端不会再回 connected 帧（那是 TCP 专属：
+        // TCP 必须先发一帧 connect，网关回 connected 之后才允许发业务帧）
+        log('已连接为 ' + userId + '（device=' + deviceId + '）', 'sys');
+        setConnectedUi(true);
         syncWatermarks();
+        // 连上就顺手查一次自己 + 对端的在线状态（也是 presence.get 的最小可用示例）
+        const peer = document.getElementById('to').value.trim();
+        const targets = peer ? [userId, peer] : [userId];
+        sendPresenceGet(targets);
       };
-      ws.onmessage = (e) => {
-        let frame;
-        try { frame = JSON.parse(e.data); } catch (_) { log('收到: ' + e.data, 'me'); return; }
-        if (frame.type === 'msg.ack') {
-          raiseWatermark(conversationIdOf(lastSentTo), frame.seq);
-          log('已受理: seq=' + frame.seq + ' serverMsgId=' + frame.serverMsgId, 'ack');
-        } else if (frame.type === 'msg.push') {
-          raiseWatermark(frame.conversationId, frame.seq);
-          const ct = frame.contentType || 'TEXT';
-          let text = ct === 'TEXT' ? frame.body : placeholderOf(ct);
-          if (ct !== 'TEXT' && frame.attrs) {
-            try {
-              const attrs = JSON.parse(frame.attrs);
-              if (attrs.url) text += ' ' + attrs.url;
-            } catch (_) { /* 元数据不是合法 JSON 时只显示占位，别让一条脏数据打断日志 */ }
-          }
-          log('收到 [' + frame.conversationId + ' #' + frame.seq + '] ' + frame.from + ': ' + text, 'me');
-          // 收到即视为已送达：回端到端 ACK，服务端据此抬高补发起点，避免下次重连又发一遍
-          queueAck(frame.conversationId, frame.seq);
-          // 页面还在前台就顺手报已读——服务端会据此把「已读」回推给发送方
-          reportRead(frame.conversationId, frame.seq);
-        } else if (frame.type === 'msg.state') {
-          // 对方的状态回执：DELIVERED = 已送达，READ = 已读
-          log('对方' + (frame.state === 'READ' ? '已读' : '已送达') + ' ' + frame.conversationId + ' #' + frame.seq, 'ack');
-        } else if (frame.type === 'msg.update') {
-          // 消息变更事件：撤回是会话级（双方都看不到原文），删除只影响操作者自己
-          if (frame.change === 'RECALLED') {
-            log('撤回 [' + frame.conversationId + ' #' + frame.seq + '] 由 ' + frame.actorId, 'ack');
-          } else {
-            log('已在本账号其它端删除 [' + frame.conversationId + ' #' + frame.seq + ']', 'ack');
-          }
-        } else if (frame.type === 'error') {
-          log('错误 ' + frame.code + ': ' + frame.message, 'sys');
-        } else if (frame.type === 'ping') {
-          // 服务端心跳探测：必须回 pong，否则空闲超时后会被网关断开
-          ws.send(JSON.stringify({ ver: 1, type: 'pong' }));
-        } else if (frame.type === 'pong') {
-          // 我方主动 ping 的服务端应答，忽略
-        } else {
-          log('收到: ' + e.data, 'me');
-        }
-      };
+
+      ws.onmessage = (e) => handleFrame(e.data);
+
       ws.onclose = () => {
         log('连接已关闭', 'sys');
         // 连接没了，待发 ACK 作废：重连时 syncWatermarks 会把 watermarks 重报一遍
         if (ackTimer) { clearTimeout(ackTimer); ackTimer = null; }
         Object.keys(pendingAcks).forEach((c) => delete pendingAcks[c]);
-        document.getElementById('connectBtn').disabled = false;
-        document.getElementById('disconnectBtn').disabled = true;
-        document.getElementById('sendBtn').disabled = true;
+        setConnectedUi(false);
       };
       ws.onerror = () => log('连接出错', 'sys');
+    }
+
+    function setConnectedUi(on) {
+      document.getElementById('connectBtn').disabled = on;
+      document.getElementById('disconnectBtn').disabled = !on;
+      document.getElementById('sendBtn').disabled = !on;
+      document.getElementById('connState').innerHTML = on
+          ? '已连接 <b>●</b> ' + me()
+          : '未连接';
     }
 
     function disconnect() {
@@ -205,31 +644,635 @@
       if (ws) ws.close();
     }
 
+    function ping() {
+      if (!connected()) { alert('未连接'); return; }
+      ws.send(JSON.stringify({ ver: 1, type: 'ping', ts: Date.now() }));
+      log('-> ping', 'sys');
+    }
+
+    // ==== 发送消息 ====
+
     function send() {
       const to = document.getElementById('to').value.trim();
       const body = document.getElementById('body').value.trim();
       const contentType = document.getElementById('contentType').value;
       const attrsRaw = document.getElementById('attrs').value.trim();
-      if (!ws || ws.readyState !== 1) { alert('未连接'); return; }
-      if (!to) { alert('请填写接收方'); return; }
+      if (!connected()) { alert('未连接'); return; }
+      if (!to) { alert('请填写对端 userId'); return; }
       // 文本消息必须有正文；媒体消息的正文可以空着（内容在 attrs.url 里）
       if (!body && contentType === 'TEXT') { alert('请填写消息内容'); return; }
       const frame = { ver: 1, type: 'msg.send', to: to, body: body, contentType: contentType };
       if (attrsRaw) {
-        try {
-          JSON.parse(attrsRaw);
-        } catch (_) {
+        try { JSON.parse(attrsRaw); } catch (_) {
           alert('attrs 必须是合法 JSON，如 {"url":"https://..."}');
           return;
         }
         frame.attrs = attrsRaw;
       }
       // clientMsgId 是幂等键：客户端重连重发时保持同一个值，服务端据此去重
-      const clientMsgId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
-      frame.clientMsgId = clientMsgId;
+      frame.clientMsgId = crypto.randomUUID ? crypto.randomUUID()
+          : String(Date.now()) + Math.random();
       lastSentTo = to;
       ws.send(JSON.stringify(frame));
-      log('发送 -> ' + to + ': ' + (contentType === 'TEXT' ? body : placeholderOf(contentType)), 'sys');
+      log('-> msg.send to=' + to + ' ' + (contentType === 'TEXT' ? body : placeholderOf(contentType)), 'sys');
+      stopTyping();
+    }
+
+    function restSend() {
+      const from = document.getElementById('restFrom').value.trim();
+      const to = document.getElementById('restTo').value.trim();
+      const body = document.getElementById('restBody').value.trim();
+      if (!from || !to || !body) { alert('from / to / body 都要填'); return; }
+      api('POST', '/send', {
+        from: from, to: to, body: body,
+        clientMsgId: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random()
+      });
+    }
+
+    // ==== 正在输入（typing） ====
+
+    let typingTimer = null;     // 停手 2s 后补一条 false
+    let lastTypingAt = 0;       // 3s 节流（服务端还有一层去抖，这里只是省流量）
+    const TYPING_THROTTLE_MS = 3000;
+    const TYPING_IDLE_MS = 2000;
+
+    document.addEventListener('DOMContentLoaded', () => {
+      // 地址配置：URL 参数优先（便于分享一条能直接用的链接），其次上一次的输入
+      const params = new URLSearchParams(location.search);
+      let savedApi = '';
+      let savedWsPort = '8081';
+      try {
+        savedApi = localStorage.getItem(API_STORAGE_KEY) || '';
+        savedWsPort = localStorage.getItem(WS_PORT_STORAGE_KEY) || '8081';
+      } catch (_) { /* 隐私模式：用默认值 */ }
+      document.getElementById('apiBase').value = params.get('api') || savedApi;
+      document.getElementById('wsPort').value = params.get('wsPort') || savedWsPort;
+      document.getElementById('apiBase').addEventListener('change', persistConfig);
+      document.getElementById('wsPort').addEventListener('change', persistConfig);
+      refreshHeader();
+      probeRest(false);
+
+      document.getElementById('body').addEventListener('input', () => {
+        if (!document.getElementById('autoTyping').checked) return;
+        const now = Date.now();
+        if (now - lastTypingAt > TYPING_THROTTLE_MS) {
+          lastTypingAt = now;
+          sendTyping(true, true);
+        }
+        // 每次输入都重置「停手」计时：2s 没有新输入就认为已经不打了
+        if (typingTimer) clearTimeout(typingTimer);
+        typingTimer = setTimeout(() => { typingTimer = null; stopTyping(); }, TYPING_IDLE_MS);
+      });
+    });
+
+    function typingTarget() {
+      const conv = convInput();
+      if (conv) {
+        // 群会话显式带上 convType：服务端能按 g: 前缀推断，但显式声明让「会话类型」
+        // 只在一处决定，省得将来前缀规则变了这里静默失效
+        return conv.startsWith('g:')
+            ? { conversationId: conv, convType: 'GROUP' }
+            : { conversationId: conv, convType: 'SINGLE' };
+      }
+      const to = document.getElementById('to').value.trim();
+      if (to) return { to: to };
+      return null;
+    }
+
+    function sendTyping(typing, silent) {
+      if (!connected()) { if (!silent) alert('未连接'); return; }
+      const target = typingTarget();
+      if (!target) { if (!silent) alert('请填写会话 ID 或对端 userId'); return; }
+      const frame = Object.assign({ ver: 1, type: 'typing', typing: typing }, target);
+      ws.send(JSON.stringify(frame));
+      if (!silent) log('-> typing=' + typing + ' ' + JSON.stringify(target), 'sys');
+    }
+
+    function stopTyping() {
+      if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; }
+      if (!connected()) return;
+      const target = typingTarget();
+      if (!target) return;
+      ws.send(JSON.stringify(Object.assign({ ver: 1, type: 'typing', typing: false }, target)));
+      lastTypingAt = 0;
+    }
+
+    function renderTyping(frame) {
+      const key = frame.conversationId + '|' + frame.userId;
+      const line = document.getElementById('typingLine');
+      if (frame.typing) {
+        line.textContent = frame.userId + ' 正在输入… (' + frame.conversationId + ')';
+        log('<- typing.push ' + frame.userId + ' 正在输入 ' + frame.conversationId, 'evt');
+        if (typingTimers[key]) clearTimeout(typingTimers[key]);
+        // 5s 兜底熄灭：对方可能直接杀掉客户端，永远等不到 typing=false
+        typingTimers[key] = setTimeout(() => {
+          delete typingTimers[key];
+          if (line.textContent.startsWith(frame.userId)) line.textContent = '';
+        }, 5000);
+      } else {
+        if (typingTimers[key]) { clearTimeout(typingTimers[key]); delete typingTimers[key]; }
+        line.textContent = '';
+        log('<- typing.push ' + frame.userId + ' 停止输入 ' + frame.conversationId, 'evt');
+      }
+    }
+
+    // ==== 端到端 ACK / 水位 / 已读 ====
+
+    function queueAck(conversationId, seq) {
+      if (!conversationId || !seq) return;
+      pendingAcks[conversationId] = Math.max(pendingAcks[conversationId] || 0, seq);
+      if (Object.keys(pendingAcks).length >= ACK_BATCH) { flushAcks(); return; }
+      if (!ackTimer) ackTimer = setTimeout(flushAcks, ACK_DELAY_MS);
+    }
+
+    function flushAcks() {
+      if (ackTimer) { clearTimeout(ackTimer); ackTimer = null; }
+      const conversations = Object.keys(pendingAcks);
+      if (conversations.length === 0) return;
+      const acks = conversations.map((conversationId) => ({ conversationId, seq: pendingAcks[conversationId] }));
+      conversations.forEach((conversationId) => delete pendingAcks[conversationId]);
+      // 断线就丢弃待发 ACK：重连后 sync 会重报 watermarks，水位只前进不会丢信息
+      if (!connected()) return;
+      ws.send(JSON.stringify({ ver: 1, type: 'msg.recv', acks: acks }));
+      log('-> msg.recv ' + acks.map((a) => a.conversationId + '#' + a.seq).join(', '), 'ack');
+    }
+
+    function syncWatermarks() {
+      if (!connected()) return;
+      const keys = Object.keys(watermarks);
+      if (keys.length === 0) return;
+      ws.send(JSON.stringify({ ver: 1, type: 'sync', watermarks: watermarks }));
+      log('-> sync ' + JSON.stringify(watermarks), 'sys');
+    }
+
+    // 已读上报（WS）：只有页面可见（用户真的在看）才报，切后台的标签页不该把消息标成已读
+    function reportRead(conversationId, seq) {
+      if (!conversationId || !seq || document.visibilityState !== 'visible') return;
+      if (!connected()) return;
+      ws.send(JSON.stringify({ ver: 1, type: 'msg.read', conversationId, seq }));
+    }
+
+    function markReadWs() {
+      const conv = requireConv();
+      if (!conv) return;
+      const seq = Number(document.getElementById('opSeq').value) || lastSeqByConv[conv] || 0;
+      if (!seq) { alert('请填 seq'); return; }
+      ws.send(JSON.stringify({ ver: 1, type: 'msg.read', conversationId: conv, seq: seq }));
+      log('-> msg.read ' + conv + '#' + seq, 'sys');
+    }
+
+    function markReadHttp() {
+      const conv = requireConv();
+      if (!conv) return;
+      const seq = Number(document.getElementById('opSeq').value) || lastSeqByConv[conv] || 0;
+      api('POST', '/conv/' + encodeURIComponent(conv) + '/read?userId='
+          + encodeURIComponent(me()) + '&seq=' + seq);
+    }
+
+    function requireConv() {
+      const conv = convInput();
+      if (!conv) { alert('请先填写或选中会话 ID'); return null; }
+      return conv;
+    }
+
+    // ==== 会话列表 / 历史 / 标记 / 撤回 ====
+
+    async function loadConversations() {
+      const limit = Number(document.getElementById('convLimit').value) || 50;
+      const res = await api('GET', '/conv?userId=' + encodeURIComponent(me()) + '&limit=' + limit);
+      const box = document.getElementById('convTable');
+      if (!res.ok || !res.data || !Array.isArray(res.data.conversations)) {
+        box.innerHTML = '<div class="hint">拉取失败，看右侧日志</div>';
+        return;
+      }
+      if (res.data.conversations.length === 0) {
+        box.innerHTML = '<div class="hint">还没有会话（先发一条消息）</div>';
+        return;
+      }
+      const rows = res.data.conversations.map((c) => {
+        const unread = c.unread > 0 ? '<span class="badge unread">未读 ' + c.unread + '</span>' : '';
+        const pinned = c.pinned ? '<span class="badge">置顶</span>' : '';
+        const muted = c.muted ? '<span class="badge">免打扰</span>' : '';
+        return '<tr class="pick" onclick="pickConv(\'' + c.conversationId + '\')">'
+            + '<td>' + c.conversationId + pinned + muted + unread + '</td>'
+            + '<td>' + c.type + '</td>'
+            + '<td>' + (c.lastDigest || '') + '</td>'
+            + '<td>#' + c.lastSeq + ' / 读 ' + c.readSeq + '</td>'
+            + '</tr>';
+      }).join('');
+      box.innerHTML = '<table><thead><tr><th>会话</th><th>类型</th><th>最后一条</th><th>进度</th></tr></thead>'
+          + '<tbody>' + rows + '</tbody></table>';
+    }
+
+    function pickConv(conversationId) {
+      document.getElementById('convId').value = conversationId;
+      const opSeq = document.getElementById('opSeq');
+      if (lastSeqByConv[conversationId]) opSeq.value = lastSeqByConv[conversationId];
+      log('已选中会话 ' + conversationId, 'sys');
+    }
+
+    function pickPeer() {
+      const to = document.getElementById('to').value.trim();
+      if (!to) { alert('请填写对端 userId'); return; }
+      const conv = conversationIdOf(to);
+      document.getElementById('convId').value = conv;
+      log('会话 ID = ' + conv, 'sys');
+    }
+
+    async function loadHistory(firstPage) {
+      const conv = requireConv();
+      if (!conv) return;
+      const limit = Number(document.getElementById('histLimit').value) || 20;
+      let beforeSeq = firstPage ? (Number(document.getElementById('histBefore').value) || 0) : histCursor;
+      const res = await api('GET', '/conv/' + encodeURIComponent(conv) + '/messages?userId='
+          + encodeURIComponent(me()) + '&beforeSeq=' + beforeSeq + '&limit=' + limit);
+      const box = document.getElementById('histList');
+      if (!res.ok || !res.data || !Array.isArray(res.data.messages)) {
+        box.innerHTML = '<div class="hint">拉取失败，看右侧日志</div>';
+        return;
+      }
+      histCursor = res.data.nextBeforeSeq || 0;
+      document.getElementById('histCursor').textContent =
+          'hasMore=' + res.data.hasMore + ' nextBeforeSeq=' + res.data.nextBeforeSeq;
+      if (res.data.messages.length === 0) {
+        box.innerHTML = '<div class="hint">这一页没有消息</div>';
+        return;
+      }
+      const rows = res.data.messages.map((m) => {
+        raiseWatermark(conv, m.seq);
+        return '<tr><td>#' + m.seq + '</td><td>' + (m.from || '') + '</td>'
+            + '<td>' + renderTextOfFrame(m) + '</td>'
+            + '<td>' + (m.recalled ? '已撤回' : '') + '</td></tr>';
+      }).join('');
+      box.innerHTML = '<table><thead><tr><th>seq</th><th>from</th><th>内容</th><th>状态</th></tr></thead>'
+          + '<tbody>' + rows + '</tbody></table>';
+    }
+
+    function recall() {
+      const conv = requireConv();
+      if (!conv) return;
+      const seq = Number(document.getElementById('opSeq').value);
+      if (!seq) { alert('请填 seq'); return; }
+      api('POST', '/conv/' + encodeURIComponent(conv) + '/messages/' + seq
+          + '/recall?operatorId=' + encodeURIComponent(me()));
+    }
+
+    function deleteMsg() {
+      const conv = requireConv();
+      if (!conv) return;
+      const seq = Number(document.getElementById('opSeq').value);
+      if (!seq) { alert('请填 seq'); return; }
+      api('POST', '/conv/' + encodeURIComponent(conv) + '/messages/' + seq
+          + '/delete?userId=' + encodeURIComponent(me()));
+    }
+
+    function setFlag() {
+      const conv = requireConv();
+      if (!conv) return;
+      const params = ['userId=' + encodeURIComponent(me())];
+      const pinned = document.getElementById('flagPinned').value;
+      const muted = document.getElementById('flagMuted').value;
+      // 缺省 = 这一项不改（不是 false）：两个开关独立，设置顶不该顺手清掉免打扰
+      if (pinned !== '') params.push('pinned=' + pinned);
+      if (muted !== '') params.push('muted=' + muted);
+      if (params.length === 1) { alert('至少选一项要改的标记'); return; }
+      api('POST', '/conv/' + encodeURIComponent(conv) + '/flag?' + params.join('&'));
+    }
+
+    // ==== 群组 ====
+
+    function groupIdValue() {
+      const id = document.getElementById('groupId').value.trim();
+      if (!id) { alert('请填写 groupId（建群后会自动填入）'); return null; }
+      return id;
+    }
+
+    async function createGroup() {
+      const name = document.getElementById('groupName').value.trim();
+      const max = Number(document.getElementById('groupMax').value) || 0;
+      const res = await api('POST', '/group?ownerId=' + encodeURIComponent(me())
+          + '&name=' + encodeURIComponent(name) + '&maxMembers=' + max);
+      if (res.ok && res.data && res.data.group) {
+        document.getElementById('groupId').value = res.data.group.groupId;
+        log('群已创建：' + res.data.group.groupId + '（点「设为当前会话」即可在这里发群消息）', 'ack');
+      }
+    }
+
+    function groupDetail() {
+      const id = groupIdValue();
+      if (!id) return;
+      api('GET', '/group/' + encodeURIComponent(id));
+    }
+
+    function groupMembers() {
+      const id = groupIdValue();
+      if (!id) return;
+      api('GET', '/group/' + encodeURIComponent(id) + '/members');
+    }
+
+    function useGroupConv() {
+      const id = document.getElementById('groupId').value.trim();
+      if (!id) { alert('请填写 groupId'); return; }
+      document.getElementById('convId').value = 'g:' + id;
+      log('会话 ID = g:' + id + '（群消息的 to 用 groupId 或会话 ID 均可）', 'sys');
+    }
+
+    function groupAddMembers() {
+      const id = groupIdValue();
+      if (!id) return;
+      const targets = splitIds(document.getElementById('groupTargets').value);
+      if (targets.length === 0) { alert('请填写要加的 userId'); return; }
+      api('POST', '/group/' + encodeURIComponent(id) + '/members?operatorId=' + encodeURIComponent(me()), targets);
+    }
+
+    function groupKick() {
+      const id = groupIdValue();
+      if (!id) return;
+      const targets = splitIds(document.getElementById('groupTargets').value);
+      if (targets.length === 0) { alert('请填写要踢的 userId'); return; }
+      targets.forEach((target) => api('DELETE', '/group/' + encodeURIComponent(id) + '/members/'
+          + encodeURIComponent(target) + '?operatorId=' + encodeURIComponent(me())));
+    }
+
+    function groupLeave() {
+      const id = groupIdValue();
+      if (!id) return;
+      api('POST', '/group/' + encodeURIComponent(id) + '/leave?userId=' + encodeURIComponent(me()));
+    }
+
+    function groupSetRole() {
+      const id = groupIdValue();
+      if (!id) return;
+      const targets = splitIds(document.getElementById('groupTargets').value);
+      if (targets.length === 0) { alert('请填写目标 userId'); return; }
+      const role = document.getElementById('groupRole').value;
+      targets.forEach((target) => api('POST', '/group/' + encodeURIComponent(id) + '/roles/'
+          + encodeURIComponent(target) + '?operatorId=' + encodeURIComponent(me()) + '&role=' + role));
+    }
+
+    function groupMute() {
+      const id = groupIdValue();
+      if (!id) return;
+      const targets = splitIds(document.getElementById('groupTargets').value);
+      if (targets.length === 0) { alert('请填写要禁言的 userId'); return; }
+      const seconds = Number(document.getElementById('muteSeconds').value) || 600;
+      targets.forEach((target) => api('POST', '/group/' + encodeURIComponent(id) + '/mute/'
+          + encodeURIComponent(target) + '?operatorId=' + encodeURIComponent(me()) + '&seconds=' + seconds));
+    }
+
+    function groupRename() {
+      const id = groupIdValue();
+      if (!id) return;
+      const name = document.getElementById('groupNewName').value.trim();
+      if (!name) { alert('请填写新群名'); return; }
+      api('POST', '/group/' + encodeURIComponent(id) + '/rename?operatorId='
+          + encodeURIComponent(me()) + '&name=' + encodeURIComponent(name));
+    }
+
+    function groupAnnouncement() {
+      const id = groupIdValue();
+      if (!id) return;
+      const text = document.getElementById('groupAnnounce').value;
+      api('POST', '/group/' + encodeURIComponent(id) + '/announcement?operatorId='
+          + encodeURIComponent(me()) + '&text=' + encodeURIComponent(text));
+    }
+
+    function groupMaxMembers() {
+      const id = groupIdValue();
+      if (!id) return;
+      const max = Number(document.getElementById('groupNewMax').value);
+      if (!max) { alert('请填写人数上限'); return; }
+      api('POST', '/group/' + encodeURIComponent(id) + '/max-members?operatorId='
+          + encodeURIComponent(me()) + '&max=' + max);
+    }
+
+    function groupMuteAll(muted) {
+      const id = groupIdValue();
+      if (!id) return;
+      api('POST', '/group/' + encodeURIComponent(id) + '/mute-all?operatorId='
+          + encodeURIComponent(me()) + '&muted=' + muted);
+    }
+
+    function groupDisband() {
+      const id = groupIdValue();
+      if (!id) return;
+      if (!confirm('解散后资料与成员都保留，但消息一律拒绝。确认解散 ' + id + '？')) return;
+      api('POST', '/group/' + encodeURIComponent(id) + '/disband?operatorId=' + encodeURIComponent(me()));
+    }
+
+    // ==== 关系链 ====
+
+    function relationGet(kind) {
+      api('GET', '/relation/' + encodeURIComponent(me()) + '/' + kind);
+    }
+
+    function relationAdd(kind) {
+      const targets = splitIds(document.getElementById('relationTargets').value);
+      if (targets.length === 0) { alert('请填写 userId'); return; }
+      api('POST', '/relation/' + encodeURIComponent(me()) + '/' + kind, targets);
+    }
+
+    function relationRemove(kind, single) {
+      const targets = single ? [single] : splitIds(document.getElementById('relationTargets').value);
+      if (targets.length === 0) { alert('请填写 userId'); return; }
+      targets.forEach((target) => api('DELETE', '/relation/' + encodeURIComponent(me())
+          + '/' + kind + '/' + encodeURIComponent(target)));
+    }
+
+    function friendsGet() { relationGet('friends'); }
+    function friendsAdd() { relationAdd('friends'); }
+    function friendsRemove() { relationRemove('friends'); }
+    function blocksGet() { relationGet('blocks'); }
+    function blocksAdd() { relationAdd('blocks'); }
+    function blocksRemove() { relationRemove('blocks'); }
+
+    // ==== 在线状态（presence） ====
+
+    function presenceTargets() {
+      const raw = document.getElementById('presenceTargets').value.trim();
+      const list = splitIds(raw);
+      if (list.length > 0) return list;
+      const self = me();
+      const peer = document.getElementById('to').value.trim();
+      return peer ? [self, peer] : [self];
+    }
+
+    function sendPresenceGet(userIds) {
+      if (!connected()) return false;
+      ws.send(JSON.stringify({ ver: 1, type: 'presence.get', userIds: userIds }));
+      log('-> presence.get ' + userIds.join(','), 'sys');
+      return true;
+    }
+
+    function presenceGetWs() {
+      if (!connected()) { alert('未连接'); return; }
+      sendPresenceGet(presenceTargets());
+    }
+
+    async function presenceGetHttp() {
+      const ids = presenceTargets();
+      const res = await api('GET', '/presence?userIds=' + encodeURIComponent(ids.join(',')));
+      if (res.ok && res.data && Array.isArray(res.data.states)) {
+        res.data.states.forEach((s) => applyPresence(s.userId, s.online, s));
+      }
+    }
+
+    function applyPresence(userId, online, extra) {
+      const previous = presenceMap[userId] || {};
+      presenceMap[userId] = Object.assign({}, previous, {
+        online: online,
+        gateways: extra && extra.gateways != null ? extra.gateways : previous.gateways,
+        devices: extra && extra.devices != null ? extra.devices : previous.devices,
+        lastSeen: extra && extra.lastSeen != null ? extra.lastSeen : previous.lastSeen
+      });
+      renderPresence();
+    }
+
+    function renderPresence() {
+      const ids = Object.keys(presenceMap);
+      const box = document.getElementById('presenceList');
+      if (ids.length === 0) { box.innerHTML = '<div class="hint">还没查过</div>'; return; }
+      const rows = ids.map((userId) => {
+        const p = presenceMap[userId];
+        const lastSeen = p.online ? '—'
+            : (p.lastSeen ? new Date(p.lastSeen).toLocaleString('zh-CN', { hour12: false }) : '—');
+        return '<tr><td><span class="dot' + (p.online ? ' on' : '') + '"></span>' + userId + '</td>'
+            + '<td>' + (p.online ? '在线' : '离线') + '</td>'
+            + '<td>' + (p.gateways != null ? p.gateways : '-') + '</td>'
+            + '<td>' + (p.devices != null ? p.devices : '-') + '</td>'
+            + '<td>' + lastSeen + '</td></tr>';
+      }).join('');
+      box.innerHTML = '<table><thead><tr><th>用户</th><th>状态</th><th>网关数</th><th>设备数</th><th>上次在线</th></tr></thead>'
+          + '<tbody>' + rows + '</tbody></table>';
+    }
+
+    // ==== 运维 ====
+
+    async function adminStatus() {
+      const res = await api('GET', '/admin/status');
+      const box = document.getElementById('adminBox');
+      if (!res.ok || !res.data) { box.innerHTML = '<div class="hint">查不到（拆分部署时要打网关实例的端口）</div>'; return; }
+      const d = res.data;
+      box.innerHTML = '<table><tbody>'
+          + '<tr><th>是否在摘流</th><td>' + (d.draining ? '是' : '否') + '</td></tr>'
+          + '<tr><th>连接数</th><td>' + d.connections + '</td></tr>'
+          // /admin/status 里两种承载的键就是 ClientSession.TRANSPORT_WS/TCP："websocket" 与 "tcp"
+          + '<tr><th>WS / TCP</th><td>' + (d.websocket != null ? d.websocket : '-') + ' / '
+          + (d.tcp != null ? d.tcp : '-') + '</td></tr>'
+          + '<tr><th>背压暂停中</th><td>' + (d.backpressure ? d.backpressure.pausedConnections : '-') + '</td></tr>'
+          + '<tr><th>监听</th><td>' + JSON.stringify(d.transports) + '</td></tr>'
+          + '</tbody></table>';
+    }
+
+    function adminDrain() {
+      const reason = document.getElementById('drainReason').value.trim() || 'manual';
+      if (!confirm('摘流会让本实例拒绝新连接并通知存量连接迁移，确认？')) return;
+      api('POST', '/admin/drain?reason=' + encodeURIComponent(reason));
+    }
+
+    function shadowStats() {
+      api('GET', '/shadow/stats');
+    }
+
+    // ==== 下行帧分发（服务端产出的每类帧都在这里） ====
+
+    const GROUP_CHANGE_LABEL = {
+      CREATED: '群已创建',
+      UPDATED: '群资料变更',
+      MEMBER_ADDED: '有人被拉进群',
+      MEMBER_REMOVED: '有人被踢出群',
+      MEMBER_LEFT: '有人退群',
+      ROLE_CHANGED: '角色变更',
+      MUTED: '被禁言',
+      UNMUTED: '禁言解除',
+      DISMISSED: '群已解散'
+    };
+
+    function handleFrame(raw) {
+      let frame;
+      try {
+        frame = JSON.parse(raw);
+      } catch (_) {
+        log('<- (非 JSON) ' + truncate(raw, 300), 'me');
+        return;
+      }
+      switch (frame.type) {
+        case 'connected':
+          // 只有原生 TCP 会收到：WS 客户端在握手 query 里带身份，握手成功即认证完成
+          log('<- connected user=' + frame.userId + ' transport=' + frame.transport, 'sys');
+          break;
+
+        case 'msg.ack':
+          raiseWatermark(conversationIdOf(lastSentTo) || convInput(), frame.seq);
+          if (frame.code === 0) {
+            log('<- msg.ack seq=' + frame.seq + ' serverMsgId=' + frame.serverMsgId
+                + (frame.traceId ? ' traceId=' + frame.traceId.slice(0, 8) : ''), 'ack');
+          } else {
+            log('<- msg.ack 失败 code=' + frame.code, 'err');
+          }
+          break;
+
+        case 'msg.push':
+          raiseWatermark(frame.conversationId, frame.seq);
+          log('<- msg.push [' + frame.conversationId + ' #' + frame.seq + '] '
+              + frame.from + ': ' + renderTextOfFrame(frame), 'me');
+          // 收到即视为已送达：回端到端 ACK，服务端据此抬高补发起点
+          queueAck(frame.conversationId, frame.seq);
+          // 页面还在前台就顺手报已读——服务端会据此把「已读」回推给发送方
+          if (!frame.recalled) reportRead(frame.conversationId, frame.seq);
+          break;
+
+        case 'msg.state':
+          log('<- msg.state ' + frame.conversationId + ' #' + frame.seq + ' '
+              + (frame.state === 'READ' ? '已读' : '已送达') + ' by ' + frame.userId, 'ack');
+          break;
+
+        case 'msg.update':
+          log('<- msg.update ' + frame.conversationId + ' #' + frame.seq + ' '
+              + (frame.change === 'RECALLED' ? '撤回 by ' + frame.actorId : '本账号其它端删除'), 'ack');
+          break;
+
+        case 'group.update':
+          log('<- group.update ' + frame.groupId + ' '
+              + (GROUP_CHANGE_LABEL[frame.change] || frame.change)
+              + ' actor=' + frame.actorId + (frame.targetId ? ' target=' + frame.targetId : ''), 'evt');
+          break;
+
+        case 'typing.push':
+          renderTyping(frame);
+          break;
+
+        case 'presence.push':
+          applyPresence(frame.userId, frame.online);
+          log('<- presence.push ' + frame.userId + (frame.online ? ' 上线' : ' 下线'), 'evt');
+          break;
+
+        case 'presence.snapshot':
+          (frame.states || []).forEach((s) => applyPresence(s.userId, s.online, s));
+          log('<- presence.snapshot ' + (frame.states || []).length + ' 条', 'evt');
+          break;
+
+        case 'error':
+          log('<- error ' + frame.code + ': ' + frame.message, 'err');
+          break;
+
+        case 'ping':
+          // 服务端心跳探测：必须回 pong，否则空闲超时后会被网关断开
+          ws.send(JSON.stringify({ ver: 1, type: 'pong', ts: Date.now() }));
+          break;
+
+        case 'pong':
+          log('<- pong', 'sys');
+          break;
+
+        case 'session.migrate':
+          log('<- session.migrate reason=' + frame.reason + ' retryAfterMs=' + frame.retryAfterMs
+              + '（客户端应加抖动后重连）', 'evt');
+          break;
+
+        default:
+          log('<- (未识别) ' + truncate(raw, 400), 'me');
+      }
     }
   </script>
 </body>

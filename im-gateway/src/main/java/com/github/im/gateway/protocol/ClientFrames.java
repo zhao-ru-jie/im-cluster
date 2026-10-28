@@ -1,10 +1,14 @@
 package com.github.im.gateway.protocol;
 
+import com.github.im.proto.presence.v1.PresenceState;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -84,6 +88,27 @@ public class ClientFrames {
      * <p>语义与 {@code MarkRead} 接口完全一致：用户级、只前进、由服务端 cap 到 last_seq。
      */
     public static final String TYPE_READ = "msg.read";
+    /**
+     * 客户端上报「我正在输入」（{@code {"ver":1,"type":"typing","conversationId":"s:a:b","typing":true}}）。
+     *
+     * <p>只给会话 ID 也行（单聊可以只给 {@code to}，群聊给 {@code convType":"GROUP","to":"群号"}），
+     * 会话 ID 缺失时由 IM 服务按消息路径同一套规则生成——网关不推导会话，避免两处算出不同的 ID。
+     *
+     * <p>语义是<b>状态</b>而不是事件：网关只做「解析 → 转给 IM 服务」，不排队、不缓存、失败静默。
+     * 一条丢掉的 typing 最多让对方少看一次三个点，而它为它加一个重试分支会引入真正的麻烦
+     * （重试导致的重复扇出、连接层为装饰品等待）。
+     */
+    public static final String TYPE_TYPING = "typing";
+    /**
+     * 查询在线状态（{@code {"ver":1,"type":"presence.get","userIds":["bob","carol"]}}）。
+     *
+     * <p>为什么长连接上也要这个：会话页打开时「对面在不在」是必答项，而连接本来就是热的，
+     * 再走一次 HTTP 只是多一次握手与鉴权。批量好友列表那种几十上百人的查询仍然建议走
+     * {@code GET /presence}（可缓存、可用连接池）。
+     */
+    public static final String TYPE_PRESENCE_GET = "presence.get";
+    /** 在线状态查询的应答（由网关直接回给请求的连接，不走 IM 服务的推送通道） */
+    public static final String TYPE_PRESENCE_SNAPSHOT = "presence.snapshot";
     /** 服务端要求客户端迁移连接（缩容/发版/摘流） */
     public static final String TYPE_MIGRATE = "session.migrate";
     /** 仅 TCP：客户端首帧声明身份 */
@@ -159,6 +184,35 @@ public class ClientFrames {
         Map<String, Object> frame = base(TYPE_MIGRATE);
         frame.put("reason", reason);
         frame.put("retryAfterMs", retryAfterMs);
+        frame.put("ts", System.currentTimeMillis());
+        return write(frame);
+    }
+
+    /**
+     * 在线状态查询应答帧。
+     *
+     * <p>为什么由网关渲染而不是让 IM 服务返回一段 frame 字符串：这是<b>请求-应答</b>的控制帧
+     * （和 {@code pong} / {@code msg.ack} 同类），它只回给「问的那条连接」，不走推送通道。
+     * 业务事件（{@code msg.push} / {@code presence.push}）才是 IM 服务的协议，
+     * 由它渲染、网关原样透传。这条边界一旦模糊，网关就会开始「懂」业务字段。
+     *
+     * @param states 与 {@code GET /presence} 出参同形，客户端可复用同一段渲染代码
+     */
+    public String presenceSnapshot(Collection<PresenceState> states) {
+        Map<String, Object> frame = base(TYPE_PRESENCE_SNAPSHOT);
+        List<Map<String, Object>> items = new ArrayList<>(states == null ? 0 : states.size());
+        if (states != null) {
+            for (PresenceState state : states) {
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("userId", state.getUserId());
+                item.put("online", state.getOnline());
+                item.put("gateways", state.getGateways());
+                item.put("devices", state.getDevices());
+                item.put("lastSeen", state.getLastSeen());
+                items.add(item);
+            }
+        }
+        frame.put("states", items);
         frame.put("ts", System.currentTimeMillis());
         return write(frame);
     }

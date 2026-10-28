@@ -2,6 +2,8 @@ package com.github.im.client;
 
 import tools.jackson.databind.JsonNode;
 
+import java.util.List;
+
 /**
  * 下行帧（网关 / IM 服务 → 客户端）的类型化表示。
  *
@@ -123,6 +125,55 @@ public sealed interface DownlinkFrame {
         public String type() {
             return Frames.T_MIGRATE;
         }
+    }
+
+    /**
+     * 某人正在输入（会话里的其他人）。
+     *
+     * @param typing false = 停止输入。这个信号必须被 UI 当真：停不下来等于那三个点一直亮着
+     */
+    record Typing(String conversationId, String convType, String userId, boolean typing, long ts)
+            implements DownlinkFrame {
+        @Override
+        public String type() {
+            return Frames.T_TYPING_PUSH;
+        }
+    }
+
+    /**
+     * 好友的在线状态变化。
+     *
+     * <p>语义是<b>状态</b>而不是事件：重复收到 {@code online=true} 无害（幂等覆盖），
+     * 所以宿主直接按 userId 更新头像亮度即可，不必去重。
+     */
+    record Presence(String userId, boolean online, long ts) implements DownlinkFrame {
+        @Override
+        public String type() {
+            return Frames.T_PRESENCE_PUSH;
+        }
+    }
+
+    /**
+     * 在线状态查询应答（对应上行 {@code presence.get}）。
+     *
+     * <p>只回给发起查询的那条连接，不会扇出到该用户的其他端——网页刷新好友列表
+     * 没有理由让手机也闪一下。
+     */
+    record PresenceSnapshot(List<PresenceEntry> states, long ts) implements DownlinkFrame {
+        @Override
+        public String type() {
+            return Frames.T_PRESENCE_SNAPSHOT;
+        }
+
+        /** 便捷查询：没查到的用户在语义上是「未知」，这里按离线返回 */
+        public boolean online(String userId) {
+            return states.stream()
+                    .anyMatch(state -> state.userId().equals(userId) && state.online());
+        }
+    }
+
+    /** 一个用户的在线状态（与 {@code GET /presence} 的 {@code states[]} 同形） */
+    record PresenceEntry(String userId, boolean online, int gateways, int devices, long lastSeen) {
     }
 
     /**

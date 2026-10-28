@@ -116,6 +116,35 @@ public record MessageEnvelope(String from,
         return a.compareTo(b) <= 0 ? ("s:" + a + ":" + b) : ("s:" + b + ":" + a);
     }
 
+    /**
+     * 从单聊会话 ID 里取出「这个人」的对端。
+     *
+     * <p>会话 ID 是 {@code s:{a}:{b}}（两个 userId 排序后拼接），所以「对端」本质上
+     * 只有从 ID 里反解这一条路——消息里虽然也有 {@code to}，但历史消息、回执、
+     * 输入状态这些路径手上往往只有一个会话 ID。
+     *
+     * @return 对端 userId；群聊 / 格式不合法 / 该用户不属于这个会话时返回 {@code null}
+     */
+    public static String peerOf(String conversationId, String actorUserId) {
+        if (conversationId == null || actorUserId == null || !conversationId.startsWith("s:")) {
+            return null;
+        }
+        String rest = conversationId.substring(2);
+        int sep = rest.indexOf(':');
+        if (sep <= 0 || sep == rest.length() - 1) {
+            return null;
+        }
+        String a = rest.substring(0, sep);
+        String b = rest.substring(sep + 1);
+        if (actorUserId.equals(a)) {
+            return b;
+        }
+        if (actorUserId.equals(b)) {
+            return a;
+        }
+        return null;
+    }
+
     /** 幂等键：发送方 + 客户端消息 ID */
     public String idempotencyKey() {
         return from + "|" + clientMsgId;
