@@ -129,6 +129,21 @@ public final class RedisKeys {
         return root + ":user:" + tag(userId) + ":devices";
     }
 
+    /**
+     * 设备台账（Hash：deviceId -> {@code transport|gatewayInstance|loginAt|online})，per user。
+     *
+     * <p>与 {@link #userDevices} 的分工：那一张是「设备槽位」（Set，只回答有哪些设备、
+     * 用于限制同账号登录台数），这里回答「每台设备最后一次是怎么登的、现在还在不在线」。
+     * 两张表不能合并——槽位在断连后<b>故意保留</b>（30 天内重连仍是同一台设备），
+     * 而台账里的 online 位必须随手断手写，两者的生命周期不同。
+     *
+     * <p>写入方只有 IM 服务（网关通过 ReportDevice 上报），读取方是设备列表接口。
+     * 键上带 TTL 与槽位一致：用户长期不登录后台账自然消失，不必定期清理。
+     */
+    public static String userDeviceState(String userId) {
+        return root + ":user:" + tag(userId) + ":device:state";
+    }
+
     /** 用户加入的群反查（Set：userId -> groupId），大群降级后靠它补齐会话列表 */
     public static String userGroups(String userId) {
         return root + ":user:" + tag(userId) + ":groups";

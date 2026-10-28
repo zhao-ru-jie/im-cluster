@@ -21,6 +21,7 @@ import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -107,6 +108,38 @@ class ImClientWebSocketTest {
 
                 Thread.sleep(300);
                 assertEquals(1, gateway.connections(), "401 之后不该再发起连接");
+                assertEquals(ImClient.State.CLOSED, client.state());
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("session.kick：回调带 reason，且客户端停机不再重连（否则被踢的设备 0.5s 后自己又回来）")
+    void stopsReconnectingAfterKick() throws Exception {
+        CountDownLatch kicked = new CountDownLatch(1);
+        AtomicReference<DownlinkFrame.SessionKick> captured = new AtomicReference<>();
+        try (StubWebSocketGateway gateway = new StubWebSocketGateway((conn, message) -> {
+            if (Frames.T_SYNC.equals(typeOf(message))) {
+                // 与真实网关同序：先发 session.kick，再关连接
+                conn.sendText(json("ver", 1, "type", Frames.T_SESSION_KICK,
+                        "deviceId", "test-device", "reason", "另一台设备登录了", "ts", 1L));
+                throw new IOException("kicked");
+            }
+        })) {
+            ImClientListener listener = new ImClientListener() {
+                @Override
+                public void onSessionKick(DownlinkFrame.SessionKick kick) {
+                    captured.set(kick);
+                    kicked.countDown();
+                }
+            };
+            try (ImClient client = new ImClient(wsConfig(gateway.port()), listener)) {
+                client.connect();
+                assertTrue(kicked.await(5, TimeUnit.SECONDS), "应回调 onSessionKick");
+
+                Thread.sleep(300);
+                assertEquals("另一台设备登录了", captured.get().reason(), "reason 要原样交给宿主展示");
+                assertEquals(1, gateway.connections(), "被踢之后不该再发起连接");
                 assertEquals(ImClient.State.CLOSED, client.state());
             }
         }

@@ -198,7 +198,7 @@ class MessageAclTest {
                 new ClientFrames(new ObjectMapper()), delivery, seqAllocator,
                 new ClientWatermarkStore(TestRedis.template(), TTL),
                 new ConversationStore(TestRedis.template(), TTL, 1000),
-                groupMembers, null, acl, null, Duration.ofMinutes(2), new MessageMetrics(null));
+                groupMembers, null, acl, null, null, Duration.ofMinutes(2), new MessageMetrics(null));
     }
 
     @SuppressWarnings("unchecked")

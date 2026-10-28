@@ -289,4 +289,57 @@ class FramesTest {
         assertEquals(2, snapshot.states().get(0).devices());
         assertEquals(1_750_000_000_000L, snapshot.states().get(1).lastSeen());
     }
+
+    @Test
+    @DisplayName("session.login 下行：带 deviceId 与 transport，供宿主按 deviceId 过滤自己")
+    void sessionLoginParsed() {
+        DownlinkFrame frame = frames.parse("""
+                {"ver":1,"type":"session.login","userId":"bob","deviceId":"pad",
+                 "transport":"websocket","ts":1750000000000}
+                """);
+        assertTrue(frame instanceof DownlinkFrame.SessionLogin);
+        DownlinkFrame.SessionLogin login = (DownlinkFrame.SessionLogin) frame;
+        assertEquals("bob", login.userId());
+        assertEquals("pad", login.deviceId());
+        assertEquals("websocket", login.transport());
+        assertEquals(1_750_000_000_000L, login.ts());
+    }
+
+    @Test
+    @DisplayName("session.kick 下行：reason 必带，缺失字段退化成空/0")
+    void sessionKickParsed() {
+        DownlinkFrame frame = frames.parse("""
+                {"ver":1,"type":"session.kick","deviceId":"pad","reason":"另一台设备登录了","ts":1750000000000}
+                """);
+        assertTrue(frame instanceof DownlinkFrame.SessionKick);
+        DownlinkFrame.SessionKick kick = (DownlinkFrame.SessionKick) frame;
+        assertEquals("pad", kick.deviceId());
+        assertEquals("另一台设备登录了", kick.reason());
+
+        DownlinkFrame.SessionKick bare = (DownlinkFrame.SessionKick) frames.parse("""
+                {"ver":1,"type":"session.kick"}
+                """);
+        assertEquals(0L, bare.ts(), "缺 ts 时补 0，不要抛");
+    }
+
+    @Test
+    @DisplayName("conv.update 下行：pinned/muted 缺省为 false，originDeviceId 用于滤掉自己的回声")
+    void convUpdateParsed() {
+        DownlinkFrame frame = frames.parse("""
+                {"ver":1,"type":"conv.update","conversationId":"s:a:b","pinned":true,
+                 "muted":false,"originDeviceId":"web","ts":1750000000000}
+                """);
+        assertTrue(frame instanceof DownlinkFrame.ConvUpdate);
+        DownlinkFrame.ConvUpdate update = (DownlinkFrame.ConvUpdate) frame;
+        assertEquals("s:a:b", update.conversationId());
+        assertTrue(update.pinned());
+        assertFalse(update.muted());
+        assertEquals("web", update.originDeviceId());
+
+        DownlinkFrame.ConvUpdate bare = (DownlinkFrame.ConvUpdate) frames.parse("""
+                {"ver":1,"type":"conv.update","conversationId":"g:group1"}
+                """);
+        assertFalse(bare.pinned());
+        assertFalse(bare.muted());
+    }
 }

@@ -1,5 +1,7 @@
 package com.github.im.contract;
 
+import com.github.im.proto.presence.v1.DeviceAck;
+import com.github.im.proto.presence.v1.DeviceReport;
 import com.github.im.proto.presence.v1.GetPresenceRequest;
 import com.github.im.proto.presence.v1.GetPresenceResponse;
 import com.github.im.proto.presence.v1.PresenceReport;
@@ -51,5 +53,18 @@ public interface PresencePort {
      */
     default PresenceReportAck reportPresence(PresenceReport report) {
         return PresenceReportAck.newBuilder().setCode(0).setMessage("ok").build();
+    }
+
+    /**
+     * 上报设备级登录/下线事件。
+     *
+     * <p>实现要负责两件事：更新设备台账（供「设备列表」查询），以及在新设备登录时
+     * 通知这个账号的<b>其他</b>在线设备（多端登录通知）。
+     *
+     * <p>默认实现静默成功：没装这个能力的部署，设备列表会退化成「只有槽位、没有登录信息」，
+     * 登录通知不发——两者都是装饰性信息，不该让连接建立失败。
+     */
+    default DeviceAck reportDevice(DeviceReport report) {
+        return DeviceAck.newBuilder().setCode(0).setMessage("ok").build();
     }
 }

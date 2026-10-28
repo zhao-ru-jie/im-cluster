@@ -9,6 +9,8 @@ import com.github.im.storage.mongodb.MongoGroupRepository;
 import com.github.im.storage.mongodb.MongoMessageRepository;
 import com.github.im.storage.mongodb.MongoRelationRepository;
 import com.github.im.storage.mongodb.MongoSchema;
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import org.bson.Document;
@@ -20,6 +22,8 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.mongodb.core.MongoTemplate;
+
+import java.util.concurrent.TimeUnit;
 
 /**
  * MongoDB 存储的手工装配（{@code im.storage=mongodb} 时生效）。
@@ -73,14 +77,28 @@ public class MongoStorageConfig {
      *
      * <p>只做一次 {@code ping} 来确认「地址可达 + 认证通过」；它同时把
      * 「配置写错」的暴露时间点从「第一条消息」提前到「启动」。
+     *
+     * <p>启动日志会把<b>地址与三个超时</b>打出来（不含账号密码）：Mongo 相关的报错
+     * （{@code MongoSocketReadTimeoutException} / {@code MongoTimeoutException}）几乎都取决于
+     * 「到底连的谁、超时配了多少」，而 uri 本身不能回显——落地一行摘要，比在故障时猜配置省事得多。
+     * 尤其是 {@code socketTimeout=0}：那意味着<b>驱动永远不会因为读不到响应而失败</b>，
+     * 存储假死时线程会一直等，只有从这行日志才看得出来。
      */
     @Bean(destroyMethod = "close")
     @ConditionalOnMissingBean(MongoClient.class)
     public MongoClient imMongoClient(@Value("${im.mongo.uri}") String uri) {
-        MongoClient client = MongoClients.create(uri);
+        ConnectionString connectionString = new ConnectionString(uri);
+        MongoClientSettings settings = MongoClientSettings.builder()
+                .applyConnectionString(connectionString)
+                .build();
+        MongoClient client = MongoClients.create(settings);
         client.getDatabase("admin").runCommand(new Document("ping", 1));
-        // uri 里可能带账号密码，日志只打「已连上」，不回显 uri
-        log.info("[storage] MongoDB 消息存储已启用（ping 成功）");
+        log.info("[storage] MongoDB 消息存储已启用（ping 成功）hosts={} connectTimeout={}ms "
+                        + "socketTimeout={}ms serverSelectionTimeout={}ms",
+                connectionString.getHosts(),
+                settings.getSocketSettings().getConnectTimeout(TimeUnit.MILLISECONDS),
+                settings.getSocketSettings().getReadTimeout(TimeUnit.MILLISECONDS),
+                settings.getClusterSettings().getServerSelectionTimeout(TimeUnit.MILLISECONDS));
         return client;
     }
 

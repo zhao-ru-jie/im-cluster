@@ -18,6 +18,7 @@ import com.github.im.proto.ingress.v1.PullPendingRequest;
 import com.github.im.proto.ingress.v1.PullPendingResponse;
 import com.github.im.proto.ingress.v1.SubmitMessageRequest;
 import com.github.im.proto.ingress.v1.SubmitMessageResponse;
+import com.github.im.server.conversation.ConversationFlagNotifier;
 import com.github.im.server.conversation.ConversationStore;
 import com.github.im.server.conversation.ConversationStore.ConversationFlag;
 import com.github.im.server.conversation.ConversationStore.ConversationMeta;
@@ -116,6 +117,8 @@ public class MessageService implements MessageIngress {
     private final MessageAcl acl;
     /** 可空：消息变更事件广播（撤回 / 本地删除） */
     private final MessageUpdateNotifier updateNotifier;
+    /** 可空：会话标记（置顶/免打扰）多端广播；未装配时只写存储，不通知其它设备 */
+    private final ConversationFlagNotifier flagNotifier;
     /** 撤回时限：超过之后只有服务端管理员能处理，客户端不再有这个动作 */
     private final Duration recallWindow;
     /** 服务端指标：registry 为 null 时全部退化为空操作，单测直接传 {@code new MessageMetrics(null)} */
@@ -133,6 +136,7 @@ public class MessageService implements MessageIngress {
                           MessageStateNotifier stateNotifier,
                           MessageAcl acl,
                           MessageUpdateNotifier updateNotifier,
+                          ConversationFlagNotifier flagNotifier,
                           @Value("${im.recall.window:2m}") Duration recallWindow,
                           MessageMetrics metrics) {
         this.redis = redis;
@@ -147,6 +151,7 @@ public class MessageService implements MessageIngress {
         this.stateNotifier = stateNotifier;
         this.acl = acl;
         this.updateNotifier = updateNotifier;
+        this.flagNotifier = flagNotifier;
         this.recallWindow = recallWindow == null ? Duration.ofMinutes(2) : recallWindow;
         this.metrics = metrics;
     }
@@ -582,10 +587,30 @@ public class MessageService implements MessageIngress {
      */
     public ConversationFlag setConversationFlags(String userId, String conversationId,
                                                  Boolean pinned, Boolean muted) {
+        return setConversationFlags(userId, conversationId, pinned, muted, null);
+    }
+
+    /**
+     * 设置会话标记，并把变更广播给同账号的其它设备。
+     *
+     * <p>标记是用户级状态：任何一台设备改完，其它设备本地缓存立刻过期，
+     * 所以写成功之后必须推一条 {@code conv.update}（不推 = 另一端一直显示错的状态，
+     * 直到下次冷启动拉列表）。
+     *
+     * @param originDeviceId 发起变更的设备，客户端据此忽略自己的回声；可空（后台/服务端发起）
+     * @throws IllegalArgumentException 用户或会话 ID 为空
+     */
+    public ConversationFlag setConversationFlags(String userId, String conversationId,
+                                                 Boolean pinned, Boolean muted,
+                                                 String originDeviceId) {
         if (!StringUtils.hasText(userId) || !StringUtils.hasText(conversationId)) {
             throw new IllegalArgumentException("userId and conversationId are required");
         }
-        return conversations.setFlags(userId, conversationId, pinned, muted);
+        ConversationFlag flag = conversations.setFlags(userId, conversationId, pinned, muted);
+        if (flagNotifier != null) {
+            flagNotifier.notifyFlags(userId, conversationId, flag.pinned(), flag.muted(), originDeviceId);
+        }
+        return flag;
     }
 
     /**

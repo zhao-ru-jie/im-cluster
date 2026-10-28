@@ -109,6 +109,14 @@ public class ClientFrames {
     public static final String TYPE_PRESENCE_GET = "presence.get";
     /** 在线状态查询的应答（由网关直接回给请求的连接，不走 IM 服务的推送通道） */
     public static final String TYPE_PRESENCE_SNAPSHOT = "presence.snapshot";
+    /**
+     * 踢下线（{@code {"ver":1,"type":"session.kick","deviceId":"pad","reason":"...","ts":..}}）。
+     *
+     * <p>它是<b>告别</b>而不是命令：连接马上就关，这一帧只是给正常客户端一个明确的退出理由
+     * （比如「你在另一台设备登录了」），让它不要当成网络故障去重连。
+     * 不指望它约束恶意客户端——真正的下线由服务端关闭 TCP 连接完成。
+     */
+    public static final String TYPE_SESSION_KICK = "session.kick";
     /** 服务端要求客户端迁移连接（缩容/发版/摘流） */
     public static final String TYPE_MIGRATE = "session.migrate";
     /** 仅 TCP：客户端首帧声明身份 */
@@ -184,6 +192,21 @@ public class ClientFrames {
         Map<String, Object> frame = base(TYPE_MIGRATE);
         frame.put("reason", reason);
         frame.put("retryAfterMs", retryAfterMs);
+        frame.put("ts", System.currentTimeMillis());
+        return write(frame);
+    }
+
+    /**
+     * 踢下线帧：关闭连接前最后一帧。
+     *
+     * @param deviceId 被踢的设备（客户端可以据此判断「被踢的是不是我自己」，
+     *                 多端场景下它也可能收到别的设备的 kick 事件）
+     * @param reason   退出理由，原样展示给用户
+     */
+    public String kickFrame(String deviceId, String reason) {
+        Map<String, Object> frame = base(TYPE_SESSION_KICK);
+        frame.put("deviceId", deviceId == null ? "" : deviceId);
+        frame.put("reason", reason == null ? "" : reason);
         frame.put("ts", System.currentTimeMillis());
         return write(frame);
     }

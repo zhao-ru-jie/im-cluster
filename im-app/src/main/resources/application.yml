@@ -80,7 +80,11 @@ im:
     init-schema: ${IM_DB_INIT_SCHEMA:true}
   mongo:
     # 仅 im.storage=mongodb 时才读取。启动先 ping 一次：地址/认证配错在启动阶段就报错。
-    uri: ${IM_MONGO_URI:mongodb://127.0.0.1:27017/?connectTimeoutMS=3000&serverSelectionTimeoutMS=5000}
+    # socketTimeoutMS 必须显式给：Java 驱动默认是 0 = 永远等。少了它，mongod 假死/网络半断时
+    # 这条读会把线程永久挂住——网关 300ms 的 deadline 只会让客户端看到 503，服务端还在原地等，
+    # 故障越积越多；给了它才是「有界失败 + 客户端可重试」。30s 只是兜底，远大于本项目单条
+    # insert / 单页查询的耗时。
+    uri: ${IM_MONGO_URI:mongodb://127.0.0.1:27017/?connectTimeoutMS=3000&serverSelectionTimeoutMS=5000&socketTimeoutMS=30000}
     database: ${IM_MONGO_DATABASE:im}
     # 启动时建索引（幂等）；生产上也可交给 DBA 脚本，但两条唯一索引（保序去重 + 幂等）不能少
     init-indexes: ${IM_MONGO_INIT_INDEXES:true}

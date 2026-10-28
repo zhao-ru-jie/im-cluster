@@ -82,7 +82,10 @@ im:
   mongo:
     # im.storage=mongodb 时使用。uri 里可以带账号密码与副本集参数，日志不会回显它。
     # 启动时会先 ping 一次：地址或认证配错在启动阶段就报错，而不是等第一条消息。
-    uri: ${IM_MONGO_URI:mongodb://127.0.0.1:27017/?connectTimeoutMS=3000&serverSelectionTimeoutMS=5000}
+    # socketTimeoutMS 必须显式给：Java 驱动默认 0 = 永远等。少了它，mongod 假死时这条读会把
+    # gRPC 线程永久挂住，网关 300ms deadline 到期只让客户端收到 503，服务端还在原地等；
+    # 有了它才是「有界失败 + 消息上行按可重试返回」。30s 只是兜底，不是性能调优参数。
+    uri: ${IM_MONGO_URI:mongodb://127.0.0.1:27017/?connectTimeoutMS=3000&serverSelectionTimeoutMS=5000&socketTimeoutMS=30000}
     database: ${IM_MONGO_DATABASE:im}
     # 启动时建索引（幂等）。生产上若由 DBA 脚本统一管理索引，可以关掉。
     # 注意：uk_msg_conv_seq / uk_msg_idem 这两条唯一索引是保序与幂等的最终防线（消息 ID 由 _id 自身保证），

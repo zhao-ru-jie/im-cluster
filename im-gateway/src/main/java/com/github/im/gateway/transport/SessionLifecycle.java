@@ -17,6 +17,7 @@ import com.github.im.proto.ingress.v1.PullPendingRequest;
 import com.github.im.proto.ingress.v1.PullPendingResponse;
 import com.github.im.proto.ingress.v1.SubmitMessageRequest;
 import com.github.im.proto.ingress.v1.SubmitMessageResponse;
+import com.github.im.proto.presence.v1.DeviceReport;
 import com.github.im.proto.presence.v1.GetPresenceRequest;
 import com.github.im.proto.presence.v1.GetPresenceResponse;
 import com.github.im.proto.presence.v1.PresenceReport;
@@ -33,6 +34,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 连接生命周期与上行帧处理的<b>唯一实现</b>，被所有传输复用。
@@ -59,6 +64,8 @@ public class SessionLifecycle {
     private static final int DEFAULT_PULL_MAX = 200;
     /** 4xx = 可重试（客户端指数退避重发），5xx = 拒收 */
     private static final int CODE_UNAVAILABLE = 503;
+    /** typing 上报排队上限：超了就丢，输入状态不值得堆在内存里等 */
+    private static final int TYPING_QUEUE_CAPACITY = 4096;
 
     private final ConnectionManager connectionManager;
     private final GatewayRegistry registry;
@@ -67,6 +74,22 @@ public class SessionLifecycle {
     /** 可空：状态上报（typing / presence）是可选能力，没装配就整体静默 */
     private final ObjectProvider<PresencePort> presenceProvider;
     private final GatewayMetrics metrics;
+
+    /**
+     * typing 上报的串行执行器：一帧一个虚拟线程会把「true 之后 false」的顺序打乱。
+     *
+     * <p>接收方是靠这个顺序熄灯的，乱序的后果不是日志难看，而是
+     * 「对方第二次正在输入不出现、只收到停止输入」——{@code false} 先到把状态清了，
+     * 随后到的 {@code true} 又被服务的 3s 去抖当成重复帧吞掉。
+     *
+     * <p>单线程 = 保序；队列有界 + {@link ThreadPoolExecutor.DiscardPolicy} 丢新帧 =
+     * 过载时丢的是装饰品，而不是像同步调用那样把这条连接的上行串行队列拖住。
+     */
+    private final ExecutorService typingReporter = new ThreadPoolExecutor(1, 1,
+            0L, TimeUnit.MILLISECONDS,
+            new LinkedBlockingQueue<>(TYPING_QUEUE_CAPACITY),
+            Thread.ofVirtual().name("typing-report-", 0).factory(),
+            new ThreadPoolExecutor.DiscardPolicy());
 
     public SessionLifecycle(ConnectionManager connectionManager,
                             GatewayRegistry registry,
@@ -108,6 +131,8 @@ public class SessionLifecycle {
         if (connectionManager.deviceCount(userId) == 1) {
             reportPresence(userId, deviceKeyOf(session), true);
         }
+        // 设备级上报：台账 + 多端登录通知（「你的账号在另一台设备登录了」）
+        reportDevice(session, true);
         pullPending(session, Map.of());
     }
 
@@ -187,6 +212,9 @@ public class SessionLifecycle {
             // 其它实例上是否还有连接由 IM 服务复核，网关不做全局判断（它看不到全局）。
             reportPresence(userId, deviceKeyOf(session), false);
         }
+        // 设备级下线：每台设备各自上报（不受「本实例是否还有别的设备」影响）。
+        // 放在 isLocal 判断之外，因为台账是按设备记的，不是按用户记的。
+        reportDevice(session, false);
         metrics.sessionClosed();
         log.info("user {} disconnected from gateway {} via {}", userId, registry.localInstanceId(), session.transport());
     }
@@ -443,6 +471,11 @@ public class SessionLifecycle {
      * 丢了最多让对方少看一次三个点；为它阻塞这条连接的串行队列，或者给客户端加一个
      * 重试分支，都是拿主链路换装饰品。
      *
+     * <p><b>但顺序必须保住</b>：这里是「异步」而不是「每帧起一个虚拟线程」。后者会把紧挨着的
+     * {@code typing=true} 和 {@code typing=false} 换序，接收方先看到「停止」再看到「正在输入」，
+     * 或者 {@code true} 因为服务的 3s 去抖被吞——现象就是「第二次明明在打字，对方只收到停止输入」。
+     * 串行执行器既保序又不阻塞上行队列，队列打满时丢帧（丢的是装饰品）。
+     *
      * <p>会话与对端<b>至少要有一个</b>：两者都没有的帧没有任何投递对象，
      * 送去 IM 服务也只会得到一次注定失败的分辨。脏帧直接丢弃，不回错误帧
      * （客户端拿这个 400 什么也做不了）。
@@ -467,7 +500,7 @@ public class SessionLifecycle {
                 .setClientTs(longValue(node, "clientTs"))
                 .setTraceId(traceIdOf(node))
                 .build();
-        Thread.ofVirtual().name("typing-", 0).start(() -> {
+        typingReporter.execute(() -> {
             try {
                 port.reportTyping(request);
             } catch (RuntimeException e) {
@@ -538,6 +571,37 @@ public class SessionLifecycle {
                 metrics.ingressFailed("presence-report", e);
                 log.debug("[presence] 边沿上报失败 user={} online={} err={}",
                         userId, online, e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * 上报设备级登录/下线（台账 + 多端登录通知）。
+     *
+     * <p>和其它状态上报同一个口径：<b>异步、失败静默</b>。台账晚一点更新、少发一次登录通知
+     * 都不影响任何消息语义，绝不能因为它把连接建立/断开变成异常路径。
+     */
+    private void reportDevice(ClientSession session, boolean login) {
+        PresencePort port = presenceProvider == null ? null : presenceProvider.getIfAvailable();
+        String userId = session.userId();
+        if (port == null || userId == null || userId.isBlank()) {
+            return;
+        }
+        DeviceReport report = DeviceReport.newBuilder()
+                .setUserId(userId)
+                .setDeviceId(deviceKeyOf(session))
+                .setTransport(session.transport())
+                .setLogin(login)
+                .setGatewayInstance(registry.localInstanceId())
+                .setTs(System.currentTimeMillis())
+                .build();
+        Thread.ofVirtual().name("device-report-", 0).start(() -> {
+            try {
+                port.reportDevice(report);
+            } catch (RuntimeException e) {
+                metrics.ingressFailed("device-report", e);
+                log.debug("[device] 设备上报失败 user={} device={} login={} err={}",
+                        userId, report.getDeviceId(), login, e.getMessage());
             }
         });
     }

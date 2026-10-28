@@ -21,6 +21,17 @@ option java_outer_classname = "ImPushProto";
 // ============================================================================
 service DownstreamPush {
   rpc Push(PushTask) returns (PushResult);
+
+  // 踢下线（设备管理）。
+  //
+  // 为什么这个动作必须落在网关而不是「推一帧让客户端自己断」：
+  // 一帧 kick 只能劝退守规矩的客户端，token 被盗、协议被改的客户端会直接忽略它，
+  // 而「踢下线」的价值恰恰在于服务端能强行收回连接。所以这里要求网关**真正关闭 TCP 连接**，
+  // 关闭前那帧 kick 只是给正常客户端一个体面的退出理由（先写后关，Netty 保证顺序）。
+  //
+  // 语义是「尽力而为 + 如实回报」：本实例上没这条连接就返回 kicked=0，
+  // 由 IM 服务根据路由表决定还要不要去别的实例踢。
+  rpc Kick(KickTask) returns (KickResult);
 }
 
 message PushTask {
@@ -35,4 +46,23 @@ message PushTask {
 message PushResult {
   repeated string delivered_user_ids = 1;
   repeated string failed_user_ids = 2; // 未投递成功（离线/非本实例），由 IM 服务落离线
+}
+
+message KickTask {
+  string user_id = 1;
+  // 空 = 该用户在本实例上的所有设备；
+  // 非空 = 只踢这台（设备粒度用 deviceId 寻址，和 PushTask 的「只到用户粒度」不同：
+  //         踢下线本来就是针对某一台设备的动作）
+  string device_id = 2;
+  // 要**保留**的设备（「退出其他设备」用）。与 device_id 互斥，同时给时以 device_id 为准。
+  string except_device_id = 3;
+  // 会原样出现在客户端的 session.kick 帧里。
+  // 这里只传「原因文本」而不传「渲染好的帧」：kick 是连接级控制帧，
+  // 和 session.migrate 一样由网关渲染（网关不需要懂业务，客户端也只需要一个退出理由）。
+  string reason = 4;
+}
+
+message KickResult {
+  int32 kicked = 1;                  // 实际关闭的连接数（0 = 本实例没有命中）
+  repeated string device_ids = 2;    // 被关掉的设备，便于服务端核对与日志
 }

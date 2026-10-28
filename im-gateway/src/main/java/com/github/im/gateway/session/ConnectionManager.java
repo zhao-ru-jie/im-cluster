@@ -127,6 +127,18 @@ public class ConnectionManager {
         return devices.containsKey(userId);
     }
 
+    /**
+     * 该用户在本实例上的会话快照（踢下线 / 多端巡检用）。
+     *
+     * <p>返回的是<b>浅拷贝</b>而不是内层 map 的视图：调用方随后要逐条 {@code close()}，
+     * 而 close 的回调会立刻回头删表，直接遍历原 map 会撞上并发修改。
+     * 拷贝出来的会话对象本身仍可能已经关闭，调用方需要自己判 {@link ClientSession#isOpen()}。
+     */
+    public List<ClientSession> sessionsOf(String userId) {
+        ConcurrentHashMap<String, ClientSession> byDevice = devices.get(userId);
+        return byDevice == null ? List.of() : new ArrayList<>(byDevice.values());
+    }
+
     /** 本实例上该用户的设备数（0 = 不在线） */
     public int deviceCount(String userId) {
         ConcurrentHashMap<String, ClientSession> byDevice = devices.get(userId);

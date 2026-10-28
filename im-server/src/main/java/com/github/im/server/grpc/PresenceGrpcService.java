@@ -1,5 +1,7 @@
 package com.github.im.server.grpc;
 
+import com.github.im.proto.presence.v1.DeviceAck;
+import com.github.im.proto.presence.v1.DeviceReport;
 import com.github.im.proto.presence.v1.GetPresenceRequest;
 import com.github.im.proto.presence.v1.GetPresenceResponse;
 import com.github.im.proto.presence.v1.PresenceIngressGrpc;
@@ -74,6 +76,12 @@ public class PresenceGrpcService extends PresenceIngressGrpc.PresenceIngressImpl
                                StreamObserver<PresenceReportAck> responseObserver) {
         handle("reportPresence", request.getUserId(), responseObserver,
                 () -> presence.reportPresence(request));
+    }
+
+    @Override
+    public void reportDevice(DeviceReport request, StreamObserver<DeviceAck> responseObserver) {
+        handle("reportDevice", request.getUserId(), responseObserver,
+                () -> presence.reportDevice(request));
     }
 
     private <T> void handle(String rpc, String subject, StreamObserver<T> observer, Supplier<T> call) {

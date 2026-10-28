@@ -125,6 +125,38 @@ public class ClientFrames {
      */
     public static final String TYPE_PRESENCE = "presence.push";
 
+    /**
+     * 多端登录通知（{@code session.login}），推给<b>同一个账号的其它在线设备</b>。
+     *
+     * <pre>
+     * {"ver":1,"type":"session.login","userId":"bob","deviceId":"pad",
+     *  "transport":"websocket","ts":1750000000000}
+     * </pre>
+     *
+     * <p>为什么要带 {@code deviceId}：推送粒度只到用户（{@link com.github.im.proto.push.v1.PushTask}
+     * 的 target 是 userId），所以这条帧会同时到达所有设备，<b>包括刚登录的那台</b>。
+     * 客户端按 {@code deviceId != 自己的} 过滤即可——用「排除某台设备」的字段去做这件事，
+     * 需要在推送链路上增加设备粒度寻址，为一条提示帧不值得。
+     */
+    public static final String TYPE_SESSION_LOGIN = "session.login";
+
+    /**
+     * 会话标记变更（{@code conv.update}）：置顶 / 免打扰在这台设备上改了，
+     * 同账号的其它设备要跟着变。
+     *
+     * <pre>
+     * {"ver":1,"type":"conv.update","conversationId":"s:a:b","pinned":true,"muted":false,
+     *  "originDeviceId":"web","ts":1750000000000}
+     * </pre>
+     *
+     * <p>为什么必须广播：标记是「用户级」状态（存在 {@code im:user:{id}:flags} 里，不分设备），
+     * 任何一台设备改完，其它设备本地缓存就过期了。不通知的后果是「手机置顶了，网页还是乱的」，
+     * 而且永远不会自愈——直到下次冷启动重新拉会话列表。
+     *
+     * <p>{@code originDeviceId} 让发起方忽略自己的回声（同样是因为推送粒度只到用户）。
+     */
+    public static final String TYPE_CONV_UPDATE = "conv.update";
+
     /** 撤回：会话级，广播给会话内所有人（含发送方自己的其他端） */
     public static final String CHANGE_RECALLED = "RECALLED";
     /** 本地删除：用户级，只推给操作者自己的其他端；对端不受影响 */
@@ -334,6 +366,40 @@ public class ClientFrames {
         frame.put("type", TYPE_PRESENCE);
         frame.put("userId", userId);
         frame.put("online", online);
+        frame.put("ts", ts);
+        return objectMapper.writeValueAsString(frame);
+    }
+
+    /**
+     * 多端登录通知帧。
+     *
+     * @param deviceId 登录的那台设备（收件人据此把自己排除掉）
+     */
+    public String loginFrame(String userId, String deviceId, String transport, long ts) {
+        Map<String, Object> frame = new LinkedHashMap<>();
+        frame.put("ver", VER);
+        frame.put("type", TYPE_SESSION_LOGIN);
+        frame.put("userId", userId);
+        frame.put("deviceId", deviceId);
+        frame.put("transport", transport);
+        frame.put("ts", ts);
+        return objectMapper.writeValueAsString(frame);
+    }
+
+    /**
+     * 会话标记变更帧（置顶 / 免打扰）。
+     *
+     * @param originDeviceId 发起变更的设备；为空表示变更来自服务端/后台（客户端都该更新）
+     */
+    public String convUpdateFrame(String conversationId, boolean pinned, boolean muted,
+                                  String originDeviceId, long ts) {
+        Map<String, Object> frame = new LinkedHashMap<>();
+        frame.put("ver", VER);
+        frame.put("type", TYPE_CONV_UPDATE);
+        frame.put("conversationId", conversationId);
+        frame.put("pinned", pinned);
+        frame.put("muted", muted);
+        frame.put("originDeviceId", originDeviceId == null ? "" : originDeviceId);
         frame.put("ts", ts);
         return objectMapper.writeValueAsString(frame);
     }

@@ -72,6 +72,7 @@
           <button id="disconnectBtn" class="ghost" onclick="disconnect()" disabled>断开</button>
           <button class="ghost" onclick="ping()">ping</button>
           <span id="connState" class="status-line">未连接</span>
+          <span id="typingBadge" class="typing"></span>
         </div>
         <div class="row">
           <span class="hint">REST 地址</span>
@@ -95,6 +96,7 @@
       <div class="tabs">
         <button class="active" onclick="tab('msg', this)">消息</button>
         <button onclick="tab('conv', this)">会话</button>
+        <button onclick="tab('device', this)">设备 / 多端</button>
         <button onclick="tab('group', this)">群组</button>
         <button onclick="tab('social', this)">关系 / 在线</button>
         <button onclick="tab('ops', this)">运维</button>
@@ -131,6 +133,14 @@
             <button class="ghost" onclick="sendTyping(true)">上报 typing=true</button>
             <button class="ghost" onclick="sendTyping(false)">上报 typing=false</button>
             <span class="hint">服务端对 true 有 3s 去抖；false 一定下发</span>
+          </div>
+          <div class="hint">
+            上行必须有<b>目标</b>：「对端 userId」或「当前会话 ID」填一个，两个都空时这条帧根本发不出去
+            （自动上报只在日志里提示一次）。<br>
+            下行只推给<b>会话里的其他人</b>（永远排除发送者本人），所以同一个 userId 开两个页面互相看不到——
+            要用两个<b>不同</b> userId 的页面（或手机 + 网页）验证。指示器出现两处：页面顶部连接状态行里的
+            「正在输入…」，以及本卡片下方的橙色一行；10s 内既没有新的 typing=true 也没等到
+            typing=false 才会自动熄灭（对方客户端直接消失时的兜底）。
           </div>
         </div>
 
@@ -194,6 +204,55 @@
               <option value="false">取消免打扰</option>
             </select>
             <button class="ghost" onclick="setFlag()">保存标记</button>
+          </div>
+          <div class="hint">
+            保存后服务端会给这个账号的<b>所有在线端</b>广播一条 <code>conv.update</code>（带
+            <code>originDeviceId</code>）：其它端的会话列表当场跟着变，本端按 deviceId 忽略自己的回声。
+            开两个用不同 deviceId 的页面即可验证。
+          </div>
+        </div>
+      </div>
+
+      <!-- ================= 设备 / 多端 ================= -->
+      <div id="pane-device" class="pane">
+        <div class="card">
+          <h3>本账号设备（GET /device/{userId}）</h3>
+          <div class="row">
+            <button class="ghost" onclick="loadDevices()">刷新设备列表</button>
+            <span class="hint">同一 userId 换个 deviceId 再开一个页面：登录时另一端会收到 session.login</span>
+          </div>
+          <div id="deviceTable"><div class="hint">还没拉取</div></div>
+        </div>
+
+        <div class="card">
+          <h3>踢下线 / 退出其他设备 / 移除设备</h3>
+          <div class="row">
+            <input id="kickDeviceId" placeholder="要踢的 deviceId（空=本页 deviceId）" style="flex:1;min-width:230px">
+            <input id="kickReason" placeholder="reason" value="kicked-by-server" style="width:190px">
+            <button class="warn" onclick="kickDevice()">踢这台</button>
+          </div>
+          <div class="row">
+            <input id="keepDeviceId" placeholder="保留的 deviceId（空=本页 deviceId）" style="flex:1;min-width:230px">
+            <input id="kickOthersReason" placeholder="reason" value="logout-other-devices" style="width:190px">
+            <button class="warn" onclick="kickOthers()">退出其他设备</button>
+          </div>
+          <div class="row">
+            <input id="forgetDeviceId" placeholder="要从账号里移除的 deviceId" style="flex:1;min-width:230px">
+            <button class="ghost" onclick="forgetDevice()">移除设备</button>
+          </div>
+          <div class="hint">
+            三个写操作都是「真的把连接关掉」，不是推一帧让客户端自觉退出；关之前会先发一条
+            <code>session.kick</code>（reason 原样给用户看）。回包里 <code>controllable=false</code>
+            表示这个部署没有连接控制通道（根本没执行），与「执行了但设备不在线」（<code>kicked=0</code>）不是一回事。
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>多端事件（WS · session.login / session.kick）</h3>
+          <div id="deviceEvents"><div class="hint">还没有</div></div>
+          <div class="hint">
+            推送粒度是「用户级」：session.login 连刚登录的那台自己也会收到，宿主按
+            <code>deviceId != 自己的</code> 过滤后再提示「你的账号在新设备登录」。
           </div>
         </div>
       </div>
@@ -326,9 +385,10 @@
     // 这个页面是「服务端能力的全量对接清单」，不是示例代码的一半：
     //   上行帧：msg.send / msg.recv / msg.read / sync / typing / presence.get / ping / pong
     //   下行帧：connected / msg.ack / msg.push / msg.state / msg.update / group.update /
-    //          typing.push / presence.push / presence.snapshot / error / ping / pong / session.migrate
+    //          typing.push / presence.push / presence.snapshot / error / ping / pong / session.migrate /
+    //          session.login（多端登录）/ session.kick（被踢下线）/ conv.update（标记多端同步）
     //   REST  ：/send、/conv（列表/已读/撤回/删除/标记）、/conv/{id}/messages、/group 全套、
-    //          /relation、/presence
+    //          /relation、/presence、/device（列表/踢下线/退出其他设备/移除）
     // 每一条都能在右侧日志里看到原始帧或 HTTP 响应，便于对着服务端日志核对。
     // ============================================================================
 
@@ -352,8 +412,13 @@
     let histCursor = 0;
     // userId -> { online, gateways, devices, lastSeen }
     const presenceMap = {};
-    // "conversationId|userId" -> setTimeout（「正在输入」5s 后自动消失）
+    // "conversationId|userId" -> setTimeout（「正在输入」的兜底熄灭，见 renderTyping）
     const typingTimers = {};
+    // 最近一次 GET /conv 的结果：conv.update 到达时要在原地改这一份再重画，
+    // 否则「手机置顶了、网页还是乱的」——而重画又只能靠再拉一次列表
+    let convListCache = [];
+    // 多端事件（session.login / session.kick），新的在最上面
+    const deviceEventList = [];
 
     // ==== 地址配置 ====
     //
@@ -482,6 +547,12 @@
       return text.length <= max ? text : text.slice(0, max) + '…(' + text.length + 'B)';
     }
 
+    /** 服务端文本（如 kick 的 reason）要拼进 innerHTML 时必须先转义 */
+    function escapeHtml(text) {
+      const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+      return String(text == null ? '' : text).replace(/[&<>"']/g, (ch) => map[ch]);
+    }
+
     // ==== 通用 REST 调用：统一打日志，方便和服务端日志对齐 ====
 
     async function api(method, path, body) {
@@ -579,11 +650,13 @@
     // ==== 标签页 ====
 
     function tab(name, btn) {
-      ['msg', 'conv', 'group', 'social', 'ops'].forEach((key) => {
+      ['msg', 'conv', 'device', 'group', 'social', 'ops'].forEach((key) => {
         document.getElementById('pane-' + key).classList.toggle('active', key === name);
       });
       document.querySelectorAll('.tabs button').forEach((b) => b.classList.remove('active'));
       if (btn) btn.classList.add('active');
+      // 进「设备 / 多端」就顺手拉一次列表：这一页的按钮全是围绕「现在有哪些设备」的
+      if (name === 'device' && me()) loadDevices();
     }
 
     // ==== 连接 ====
@@ -603,6 +676,9 @@
           + '&deviceId=' + encodeURIComponent(deviceId);
       if (token) url += '&token=' + encodeURIComponent(token);
       log('正在连接 ' + url.replace(/token=[^&]+/, 'token=***'), 'sys');
+      typingTargetWarned = false;   // 新连接重新允许提示一次
+      document.getElementById('typingBadge').textContent = '';
+      document.getElementById('typingLine').textContent = '';
       ws = new WebSocket(url);
 
       ws.onopen = () => {
@@ -692,9 +768,16 @@
     // ==== 正在输入（typing） ====
 
     let typingTimer = null;     // 停手 2s 后补一条 false
-    let lastTypingAt = 0;       // 3s 节流（服务端还有一层去抖，这里只是省流量）
-    const TYPING_THROTTLE_MS = 3000;
+    let lastTypingAt = 0;       // 连续打字时的「我还在这」心跳间隔
+    // 页面这一层<b>只做防抖，不做去重</b>：真正的去重（3s 窗口）在服务端 TypingNotifier 里。
+    // 曾经这里是 3s 节流，正好压住服务端的去抖窗口——网络抖动让服务端测出的间隔差几毫秒，
+    // 那条 true 就被当重复帧吞掉，对端等不到刷新、它的兜底计时先熄灭，
+    // 表现就是「明明还在打字，对方只收到停止输入」。所以这里只留 500ms 防按键风暴。
+    const TYPING_THROTTLE_MS = 500;
     const TYPING_IDLE_MS = 2000;
+    let typingTargetWarned = false;   // 「没有目标所以没上报」只提示一次，否则按键就刷屏
+    // "conversationId|userId" -> 已应用的最新帧 ts（乱序的旧帧不能把新状态改回去）
+    const typingLastTs = {};
 
     document.addEventListener('DOMContentLoaded', () => {
       // 地址配置：URL 参数优先（便于分享一条能直接用的链接），其次上一次的输入
@@ -742,7 +825,16 @@
     function sendTyping(typing, silent) {
       if (!connected()) { if (!silent) alert('未连接'); return; }
       const target = typingTarget();
-      if (!target) { if (!silent) alert('请填写会话 ID 或对端 userId'); return; }
+      if (!target) {
+        if (!silent) { alert('请填写会话 ID 或对端 userId'); return; }
+        // 自动上报（打字触发）没有目标时不要静默：这正是「怎么对方看不到我在输入」的常见原因，
+        // 但每次按键都提示会刷屏，所以只提示一次
+        if (!typingTargetWarned) {
+          typingTargetWarned = true;
+          log('typing 没有上报：请先填「对端 userId」或「当前会话 ID」（此提示只出现一次）', 'err');
+        }
+        return;
+      }
       const frame = Object.assign({ ver: 1, type: 'typing', typing: typing }, target);
       ws.send(JSON.stringify(frame));
       if (!silent) log('-> typing=' + typing + ' ' + JSON.stringify(target), 'sys');
@@ -758,20 +850,37 @@
     }
 
     function renderTyping(frame) {
+      // 服务端已经排除了发送者本人；这里再兜一层，免得自己多端时看到「我在输入」
+      if (frame.userId === me()) return;
       const key = frame.conversationId + '|' + frame.userId;
+      // 乱序防护：一条迟到的 typing=false 不能把刚到的 typing=true 熄掉
+      // （网关已串行保序，但多实例/多跳时仍可能乱序，而「顺序」正是这个功能的语义）
+      const ts = Number(frame.ts) || 0;
+      if (ts > 0 && typingLastTs[key] && ts < typingLastTs[key]) {
+        log('<- typing.push 丢弃过期帧 ' + key + ' ts=' + ts + ' < ' + typingLastTs[key], 'sys');
+        return;
+      }
+      if (ts > 0) typingLastTs[key] = ts;
       const line = document.getElementById('typingLine');
+      const badge = document.getElementById('typingBadge');
+      const setText = (text) => {
+        line.textContent = text;
+        // 顶部状态行也显示一份：切到别的标签页时那三个点同样看得见
+        badge.textContent = text ? '● ' + text : '';
+      };
       if (frame.typing) {
-        line.textContent = frame.userId + ' 正在输入… (' + frame.conversationId + ')';
+        setText(frame.userId + ' 正在输入… (' + frame.conversationId + ')');
         log('<- typing.push ' + frame.userId + ' 正在输入 ' + frame.conversationId, 'evt');
         if (typingTimers[key]) clearTimeout(typingTimers[key]);
-        // 5s 兜底熄灭：对方可能直接杀掉客户端，永远等不到 typing=false
+        // 兜底熄灭：对方可能直接杀掉客户端，永远等不到 typing=false。
+        // 取 10s（= 服务端 typing 帧的 TTL），别贴着刷新间隔：间隔逼近兜底时间会让三个点先灭再生地闪
         typingTimers[key] = setTimeout(() => {
           delete typingTimers[key];
-          if (line.textContent.startsWith(frame.userId)) line.textContent = '';
-        }, 5000);
+          if (line.textContent.startsWith(frame.userId)) setText('');
+        }, 10000);
       } else {
         if (typingTimers[key]) { clearTimeout(typingTimers[key]); delete typingTimers[key]; }
-        line.textContent = '';
+        setText('');
         log('<- typing.push ' + frame.userId + ' 停止输入 ' + frame.conversationId, 'evt');
       }
     }
@@ -845,11 +954,18 @@
         box.innerHTML = '<div class="hint">拉取失败，看右侧日志</div>';
         return;
       }
-      if (res.data.conversations.length === 0) {
+      convListCache = res.data.conversations;
+      renderConvTable();
+    }
+
+    // 只画缓存，不发请求：conv.update 到达时直接在原地改缓存再走这里
+    function renderConvTable() {
+      const box = document.getElementById('convTable');
+      if (convListCache.length === 0) {
         box.innerHTML = '<div class="hint">还没有会话（先发一条消息）</div>';
         return;
       }
-      const rows = res.data.conversations.map((c) => {
+      const rows = convListCache.map((c) => {
         const unread = c.unread > 0 ? '<span class="badge unread">未读 ' + c.unread + '</span>' : '';
         const pinned = c.pinned ? '<span class="badge">置顶</span>' : '';
         const muted = c.muted ? '<span class="badge">免打扰</span>' : '';
@@ -862,6 +978,24 @@
       }).join('');
       box.innerHTML = '<table><thead><tr><th>会话</th><th>类型</th><th>最后一条</th><th>进度</th></tr></thead>'
           + '<tbody>' + rows + '</tbody></table>';
+    }
+
+    /**
+     * 把一条 conv.update 应用到会话列表缓存上。
+     *
+     * <p>列表还没拉过（缓存为空）就什么都不用做——那次 GET /conv 会带回最新的标记，
+     * 这也是「标记是用户级状态、丢一条推送不至于错到底」的原因。
+     */
+    function applyConvUpdate(conversationId, pinned, muted) {
+      let hit = false;
+      convListCache.forEach((c) => {
+        if (c.conversationId !== conversationId) return;
+        c.pinned = pinned;
+        c.muted = muted;
+        hit = true;
+      });
+      if (hit) renderConvTable();
+      return hit;
     }
 
     function pickConv(conversationId) {
@@ -936,7 +1070,99 @@
       if (pinned !== '') params.push('pinned=' + pinned);
       if (muted !== '') params.push('muted=' + muted);
       if (params.length === 1) { alert('至少选一项要改的标记'); return; }
+      // 带上 deviceId：服务端把它塞进 conv.update 的 originDeviceId，本页据此认出自己的回声
+      params.push('deviceId=' + encodeURIComponent(pageDeviceId()));
       api('POST', '/conv/' + encodeURIComponent(conv) + '/flag?' + params.join('&'));
+    }
+
+    // ==== 设备 / 多端 ====
+
+    /** 本页在 WS 握手 query 里声明的 deviceId（连接与未连接时的默认值一致） */
+    function pageDeviceId() {
+      return document.getElementById('deviceId').value.trim() || 'web';
+    }
+
+    function pushDeviceEvent(text, cls) {
+      const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+      deviceEventList.unshift({ time, text, cls });
+      while (deviceEventList.length > 20) deviceEventList.pop();
+      const box = document.getElementById('deviceEvents');
+      if (deviceEventList.length === 0) {
+        box.innerHTML = '<div class="hint">还没有</div>';
+        return;
+      }
+      box.innerHTML = deviceEventList.map((e) => '<div class="' + (e.cls || '') + '">'
+          + e.time + ' ' + e.text + '</div>').join('');
+    }
+
+    async function loadDevices() {
+      const userId = me();
+      if (!userId) { alert('请先填写 userId'); return; }
+      const res = await api('GET', '/device/' + encodeURIComponent(userId));
+      const box = document.getElementById('deviceTable');
+      if (!res.ok || !res.data || !Array.isArray(res.data.devices)) {
+        box.innerHTML = '<div class="hint">拉取失败，看右侧日志</div>';
+        return;
+      }
+      if (res.data.devices.length === 0) {
+        box.innerHTML = '<div class="hint">这个账号下还没有设备记录（先连接一次）</div>';
+        return;
+      }
+      const rows = res.data.devices.map((d) => '<tr>'
+          + '<td><span class="dot' + (d.online ? ' on' : '') + '"></span>' + d.deviceId
+          + (d.deviceId === pageDeviceId() ? '<span class="badge">本页</span>' : '') + '</td>'
+          + '<td>' + (d.online ? '在线' : '离线') + '</td>'
+          + '<td>' + (d.transport || '—') + '</td>'
+          + '<td>' + (d.gateway || '—') + '</td>'
+          // loginAt=0 是「只有槽位、没有登录信息」（老数据/未开启设备上报），别渲染成 1970 年
+          + '<td>' + (d.loginAt > 0 ? new Date(d.loginAt).toLocaleString('zh-CN', { hour12: false }) : '—') + '</td>'
+          + '</tr>').join('');
+      box.innerHTML = '<table><thead><tr><th>设备</th><th>状态</th><th>承载</th><th>网关</th><th>登录时间</th>'
+          + '</tr></thead><tbody>' + rows + '</tbody></table>';
+      log('设备列表：' + res.data.count + ' 台，在线 ' + res.data.onlineCount, 'api');
+    }
+
+    async function kickDevice() {
+      const userId = me();
+      if (!userId) { alert('请先填写 userId'); return; }
+      const deviceId = document.getElementById('kickDeviceId').value.trim() || pageDeviceId();
+      const reason = document.getElementById('kickReason').value.trim() || 'kicked-by-server';
+      const res = await api('POST', '/device/' + encodeURIComponent(userId) + '/kick?deviceId='
+          + encodeURIComponent(deviceId) + '&reason=' + encodeURIComponent(reason));
+      reportKickOutcome(res, '踢 ' + deviceId);
+    }
+
+    async function kickOthers() {
+      const userId = me();
+      if (!userId) { alert('请先填写 userId'); return; }
+      const keep = document.getElementById('keepDeviceId').value.trim() || pageDeviceId();
+      const reason = document.getElementById('kickOthersReason').value.trim() || 'logout-other-devices';
+      const res = await api('POST', '/device/' + encodeURIComponent(userId) + '/kick-others?keepDeviceId='
+          + encodeURIComponent(keep) + '&reason=' + encodeURIComponent(reason));
+      reportKickOutcome(res, '退出其它设备（保留 ' + keep + '）');
+    }
+
+    async function forgetDevice() {
+      const userId = me();
+      if (!userId) { alert('请先填写 userId'); return; }
+      const deviceId = document.getElementById('forgetDeviceId').value.trim();
+      if (!deviceId) { alert('请填要从账号里移除的 deviceId'); return; }
+      await api('DELETE', '/device/' + encodeURIComponent(userId) + '/' + encodeURIComponent(deviceId));
+      loadDevices();
+    }
+
+    // code != 0 是「这次请求没被受理」，kicked=0 是「受理了但设备本来就不在线」，两件事不能混着报
+    function reportKickOutcome(res, action) {
+      if (!res.ok || !res.data) {
+        log(action + ' 失败，看上面的响应', 'err');
+      } else if (res.data.code !== 0) {
+        log(action + '：未受理（' + (res.data.message || ('code=' + res.data.code)) + '）', 'err');
+      } else if (res.data.kicked > 0) {
+        log(action + '：已关闭 ' + res.data.kicked + ' 条连接 ' + JSON.stringify(res.data.deviceIds || []), 'ack');
+      } else {
+        log(action + '：没有可踢的连接（设备不在线，目标状态已达成）', 'sys');
+      }
+      loadDevices();
     }
 
     // ==== 群组 ====
@@ -1251,6 +1477,39 @@
           (frame.states || []).forEach((s) => applyPresence(s.userId, s.online, s));
           log('<- presence.snapshot ' + (frame.states || []).length + ' 条', 'evt');
           break;
+
+        case 'session.login': {
+          // 推送粒度是用户级：刚登录的那台自己也会收到，按 deviceId 过滤出「别人」
+          const mine = frame.deviceId === pageDeviceId();
+          const text = 'session.login device=' + (frame.deviceId || '-')
+              + ' transport=' + (frame.transport || '-')
+              + (mine ? '（本机登录的回声，忽略）' : '（其它端登录，该提示用户）');
+          pushDeviceEvent(text, mine ? 'sys' : 'evt');
+          log('<- ' + text, mine ? 'sys' : 'evt');
+          break;
+        }
+
+        case 'session.kick': {
+          const reason = frame.reason || 'kicked-by-server';
+          pushDeviceEvent('被踢下线：' + reason + '（device=' + (frame.deviceId || '-') + '，不要重连）', 'err');
+          log('<- session.kick device=' + (frame.deviceId || '-') + ' reason=' + reason
+              + '（连接马上被服务端关闭，不要重连）', 'err');
+          showBanner('本连接已被服务端踢下线：<code>' + escapeHtml(reason) + '</code>。'
+              + '<br>连接已经被关闭，<b>不要重连</b>——重连只会被再踢一次；'
+              + '想继续测试就换一个 deviceId 重新连接。');
+          break;
+        }
+
+        case 'conv.update': {
+          // originDeviceId == 自己：本端刚才那次保存的回声，标记早就写进服务端了，不用重复应用
+          const echoed = !!frame.originDeviceId && frame.originDeviceId === pageDeviceId();
+          const applied = applyConvUpdate(frame.conversationId, !!frame.pinned, !!frame.muted);
+          log('<- conv.update ' + frame.conversationId + ' pinned=' + !!frame.pinned
+              + ' muted=' + !!frame.muted + ' origin=' + (frame.originDeviceId || '-')
+              + (echoed ? '（本端回声，忽略）'
+                  : (applied ? '（已就地更新会话列表）' : '（会话列表未加载，下次刷新即对齐）')), 'evt');
+          break;
+        }
 
         case 'error':
           log('<- error ' + frame.code + ': ' + frame.message, 'err');

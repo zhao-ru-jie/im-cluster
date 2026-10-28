@@ -766,7 +766,8 @@ im:
     batch-enabled: true    # group commit：并发到达的插入合并成一个事务
   # storage: mongodb 时改用下面这段（启动先 ping 一次，配错在启动阶段就报）
   mongo:
-    uri: mongodb://127.0.0.1:27017/?connectTimeoutMS=3000&serverSelectionTimeoutMS=5000
+    # socketTimeoutMS 不要省：驱动默认 0 = 永远等，mongod 假死时会把上线/发消息的线程永久挂住
+    uri: mongodb://127.0.0.1:27017/?connectTimeoutMS=3000&serverSelectionTimeoutMS=5000&socketTimeoutMS=30000
     database: im
     init-indexes: true     # 建三条唯一索引（保序 / 幂等 / 消息 ID）+ 各反查索引，幂等
 ```

@@ -2,6 +2,8 @@ package com.github.im.server.presence;
 
 import com.github.im.contract.MessageEnvelope;
 import com.github.im.contract.PresencePort;
+import com.github.im.proto.presence.v1.DeviceAck;
+import com.github.im.proto.presence.v1.DeviceReport;
 import com.github.im.proto.presence.v1.GetPresenceRequest;
 import com.github.im.proto.presence.v1.GetPresenceResponse;
 import com.github.im.proto.presence.v1.PresenceReport;
@@ -9,6 +11,7 @@ import com.github.im.proto.presence.v1.PresenceReportAck;
 import com.github.im.proto.presence.v1.PresenceState;
 import com.github.im.proto.presence.v1.TypingRequest;
 import com.github.im.proto.presence.v1.TypingResponse;
+import com.github.im.server.device.DeviceService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -61,13 +64,17 @@ public class PresenceService implements PresencePort {
     private final PresenceStore store;
     private final TypingNotifier typingNotifier;
     private final PresenceNotifier presenceNotifier;
+    /** 设备级事件（台账 + 多端登录通知）委托给它：presence 管「用户在不在」，设备管「哪几台在」 */
+    private final DeviceService deviceService;
 
     public PresenceService(PresenceStore store,
                            TypingNotifier typingNotifier,
-                           PresenceNotifier presenceNotifier) {
+                           PresenceNotifier presenceNotifier,
+                           DeviceService deviceService) {
         this.store = store;
         this.typingNotifier = typingNotifier;
         this.presenceNotifier = presenceNotifier;
+        this.deviceService = deviceService;
     }
 
     @Override
@@ -141,6 +148,17 @@ public class PresenceService implements PresencePort {
                     .build());
         }
         return states;
+    }
+
+    /**
+     * 设备级上报：台账 + 多端登录通知。
+     *
+     * <p>转发给 {@link DeviceService} 而不是在这里就地实现：用户级的在线状态（好友列表的亮点）
+     * 与设备级的台账（设备管理页）是两份不同的数据，混在一个类里，改其中一侧时很容易踩到另一侧。
+     */
+    @Override
+    public DeviceAck reportDevice(DeviceReport report) {
+        return deviceService.report(report);
     }
 
     @Override

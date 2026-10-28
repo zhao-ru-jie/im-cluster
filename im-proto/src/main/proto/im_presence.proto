@@ -49,6 +49,38 @@ service PresenceIngress {
   // 为什么不在网关侧直接广播给好友：好友关系是 IM 服务的领域数据（关系表在 im-server），
   // 网关不认识它；把关系读进网关会把网关变成第二个业务服务。
   rpc ReportPresence(PresenceReport) returns (PresenceReportAck);
+
+  // 上报「某个设备登录了 / 下线了」。
+  //
+  // 与 ReportPresence 的分工：ReportPresence 只报「用户级在线状态的边沿」（首个设备上线、
+  // 最后一个设备下线），用于好友列表的亮点；这里报的是**设备级**事实，用于两件事：
+  //   1) 设备台账（哪台设备、什么传输、从哪个实例登入、现在还在不在线）；
+  //   2) 多端登录通知（把「新设备登录」推给这个账号的其他在线设备）。
+  //
+  // 为什么要走 IM 服务而不是网关自己广播：登录通知要发给「这个账号的**所有**设备」，
+  // 而它们可能分散在多个网关实例上。网关只知道本机有谁，只有 IM 服务手上有全局路由，
+  // 能一次扇出到所有实例。顺带把台账也写在 IM 侧，读设备列表时不必再打网关。
+  rpc ReportDevice(DeviceReport) returns (DeviceAck);
+}
+
+// 一次设备级的登录/下线事件。
+//
+// at-least-once：网关上报失败只影响台账新鲜度与一次登录通知，重连会再次上报，
+// 所以服务端按 (userId, deviceId) 幂等覆盖即可，不需要序号或去重窗口。
+message DeviceReport {
+  string user_id = 1;
+  string device_id = 2;        // 网关侧缺省为 "default"（没带 deviceId 的老客户端）
+  string transport = 3;        // websocket / tcp
+  bool login = 4;              // true=建立连接；false=断开
+  string gateway_instance = 5;
+  int64 ts = 6;
+}
+
+message DeviceAck {
+  int32 code = 1;
+  string message = 2;
+  // 这次登录通知实际推给了几台「其它」设备（0 = 单端登录或其它端都不在线）
+  int32 notified = 3;
 }
 
 message TypingRequest {

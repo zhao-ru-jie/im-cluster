@@ -259,7 +259,7 @@ class MessageLifecycleTest {
                 delivery, seqAllocator,
                 new ClientWatermarkStore(TestRedis.template(), TTL),
                 new ConversationStore(TestRedis.template(), TTL, MAX_RECENT),
-                groupMembers, null, null, notifier(), recallWindow, new MessageMetrics(null));
+                groupMembers, null, null, notifier(), null, recallWindow, new MessageMetrics(null));
     }
 
     /** 变更事件通知器：真正走一遍实现，推送落到 {@link #pushed} 队列 */

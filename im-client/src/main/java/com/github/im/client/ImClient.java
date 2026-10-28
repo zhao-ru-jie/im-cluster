@@ -38,7 +38,7 @@ import java.util.concurrent.TimeUnit;
  * 而这段窗口在移动端非常常见——用户点了发送就切后台、系统立刻冻结进程。
  * 落表在前，最坏情况是「表里有、但还没发出去」，那是可恢复的（重投）。
  *
- * <h2>重连的三个触发源，三种处理</h2>
+ * <h2>重连的三种触发源，三种处理</h2>
  *
  * <ul>
  *   <li><b>读写失败 / 对端关闭</b>：按 {@link ReconnectPolicy} 指数退避；</li>
@@ -47,6 +47,9 @@ import java.util.concurrent.TimeUnit;
  *   <li><b>{@code error 401}</b>：不重连。token 无效时重连只会把自己打进风控，
  *       交给宿主重新取 token（{@link ImClientListener#onAuthRejected}）。</li>
  * </ul>
+ *
+ * <p>{@code session.kick} 也走「不重连」：连接是被服务端主动关掉的，退避重连只会被再踢一次
+ * （见 {@link ImClientListener#onSessionKick}）。
  *
  * <h2>线程模型</h2>
  *
@@ -551,6 +554,11 @@ public final class ImClient implements AutoCloseable {
             case DownlinkFrame.Presence presence -> notifyListener(() -> listener.onPresence(presence));
             case DownlinkFrame.PresenceSnapshot snapshot ->
                     notifyListener(() -> listener.onPresenceSnapshot(snapshot));
+            // 多端登录 / 会话标记同步：纯通知，不改本地表，也不影响本连接
+            case DownlinkFrame.SessionLogin login -> notifyListener(() -> listener.onSessionLogin(login));
+            case DownlinkFrame.ConvUpdate convUpdate ->
+                    notifyListener(() -> listener.onConvUpdate(convUpdate));
+            case DownlinkFrame.SessionKick kick -> handleKick(kick);
             case DownlinkFrame.Error error -> handleError(error);
             // 服务端探测必须立刻回：网关 90s 收不到任何上行就断开，
             // 而「回 pong」本身也证明连接是可写的（半开连接靠这个暴露）
@@ -686,6 +694,23 @@ public final class ImClient implements AutoCloseable {
                     : row.withFailed("code=" + error.code() + " " + error.message(), now)));
         }
         notifyListener(() -> listener.onError(error));
+    }
+
+    /**
+     * 被服务端踢下线：通知宿主，然后<b>彻底停机</b>。
+     *
+     * <p>网关的顺序是「先发 {@code session.kick} 再 close」，收到这一帧说明连接马上就要断。
+     * 如果照常按网络故障重连，被踢的设备会在 0.5s 后自己回来，踢下线就退化成「闪断一次」。
+     * 所以这里直接走 {@link #shutdown}（与 401 同一套语义：本实例不再重连），
+     * 宿主想重新登录时用新的 {@link ImClientConfig} 新建一个实例即可。
+     *
+     * <p>先通知再停机：宿主在回调里读到的 {@link ImClient#state()} 仍是连接态，
+     * 展示 {@code reason}、清理本地凭据都不会撞上已经关掉的本地表。
+     */
+    private void handleKick(DownlinkFrame.SessionKick kick) {
+        log.log(System.Logger.Level.WARNING, "[client] 被服务端踢下线：{0}", kick.reason());
+        notifyListener(() -> listener.onSessionKick(kick));
+        shutdown("被服务端踢下线：" + kick.reason());
     }
 
     private void handleMigrate(DownlinkFrame.Migrate migrate) {

@@ -80,6 +80,30 @@ public interface ImClientListener {
     }
 
     /**
+     * 同账号的其它设备登录了。
+     *
+     * <p>宿主应过滤掉自己的 {@code deviceId} 后提示用户（「你的账号在新设备登录」）；
+     * 这是发现账号被盗/多端占用的第一个信号。
+     */
+    default void onSessionLogin(DownlinkFrame.SessionLogin login) {
+    }
+
+    /**
+     * 本连接被服务端踢下线。
+     *
+     * <p>SDK 已经处理了「不重连」这件事：回调结束后它自己会停机（同 401 的语义），
+     * 宿主<b>不用也不要</b>在这里触发重连——重连只会被再踢一次。
+     * 要做的是把 {@code reason} 展示给用户并清掉本地凭据；用户想重新登录时，
+     * 用新的配置新建一个 {@link ImClient}（被踢的实例不会再连上）。
+     */
+    default void onSessionKick(DownlinkFrame.SessionKick kick) {
+    }
+
+    /** 会话标记（置顶/免打扰）在同账号其它端变更了 */
+    default void onConvUpdate(DownlinkFrame.ConvUpdate update) {
+    }
+
+    /**
      * 服务端错误帧（上行被拒、协议错误、服务暂不可用）。
      *
      * <p>SDK 已按 {@code code} 处理过本地消息表（503 安排重投，4xx 标记失败），

@@ -77,6 +77,12 @@ public final class Frames {
     public static final String T_PRESENCE_SNAPSHOT = "presence.snapshot";
     /** 下行：好友的在线状态变化 */
     public static final String T_PRESENCE_PUSH = "presence.push";
+    /** 下行：同账号的其它设备登录了（多端登录通知，含自己那台，按 deviceId 过滤） */
+    public static final String T_SESSION_LOGIN = "session.login";
+    /** 下行：本连接被服务端踢下线（收到后连接会被立即关闭，不要重连） */
+    public static final String T_SESSION_KICK = "session.kick";
+    /** 下行：会话标记（置顶/免打扰）变更，同账号其它端需同步 */
+    public static final String T_CONV_UPDATE = "conv.update";
 
     private final ObjectMapper mapper;
 
@@ -305,6 +311,17 @@ public final class Frames {
                     root.path("ts").asLong(0));
             case T_PRESENCE_SNAPSHOT -> new DownlinkFrame.PresenceSnapshot(
                     presenceEntriesOf(root), root.path("ts").asLong(0));
+            case T_SESSION_LOGIN -> new DownlinkFrame.SessionLogin(
+                    text(root, "userId"), text(root, "deviceId"), text(root, "transport"),
+                    root.path("ts").asLong(0));
+            case T_SESSION_KICK -> new DownlinkFrame.SessionKick(
+                    text(root, "deviceId"), text(root, "reason"), root.path("ts").asLong(0));
+            case T_CONV_UPDATE -> new DownlinkFrame.ConvUpdate(
+                    text(root, "conversationId"),
+                    root.path("pinned").asBoolean(false),
+                    root.path("muted").asBoolean(false),
+                    text(root, "originDeviceId"),
+                    root.path("ts").asLong(0));
             default -> new DownlinkFrame.Unknown(type, root);
         };
     }

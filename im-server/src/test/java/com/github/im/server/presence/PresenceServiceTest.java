@@ -7,6 +7,7 @@ import com.github.im.proto.presence.v1.PresenceReportAck;
 import com.github.im.proto.presence.v1.PresenceState;
 import com.github.im.proto.presence.v1.TypingRequest;
 import com.github.im.proto.presence.v1.TypingResponse;
+import com.github.im.server.device.DeviceService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -48,7 +49,8 @@ class PresenceServiceTest {
     private final PresenceStore store = mock(PresenceStore.class);
     private final TypingNotifier typing = mock(TypingNotifier.class);
     private final PresenceNotifier notifier = mock(PresenceNotifier.class);
-    private final PresenceService service = new PresenceService(store, typing, notifier);
+    private final DeviceService devices = mock(DeviceService.class);
+    private final PresenceService service = new PresenceService(store, typing, notifier, devices);
 
     // ==== typing：会话解析 ====
 

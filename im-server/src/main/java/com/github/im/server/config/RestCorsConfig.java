@@ -55,6 +55,7 @@ public class RestCorsConfig implements WebMvcConfigurer {
             "/group/**",
             "/relation/**",
             "/presence/**",
+            "/device/**",
             "/send",
             "/admin/**",
             "/shadow/**");

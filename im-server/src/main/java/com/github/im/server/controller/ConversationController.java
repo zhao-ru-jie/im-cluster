@@ -144,21 +144,26 @@ public class ConversationController {
      *
      * <pre>
      * POST /conv/{conversationId}/flag?userId=alice&pinned=true
-     * POST /conv/{conversationId}/flag?userId=alice&muted=false
+     * POST /conv/{conversationId}/flag?userId=alice&muted=false&deviceId=web
      * </pre>
      *
      * <p>参数缺省 = 这一项不改（不是 false）：两个开关是独立的，
      * 「设为置顶」不应该顺手把免打扰清掉。
+     *
+     * <p>{@code deviceId} 可选，只用于多端广播时让发起方忽略自己的回声
+     * （变更本身是用户级状态，会推给这个账号的所有在线端）。
      */
     @PostMapping("/{conversationId}/flag")
     public Map<String, Object> flag(@PathVariable String conversationId,
                                     @RequestParam(name = "userId") String userId,
                                     @RequestParam(name = "pinned", required = false) Boolean pinned,
-                                    @RequestParam(name = "muted", required = false) Boolean muted) {
+                                    @RequestParam(name = "muted", required = false) Boolean muted,
+                                    @RequestParam(name = "deviceId", required = false) String deviceId) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("conversationId", conversationId);
         try {
-            ConversationFlag flag = messageService.setConversationFlags(userId, conversationId, pinned, muted);
+            ConversationFlag flag = messageService.setConversationFlags(
+                    userId, conversationId, pinned, muted, deviceId);
             result.put("code", 0);
             result.put("pinned", flag.pinned());
             result.put("muted", flag.muted());

@@ -177,6 +177,47 @@ public sealed interface DownlinkFrame {
     }
 
     /**
+     * 多端登录通知：同账号的某台设备登录了。
+     *
+     * <p>推送粒度是用户级，所以<b>刚登录的那台自己也会收到</b>；宿主按
+     * {@code deviceId != 自己的 deviceId} 过滤后提示「你的账号在新设备登录」。
+     */
+    record SessionLogin(String userId, String deviceId, String transport, long ts)
+            implements DownlinkFrame {
+        @Override
+        public String type() {
+            return Frames.T_SESSION_LOGIN;
+        }
+    }
+
+    /**
+     * 踢下线：本连接马上会被服务端关闭。
+     *
+     * <p>{@link ImClient} 收到它就会停机、不再重连（重连等于自己把自己又踢回去一次），
+     * 然后经 {@link ImClientListener#onSessionKick} 交给宿主。
+     * {@code reason} 可以直接展示给用户（例如「你在另一台设备登录了」）。
+     */
+    record SessionKick(String deviceId, String reason, long ts) implements DownlinkFrame {
+        @Override
+        public String type() {
+            return Frames.T_SESSION_KICK;
+        }
+    }
+
+    /**
+     * 会话标记变更（置顶 / 免打扰）：同账号其它端改了，本地要跟着改。
+     *
+     * @param originDeviceId 发起变更的设备；等于自己的 deviceId 时忽略（那是自己操作的回声）
+     */
+    record ConvUpdate(String conversationId, boolean pinned, boolean muted,
+                      String originDeviceId, long ts) implements DownlinkFrame {
+        @Override
+        public String type() {
+            return Frames.T_CONV_UPDATE;
+        }
+    }
+
+    /**
      * 不认识的帧类型。
      *
      * <p>不抛异常、不断连：服务端加新帧时，老客户端只是「不处理」，
