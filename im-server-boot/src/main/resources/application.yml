@@ -10,6 +10,16 @@ spring:
   autoconfigure:
     exclude:
       - org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration
+      # 同理，im-storage-mongodb 把 Boot 的 Mongo 自动装配带进了 classpath，而它只看
+      # 「classpath 上有 MongoClient/Spring Data MongoDB」就生效：不排除的话，只想用 Redis 的部署
+      # 也会多出一个指向 localhost:27017 的客户端和一个连不上就报 DOWN 的健康指示器——
+      # 后者经 Actuator 聚合传导到 grpc.health.v1，会让网关把实例摘掉。
+      # 客户端与 MongoTemplate 由 MongoStorageConfig 在 im.storage=mongodb 时显式创建；
+      # MongoHealthContributorAutoConfiguration 不排除（它是 @ConditionalOnBean(MongoClient)，
+      # 只在 mongodb 形态下生效，正好用来做「Mongo 挂了就别再接流量」的探针）。
+      - org.springframework.boot.mongodb.autoconfigure.MongoAutoConfiguration
+      - org.springframework.boot.data.mongodb.autoconfigure.DataMongoAutoConfiguration
+      - org.springframework.boot.data.mongodb.autoconfigure.DataMongoRepositoriesAutoConfiguration
   threads:
     virtual:
       enabled: true
@@ -53,10 +63,12 @@ management:
       show-details: never
 
 im:
-  # —— 消息存储形态 ——
-  #   redis（默认）: Redis List，零外部数据库依赖，本地开发/联调
-  #   jdbc         : MySQL（im-storage-jdbc 模块），生产形态；需要配下面 im.db.*
-  storage: ${IM_STORAGE:redis}
+  # —— 存储形态 ——
+  #   redis（默认）: Redis List/Set，零外部数据库依赖，本地开发/联调
+  #   jdbc         : MySQL（im-storage-jdbc 模块），强关系/事务形态；需要配下面 im.db.*
+  #   mongodb      : MongoDB（im-storage-mongodb 模块），文档形态；需要配下面 im.mongo.*
+  # 三种形态各自提供同一组端口（消息 / 群 / 成员 / 关系链），业务侧不感知介质。
+  storage: ${IM_STORAGE:mongodb}
   db:
     url: ${IM_DB_URL:jdbc:mysql://127.0.0.1:3306/im-cluster?useSSL=true&useUnicode=true&characterEncoding=UTF-8&autoReconnect=true&failOverReadOnly=false}
     username: ${IM_DB_USERNAME:root}
@@ -67,6 +79,15 @@ im:
     # group commit：并发到达的插入合并成一个事务提交，把每条一次的 fsync 摊薄成 1/N。
     # 只在「已经有消息在排队」时合批，所以稀疏写入没有额外延迟；关掉可对照压测。
     batch-enabled: ${IM_DB_BATCH_ENABLED:true}
+  mongo:
+    # im.storage=mongodb 时使用。uri 里可以带账号密码与副本集参数，日志不会回显它。
+    # 启动时会先 ping 一次：地址或认证配错在启动阶段就报错，而不是等第一条消息。
+    uri: ${IM_MONGO_URI:mongodb://127.0.0.1:27017/?connectTimeoutMS=3000&serverSelectionTimeoutMS=5000}
+    database: ${IM_MONGO_DATABASE:im}
+    # 启动时建索引（幂等）。生产上若由 DBA 脚本统一管理索引，可以关掉。
+    # 注意：uk_msg_conv_seq / uk_msg_idem 这两条唯一索引是保序与幂等的最终防线（消息 ID 由 _id 自身保证），
+    # 关掉自动创建不等于可以没有它们——只是改为由别处负责。
+    init-indexes: ${IM_MONGO_INIT_INDEXES:true}
   push:
     # 下发到网关实例的超时：超时即视为失败 -> 落离线，不做无限重试
     timeout-ms: ${IM_PUSH_TIMEOUT_MS:800}

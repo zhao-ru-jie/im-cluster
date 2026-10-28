@@ -9,6 +9,13 @@ spring:
   autoconfigure:
     exclude:
       - org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration
+      # im-storage-mongodb 把 Boot 的 Mongo 自动装配带进了 classpath，它是「有就生效」而与
+      # im.storage 无关：不排除的话，Redis 形态会多出一个指向 localhost:27017 的客户端，
+      # 以及一个连不上就报 DOWN 的健康指示器（经 Actuator 聚合会传到 grpc.health）。
+      # 客户端与 MongoTemplate 由 MongoStorageConfig 在 im.storage=mongodb 时显式创建。
+      - org.springframework.boot.mongodb.autoconfigure.MongoAutoConfiguration
+      - org.springframework.boot.data.mongodb.autoconfigure.DataMongoAutoConfiguration
+      - org.springframework.boot.data.mongodb.autoconfigure.DataMongoRepositoriesAutoConfiguration
   # 开启虚拟线程（JDK 21+）
   threads:
     virtual:
@@ -58,9 +65,10 @@ im:
   auth:
     mode: ${IM_AUTH_MODE:off}
     secret: ${IM_AUTH_SECRET:}
-  # —— 消息存储形态 ——
-  #   redis（默认）: Redis List，零外部数据库依赖，本地开发/联调
-  #   jdbc         : MySQL（im-storage-jdbc 模块），生产形态；需要配下面 im.db.*
+  # —— 存储形态 ——
+  #   redis（默认）: Redis List/Set，零外部数据库依赖，本地开发/联调
+  #   jdbc         : MySQL（im-storage-jdbc 模块），强关系/事务形态；需要配下面 im.db.*
+  #   mongodb      : MongoDB（im-storage-mongodb 模块），文档形态；需要配下面 im.mongo.*
   storage: ${IM_STORAGE:redis}
   db:
     # 仅 im.storage=jdbc 时才读取；留空且使用 redis 时不会创建任何连接池
@@ -70,6 +78,12 @@ im:
     pool-size: ${IM_DB_POOL_SIZE:20}
     # 首次启动自动建表；生产建议 false，交给 Flyway/Liquibase
     init-schema: ${IM_DB_INIT_SCHEMA:true}
+  mongo:
+    # 仅 im.storage=mongodb 时才读取。启动先 ping 一次：地址/认证配错在启动阶段就报错。
+    uri: ${IM_MONGO_URI:mongodb://127.0.0.1:27017/?connectTimeoutMS=3000&serverSelectionTimeoutMS=5000}
+    database: ${IM_MONGO_DATABASE:im}
+    # 启动时建索引（幂等）；生产上也可交给 DBA 脚本，但两条唯一索引（保序去重 + 幂等）不能少
+    init-indexes: ${IM_MONGO_INIT_INDEXES:true}
   # —— 会话内序号（见 SeqAllocator）——
   # 每条消息一次 Redis 原子 INCR（Lua），返回值即所有实例共同认可的会话内顺序，无可调参数。
   # 发号下界取「已落库的最大 seq / 客户端水位 / 本进程已知」三者最大值，

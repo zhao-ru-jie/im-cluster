@@ -8,12 +8,14 @@ import java.util.Set;
 /**
  * 消息存储端口（IM 服务独占）。
  *
- * <p>本模块<b>不含任何实现</b>，两种介质各自独立成模块，由 {@code im.storage} 切换：
+ * <p>本模块<b>不含任何实现</b>，每种介质各自独立成模块，由 {@code im.storage} 切换：
  * <ul>
  *   <li>{@code im-storage-redis}：{@code com.github.im.storage.redis.RedisMessageRepository}，
  *       Redis List 存 JSON，缺省形态（零外部数据库依赖，本地/联调/小规模）；</li>
  *   <li>{@code im-storage-jdbc}：{@code com.github.im.storage.jdbc.JdbcMessageRepository}，
- *       MySQL，生产形态。</li>
+ *       MySQL，强关系与事务形态；</li>
+ *   <li>{@code im-storage-mongodb}：{@code com.github.im.storage.mongodb.MongoMessageRepository}，
+ *       MongoDB 文档形态（{@code _id} 即「会话 + seq」，保序与幂等由唯一索引兜住）。</li>
  * </ul>
  *
  * <p>业务侧只依赖 {@code append / recent / since} 这几个方法，换介质不改业务代码——

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.github</groupId>
+        <artifactId>im-cluster</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>im-storage-mongodb</artifactId>
+    <name>im-storage-mongodb</name>
+    <description>存储端口（消息/群/成员/关系链）的 MongoDB 实现（im.storage=mongodb 时生效）</description>
+
+    <dependencies>
+        <!-- 只需要 IM 服务的存储端口（MessageRepository / GroupRepository / GroupMemberRepository /
+             RelationRepository）与它们的模型（StoredMessage / GroupInfo / GroupRole） -->
+        <dependency>
+            <groupId>com.github</groupId>
+            <artifactId>im-server</artifactId>
+        </dependency>
+
+        <!--
+          Spring Data MongoDB（含 mongodb-driver-sync）：读写统一走实体映射
+          （@Document / @MongoId / @CompoundIndex + MongoTemplate），字段名与索引各只声明一次，
+          索引由 MongoSchema 解析注解后创建。
+
+          注意它会把 MongoAutoConfiguration / MongoDataAutoConfiguration 带进 classpath。
+          那两个自动装配是「classpath 上有就生效」，与 im.storage 无关，所以两个部署入口
+          都在 application.yml 里静态排除了它们（MongoClient 由本模块的 MongoStorageConfig
+          按 im.storage=mongodb 显式创建，与 JdbcStorageConfig 自建 HikariDataSource 同构）。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-mongodb</artifactId>
+        </dependency>
+
+        <!-- 文档 ↔ StoredMessage 的映射是纯函数，可以在没有 Mongo 实例的情况下完整覆盖 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>

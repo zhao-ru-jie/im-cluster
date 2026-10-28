@@ -34,7 +34,7 @@ A 发给 B 的消息经 **Redis 在线路由表定位目标网关 + gRPC 实例�
 | 长连接 | **Netty 4.2**（自建 ServerBootstrap） | WebSocket + 原生 TCP 双通道，不依赖 Tomcat 承载长连接 |
 | 服务间通信 | **gRPC**（`spring-boot-starter-grpc-server`） | 双向：上行 `MessageIngress`、下行 `DownstreamPush` |
 | 状态存储 | **Redis** | 在线路由、离线队列、seq 分配、幂等表 |
-| 消息存储 | **Redis / MySQL 可切换** | `im.storage` 决定实现，同一份 jar |
+| 消息存储 | **Redis / MySQL / MongoDB 可切换** | `im.storage` 决定实现，同一份 jar |
 | 服务发现 | **Redis 路由表 + Nacos（可选）** | 路由由 Redis 承担，Nacos 只做「实例 ID → 可达 ip:port」 |
 | 部署 | Docker / Kubernetes | HPA 按连接数扩缩容 |
 
@@ -52,6 +52,7 @@ A 发给 B 的消息经 **Redis 在线路由表定位目标网关 + gRPC 实例�
 | `im-server` | **IM 服务** | 消息受理（幂等 + seq）、路由决策、离线兜底、历史消息、群成员；**不含任何存储实现** | 库 |
 | `im-storage-redis` | 存储实现插件（缺省） | `MessageRepository` / `GroupRepository` / `GroupMemberRepository` / `RelationRepository` 的 Redis 实现 | 依赖 jar |
 | `im-storage-jdbc` | 存储实现插件（生产） | `MessageRepository` / `GroupMemberRepository` 的 MySQL 实现 + DDL | 依赖 jar |
+| `im-storage-mongodb` | 存储实现插件（文档形态） | 四个存储端口的 MongoDB 实现；实体映射（`@Document` / `@MongoId` / `@CompoundIndex`）+ 注解驱动的索引创建 | 依赖 jar |
 | `im-app` | 单体装配入口 | 同进程装配网关 + IM 服务，可执行 fat jar | fat jar |
 | `im-gateway-boot` | 拆分部署：长连接服务 | 只做接入，上行全走 gRPC | fat jar |
 | `im-server-boot` | 拆分部署：IM 服务 | 只承载业务与存储，暴露 `MessageIngress`，经 `RemoteGatewayPushPort` 下发 | fat jar |
@@ -64,19 +65,21 @@ im-app   ──> im-gateway ──┐
          ──> im-rpc ──────┘
 
 im-gateway-boot ──> im-gateway / im-rpc ──> im-proto
-im-server-boot  ──> im-server  / im-rpc / im-storage-redis / im-storage-jdbc ──> im-proto
+im-server-boot  ──> im-server  / im-rpc / im-storage-redis / im-storage-jdbc / im-storage-mongodb ──> im-proto
 
-im-storage-redis ──> im-server ──> im-proto
-im-storage-jdbc  ──> im-server ──> im-proto
+im-storage-redis   ──> im-server ──> im-proto
+im-storage-jdbc    ──> im-server ──> im-proto
+im-storage-mongodb ──> im-server ──> im-proto
 ```
 
 三条硬约束：
 
 1. **`im-gateway` 与 `im-server` 互不依赖**，唯一共享物是 `im-proto`；
 2. 业务模块不依赖 `im-rpc`，保持「业务代码里看不到传输细节」；
-3. `im-storage-redis` / `im-storage-jdbc` 都只单向依赖 `im-server` 的存储端口，**反向不依赖**——换存储实现不改业务。
-   jdbc 模块刻意不用 `spring-boot-starter-jdbc`，避免只用 Redis 的部署被自动装配出一个连不上的 DataSource。
-   两者由 `im.storage` 二选一装配（`redis` 或缺省 / `jdbc`），互斥条件写在各自的 `*StorageConfig` 里。
+3. `im-storage-*` 都只单向依赖 `im-server` 的存储端口，**反向不依赖**——换存储实现不改业务。
+   jdbc 模块刻意不用 `spring-boot-starter-jdbc`，避免只用 Redis 的部署被自动装配出一个连不上的 DataSource；
+   mongodb 模块同理排除 Boot 的 Mongo 自动装配，避免 Redis 形态多出一个连不上 `localhost:27017` 的客户端。
+   三者由 `im.storage` 三选一装配（`redis` 或缺省 / `jdbc` / `mongodb`），互斥条件写在各自的 `*StorageConfig` 里。
 
 ### 运行时拓扑
 
@@ -98,7 +101,8 @@ im-storage-jdbc  ──> im-server ──> im-proto
                              └────────── gRPC DownstreamPush.Push ────────────┘
 
 im-gateway ──写──> Redis(im:gateway:user:{userId} = SET{网关实例})
-im-server  ──读写──> Redis(im:conv:msgs / im:offline / im:seq / im:idem)（im.storage=jdbc 时消息落 MySQL）
+im-server  ──读写──> Redis(im:conv:msgs / im:offline / im:seq / im:idem)（im.storage=jdbc 时消息落 MySQL，
+                                                                         =mongodb 时落 MongoDB 的 im_message）
 ```
 
 ### 一条消息的完整链路
@@ -721,18 +725,19 @@ void append(StoredMessage message);
 List<StoredMessage> recent(String conversationId, int limit);
 ```
 
-落库的是**结构化记录**（不是已序列化好的下行帧），帧在读取时按需重建。两种实现：
+落库的是**结构化记录**（不是已序列化好的下行帧），帧在读取时按需重建。三种实现：
 
 | 实现 | 位置 | 介质 | 适用 |
 |------|------|------|------|
 | `RedisMessageRepository` | `im-storage-redis`（默认） | `im:conv:msgs:{conversationId}` List，JSON | 本地开发 / 联调，零外部数据库 |
 | `JdbcMessageRepository` | `im-storage-jdbc` | MySQL `im_message` | 生产形态，支持按会话 + 序号漫游 |
+| `MongoMessageRepository` | `im-storage-mongodb` | MongoDB `im_message`，实体 `MessageEntity`，`_id = serverMsgId` | 文档形态，身份用 UUIDv7，`(conversationId, seq)` 唯一索引兜住保序与去重 |
 
-切换只需配置（`im.storage=jdbc` 时才装配连接池，默认形态完全不碰数据库）：
+切换只需配置（`im.storage=jdbc` 时才装配连接池、`=mongodb` 时才建 Mongo 客户端，默认形态完全不碰外部数据库）：
 
 ```yaml
 im:
-  storage: jdbc            # redis（默认）| jdbc
+  storage: jdbc            # redis（默认）| jdbc | mongodb
   db:
     # rewriteBatchedStatements=true：驱动把批量插入压成一条多值 INSERT，省 round trip
     url: jdbc:mysql://127.0.0.1:3306/im-cluster?useSSL=false&allowPublicKeyRetrieval=true&rewriteBatchedStatements=true
@@ -741,7 +746,30 @@ im:
     pool-size: 20
     init-schema: true      # 首次启动执行 db/schema.sql；生产建议关掉交给 Flyway
     batch-enabled: true    # group commit：并发到达的插入合并成一个事务
+  # storage: mongodb 时改用下面这段（启动先 ping 一次，配错在启动阶段就报）
+  mongo:
+    uri: mongodb://127.0.0.1:27017/?connectTimeoutMS=3000&serverSelectionTimeoutMS=5000
+    database: im
+    init-indexes: true     # 建三条唯一索引（保序 / 幂等 / 消息 ID）+ 各反查索引，幂等
 ```
+
+`im.storage` 只决定**持久化介质**：seq 发号、幂等表、离线队列、在线路由仍在 Redis
+（`jdbc` / `mongodb` 两种形态都同样要连 Redis，只是消息与群/关系链落到外部数据库）。
+
+启动时除了建索引，还会**清掉本模块自己废弃的索引**（`createIndex` 只增不减，删注解不会删索引）。
+典型事故：`serverMsgId` 从普通字段改成文档 `_id` 后，遗留的 `uk_msg_server_id` 约束着一个永远缺失的字段，
+MongoDB 把缺失当 null → 第一条消息占掉那个槽位，**从第二条起全部** `dup key: { serverMsgId: null }`。
+
+MongoDB 形态用**实体映射**：`entity/` 下的 5 个 `@Document` 类持有字段与索引声明
+（`@MongoId` 决定 `_id`、`@CompoundIndex` / `@Indexed` 决定索引），`MongoSchema` 用 Spring Data 的
+`MongoPersistentEntityIndexResolver` 解析注解后建索引——字段名与索引各只声明一次。
+落库约定与 MySQL 形态一一对应：
+
+| 集合 | 文档 | 关键索引 |
+|------|------|----------|
+| `im_message` | 一条消息，`_id = serverMsgId`（UUIDv7，消息身份） | `uk_msg_conv_seq` / `uk_msg_idem`（均唯一） |
+| `im_message_delete` | 用户级本地删除，`_id = userId:conversationId:seq` | `idx_msg_delete_user` / `idx_msg_delete_conv` |
+| `im_group` / `im_group_member` / `im_relation` | 群资料 / 群成员（含角色与禁言）/ 有向关系边 | `idx_group_owner` / `uk_group_member`+`idx_group_member_user` / `uk_relation`+`idx_relation_target` |
 
 ### 写入吞吐：group commit
 
@@ -1125,9 +1153,10 @@ IM_GRPC_PORT=9090 IM_GRPC_HOST=127.0.0.1 \
 |---|---|---|
 | `im-server` | `SeqAllocatorTest`（冷启动 / 客户端水位 / Redis 回退到旧快照 / 多实例顺序 / 8 线程并发 / DB 下界查询摊薄） | **真实 Redis** |
 | `im-storage-redis` | `RedisMessageRepositoryTest`（落库乱序时 `maxSeq` 仍取真正最大值）、`RedisStorageConfigTest`（`im.storage` 缺省落 Redis、配 `jdbc` 时本模块不建 Bean） | **真实 Redis**（配置测试除外） |
+| `im-storage-mongodb` | `MongoEntityMappingTest`（模型 ↔ 实体无损往返、`_id` 语义、索引注解解析出的名字与唯一性）、`MongoQueryMappingTest`（`id`/`serverMsgId` → `_id` 的查询与更新映射、`from`/`recalledAt` 等字段不被改名）、`MongoStorageConfigTest`（`im.storage=mongodb` 才装配四个端口、宿主已有客户端时不重复创建、其它形态下一律不建）、`MongoSchemaIndexTest`（复现「遗留 `uk_msg_server_id` 导致第二条消息撞 `dup key: null`」，并验证启动收敛会删掉它） | 前三个不需要 Mongo；`MongoSchemaIndexTest` 要真实 Mongo（连不上自动跳过） |
 | `im-rpc` | `GrpcChannelFactoryHealthTest`（NOT_SERVING 实例被摘出轮询、无健康服务的对端仍可用、waitForReady 等到 deadline、关开关回到旧行为） | 真实 gRPC 服务端（进程内起） |
 | `im-gateway` | `HmacTokenAuthenticatorTest`（越权冒用 / 过期 / 篡改过期时间 / 换密钥伪造 / 格式错误）、`AuthGuardTest`（off 全放行、warn 只记录不误伤、enforce 拒绝、缺 secret 启动失败）、`SerialExecutorTest`（串行 / 保序 / 高水位暂停只触发一次且不丢帧 / 低水位才恢复 / 未到阈值不触发 / 控制任务不参与背压 / 指标监听收到暂停+恢复 / 单任务异常不中断） | 无 |
-| `im-server-boot` | `GrpcHealthEndpointTest`（健康服务确实被绑定且最终 SERVING） | Spring 上下文 + Redis |
+| `im-server-boot` | `GrpcHealthEndpointTest`（健康服务确实被绑定且最终 SERVING）、`ImServerApplicationScanTest`（三种介质的包都在扫描白名单里）、`StorageWiringTest`（`im.storage=redis` 时装配 Redis 实现，且不建 DataSource / MongoClient / MongoTemplate；两个上下文用例都显式钉住 `im.storage=redis`，不跟随部署侧默认值） | Spring 上下文 + Redis |
 
 Redis 相关用例默认连 `127.0.0.1:6379`（可用 `-Dim.test.redis.host=... -Dim.test.redis.port=...` 改），
 要验证的正是 Lua 的原子性和下界保护，把 Redis mock 掉就等于把最该测的部分测丢了。
@@ -1205,12 +1234,15 @@ kubectl apply -f k8s/im-node.yaml     # 或 im-gateway.yaml + im-server.yaml（�
 
 | 配置 | 环境变量 | 默认 | 说明 |
 |------|----------|------|------|
-| `im.storage` | `IM_STORAGE` | `redis` | `redis` / `jdbc` |
+| `im.storage` | `IM_STORAGE` | `redis` | `redis` / `jdbc` / `mongodb` |
 | `im.db.url` | `IM_DB_URL` | 空 | 仅 `jdbc` 时读取 |
 | `im.db.username` / `password` | `IM_DB_USERNAME` / `IM_DB_PASSWORD` | `root` / 空 | |
 | `im.db.pool-size` | `IM_DB_POOL_SIZE` | `20` | Hikari 连接池 |
 | `im.db.batch-enabled` | `IM_DB_BATCH_ENABLED` | `true` | group commit：并发到达的插入合并成一个事务 |
 | `im.db.init-schema` | `IM_DB_INIT_SCHEMA` | `true` | 首次启动执行 DDL |
+| `im.mongo.uri` | `IM_MONGO_URI` | `mongodb://127.0.0.1:27017/` | 仅 `mongodb` 时读取；启动先 `ping` 一次 |
+| `im.mongo.database` | `IM_MONGO_DATABASE` | `im` | 库名 |
+| `im.mongo.init-indexes` | `IM_MONGO_INIT_INDEXES` | `true` | 启动建索引（幂等）；三条唯一索引是保序与幂等的最终防线 |
 
 ### 长连接接入
 
@@ -1371,6 +1403,17 @@ im-cluster/
 │   ├── JdbcBatchAppender.java                # group commit：并发插入合并成一次事务提交
 │   ├── JdbcGroupMemberRepository.java
 │   └── resources/db/schema.sql               # DDL
+│
+├── im-storage-mongodb/          # 存储实现插件（MongoDB）
+│   ├── MongoStorageConfig.java               # 条件装配：仅 im.storage=mongodb（自建客户端 + 启动 ping）
+│   ├── MongoMessageRepository.java           # _id = serverMsgId；(conv, seq) 走唯一索引定位；撤回用带条件的单文档更新
+│   ├── MongoGroupRepository.java
+│   ├── MongoGroupMemberRepository.java       # 角色 / 禁言挂在成员文档上，退群即一起消失
+│   ├── MongoRelationRepository.java          # 有向边：好友两条 / 黑名单一条
+│   ├── MongoSchema.java                      # 解析实体上的索引注解并建索引（幂等）
+│   └── entity/                               # 实体映射：MessageEntity / MessageDeleteEntity /
+│                                             #   GroupEntity / GroupMemberEntity / RelationEntity
+│                                             #   （@Document + @MongoId + @CompoundIndex/@Indexed）
 │
 ├── im-app/                      # 单体装配入口
 │   ├── ImClusterApplication.java

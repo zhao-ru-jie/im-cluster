@@ -35,7 +35,9 @@ import javax.sql.DataSource;
  *
  * <p>为什么不用 {@code spring-boot-starter-jdbc} 的自动装配：它会在<b>没有任何 DSN</b> 的情况下
  * 也去自动装配 DataSource，导致「只想用 Redis 的部署」启动失败。这里保持显式条件装配：
- * 没配 {@code im.storage=jdbc} 就完全不碰数据库，两种存储形态可以在同一份 jar 里共存。
+ * 没配 {@code im.storage=jdbc} 就完全不碰数据库，三种形态（redis / jdbc / mongodb）可以在同一份 jar 里共存。
+ * 那个「classpath 上有就生效」的连通性负担由部署入口的 {@code spring.autoconfigure.exclude} 关掉，
+ * 见 im-server-boot / im-app 的 application.yml。
  *
  * <p>MyBatis-Plus 的自动装配（{@code MybatisPlusAutoConfiguration}）是
  * {@code @ConditionalOnSingleCandidate(DataSource.class)}，同样只在 {@link #imDataSource} 存在时生效，

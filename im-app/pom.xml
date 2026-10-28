@@ -33,6 +33,11 @@
             <groupId>com.github</groupId>
             <artifactId>im-storage-jdbc</artifactId>
         </dependency>
+        <!-- MongoDB 版存储：im.storage=mongodb 时生效；其余形态下不建客户端 -->
+        <dependency>
+            <groupId>com.github</groupId>
+            <artifactId>im-storage-mongodb</artifactId>
+        </dependency>
         <!-- gRPC 客户端适配层：transport=grpc/shadow 时连接独立部署的 im-server -->
         <dependency>
             <groupId>com.github</groupId>

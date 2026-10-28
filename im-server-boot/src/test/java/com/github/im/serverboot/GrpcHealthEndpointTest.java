@@ -27,6 +27,10 @@ import static org.junit.jupiter.api.Assertions.fail;
  * <p>状态是定时从 Actuator 健康聚合同步过来的（默认 5s，这里调小到 200ms），所以断言用轮询。
  */
 @SpringBootTest(classes = ImServerApplication.class, properties = {
+        // 固定用 Redis 形态：本用例验的是「健康服务被装配且最终 SERVING」，
+        // 不该被部署侧默认的 im.storage（application.yml 里可切换）绑上一台外部数据库。
+        // 三种介质的装配条件由各自的 *StorageConfigTest 覆盖。
+        "im.storage=redis",
         "spring.grpc.server.port=19291",
         "im.node.grpc-port=19291",
         "server.port=0",

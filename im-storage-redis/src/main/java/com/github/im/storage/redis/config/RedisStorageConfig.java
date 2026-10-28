@@ -33,14 +33,15 @@ import tools.jackson.databind.ObjectMapper;
  * 业务侧（{@code MessageService} / {@code GroupService} / {@code MessageAcl}）只认端口，
  * 换介质不改一行业务代码。
  *
- * <h2>两个条件类互斥，不会出现两个实现</h2>
+ * <h2>三个条件类互斥，不会出现两个实现</h2>
  *
  * <ul>
  *   <li>本类：{@code im.storage=redis}，或<b>根本没配</b>（{@code matchIfMissing = true}，历史默认值）；</li>
- *   <li>{@code JdbcStorageConfig}：{@code im.storage=jdbc}。</li>
+ *   <li>{@code JdbcStorageConfig}：{@code im.storage=jdbc}；</li>
+ *   <li>{@code MongoStorageConfig}：{@code im.storage=mongodb}。</li>
  * </ul>
  *
- * <p>因此部署侧只需要决定一件事：要不要连 MySQL。不配就落在 Redis 上——这也是本地开发、
+ * <p>因此部署侧只需要决定一件事：要不要连外部数据库。不配就落在 Redis 上——这也是本地开发、
  * 联调、以及「只想跑起来看看」的最小依赖形态。
  *
  * <p>{@link StringRedisTemplate} 由 {@code spring-boot-starter-data-redis} 自动装配提供；

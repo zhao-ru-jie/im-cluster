@@ -25,8 +25,8 @@ class ImServerApplicationScanTest {
     }
 
     @Test
-    @DisplayName("扫描范围必须同时包含两个存储实现包")
-    void scansBothStoragePackages() {
+    @DisplayName("扫描范围必须同时包含全部存储实现包")
+    void scansAllStoragePackages() {
         List<String> packages = scannedPackages();
 
         assertTrue(packages.contains("com.github.im.server"),
@@ -35,6 +35,8 @@ class ImServerApplicationScanTest {
                 "少了 com.github.im.storage.redis：im.storage=redis（或缺省）时会报 MessageRepository 找不到，实际：" + packages);
         assertTrue(packages.contains("com.github.im.storage.jdbc"),
                 "少了 com.github.im.storage.jdbc：im.storage=jdbc 时会报 MessageRepository 找不到，实际：" + packages);
+        assertTrue(packages.contains("com.github.im.storage.mongodb"),
+                "少了 com.github.im.storage.mongodb：im.storage=mongodb 时会报 MessageRepository 找不到，实际：" + packages);
         assertTrue(packages.contains("com.github.im.serverboot"),
                 "入口自己的包（本地装配类 / 健康检查）也必须被扫描，实际：" + packages);
     }

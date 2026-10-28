@@ -32,6 +32,12 @@
             <artifactId>im-storage-jdbc</artifactId>
         </dependency>
 
+        <!-- MongoDB 版存储：im.storage=mongodb 时生效；其余形态下不建客户端、连不上也不会有人去连 -->
+        <dependency>
+            <groupId>com.github</groupId>
+            <artifactId>im-storage-mongodb</artifactId>
+        </dependency>
+
         <!-- 下行推送通道（gRPC 到各网关实例） -->
         <dependency>
             <groupId>com.github</groupId>

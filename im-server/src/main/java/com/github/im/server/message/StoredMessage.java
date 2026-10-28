@@ -14,7 +14,10 @@ package com.github.im.server.message;
  *
  * @param conversationId      会话 ID
  * @param seq         会话内序号（单调递增，保序与拉齐依据）
- * @param serverMsgId 服务端消息 ID（UUIDv7，全局唯一；与 seq 解耦，不受 seq 回绕影响）
+ * @param serverMsgId 服务端消息 ID（UUIDv7，全局唯一；与 seq 解耦，不受 seq 回绕影响）。
+ *                    由 {@code MessageIds.next()} 生成，是这条消息的<b>身份</b>：
+ *                    MySQL 形态是 {@code NOT NULL} 唯一列，MongoDB 形态直接当文档 {@code _id}，
+ *                    因此实现层都假定它非空（不另做防御性校验，校验只该有一处——生成它的地方）。
  * @param from        发送方
  * @param to          单聊接收方 / 群 ID
  * @param convType    SINGLE / GROUP
