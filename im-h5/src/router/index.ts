@@ -35,6 +35,11 @@ const router = createRouter({
       component: () => import('@/pages/ContactsPage.vue')
     },
     {
+      path: '/requests',
+      name: 'requests',
+      component: () => import('@/pages/FriendRequestsPage.vue')
+    },
+    {
       path: '/me',
       name: 'me',
       component: () => import('@/pages/MePage.vue')

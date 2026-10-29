@@ -3,6 +3,7 @@ import type {
   ConversationItem,
   ConvType,
   DeviceItem,
+  FriendRequestItem,
   GroupInfo,
   GroupRole,
   MsgPushFrame,
@@ -169,9 +170,8 @@ export const RelationApi = {
   friends(userId: string): Promise<FriendsResponse> {
     return api<FriendsResponse>('GET', `/relation/${encodeURIComponent(userId)}/friends`, undefined, { throwOnBizError: false });
   },
-  addFriend(userId: string, friendId: string): Promise<FriendsResponse> {
-    return api<FriendsResponse>('POST', `/relation/${encodeURIComponent(userId)}/friends`, [friendId]);
-  },
+  // 没有 addFriend：建立好友关系必须走「申请 + 对方同意」，
+  // 服务端已经把直接写双向好友边的路由删掉了（见 RelationController 类注释）
   removeFriend(userId: string, friendId: string): Promise<FriendsResponse> {
     return api<FriendsResponse>('DELETE', `/relation/${encodeURIComponent(userId)}/friends/${encodeURIComponent(friendId)}`);
   },
@@ -183,6 +183,50 @@ export const RelationApi = {
   },
   unblock(userId: string, blockedId: string): Promise<BlocksResponse> {
     return api<BlocksResponse>('DELETE', `/relation/${encodeURIComponent(userId)}/blocks/${encodeURIComponent(blockedId)}`);
+  }
+};
+
+/* ------------------------------ 好友申请 ------------------------------ */
+
+export interface FriendRequestListResponse {
+  code: number;
+  message?: string;
+  userId: string;
+  incoming: FriendRequestItem[];
+  outgoing: FriendRequestItem[];
+}
+
+export interface FriendActionResponse {
+  code: number;
+  message?: string;
+  /** accept 时才带：动作之后的好友列表，省一次往返 */
+  friends?: string[];
+  request?: FriendRequestItem;
+}
+
+/**
+ * 好友申请（申请 → 通知 → 同意/拒绝）。
+ *
+ * <p>没有 throwOnBizError:false：这里的写操作失败必须让调用方拿到
+ * {@code ApiError.message}（「你们已经是好友了」「申请不存在或已处理」），
+ * 这些是用户要看到的文案，不能被静默吞掉。
+ */
+export const FriendRequestApi = {
+  send(userId: string, to: string, message = ''): Promise<FriendActionResponse> {
+    return api<FriendActionResponse>('POST', `/relation/${encodeURIComponent(userId)}/requests`, { to, message });
+  },
+  list(userId: string): Promise<FriendRequestListResponse> {
+    // 读接口：网络抖动时按「空列表」降级，避免通讯录整页报错
+    return api<FriendRequestListResponse>('GET', `/relation/${encodeURIComponent(userId)}/requests`, undefined, { throwOnBizError: false });
+  },
+  accept(userId: string, fromId: string): Promise<FriendActionResponse> {
+    return api<FriendActionResponse>('POST', `/relation/${encodeURIComponent(userId)}/requests/${encodeURIComponent(fromId)}/accept`);
+  },
+  reject(userId: string, fromId: string): Promise<FriendActionResponse> {
+    return api<FriendActionResponse>('POST', `/relation/${encodeURIComponent(userId)}/requests/${encodeURIComponent(fromId)}/reject`);
+  },
+  cancel(userId: string, toId: string): Promise<FriendActionResponse> {
+    return api<FriendActionResponse>('DELETE', `/relation/${encodeURIComponent(userId)}/requests/${encodeURIComponent(toId)}`);
   }
 };
 

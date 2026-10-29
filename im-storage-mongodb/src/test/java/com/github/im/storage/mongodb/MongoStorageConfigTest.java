@@ -3,6 +3,7 @@ package com.github.im.storage.mongodb;
 import com.github.im.server.group.GroupMemberRepository;
 import com.github.im.server.group.GroupRepository;
 import com.github.im.server.message.MessageRepository;
+import com.github.im.server.relation.FriendRequestRepository;
 import com.github.im.server.relation.RelationRepository;
 import com.github.im.storage.mongodb.config.MongoStorageConfig;
 import com.mongodb.client.MongoClient;
@@ -33,13 +34,15 @@ import static org.mockito.Mockito.mock;
 class MongoStorageConfigTest {
 
     @Test
-    @DisplayName("im.storage=mongodb → 四个端口都是 MongoDB 实现")
+    @DisplayName("im.storage=mongodb → 全部端口都是 MongoDB 实现")
     void registersAllFourPortsWhenMongodb() {
         try (AnnotationConfigApplicationContext context = context(Map.of("im.storage", "mongodb"))) {
             assertTrue(context.getBean(MessageRepository.class) instanceof MongoMessageRepository);
             assertTrue(context.getBean(GroupRepository.class) instanceof MongoGroupRepository);
             assertTrue(context.getBean(GroupMemberRepository.class) instanceof MongoGroupMemberRepository);
             assertTrue(context.getBean(RelationRepository.class) instanceof MongoRelationRepository);
+            assertTrue(context.getBean(FriendRequestRepository.class) instanceof MongoFriendRequestRepository,
+                    "好友申请没有实现的话，RelationService 起不来——这个端口和关系边一样是必需的");
         }
     }
 
@@ -63,6 +66,7 @@ class MongoStorageConfigTest {
                 assertEquals(0, context.getBeansOfType(GroupRepository.class).size());
                 assertEquals(0, context.getBeansOfType(GroupMemberRepository.class).size());
                 assertEquals(0, context.getBeansOfType(RelationRepository.class).size());
+                assertEquals(0, context.getBeansOfType(FriendRequestRepository.class).size());
                 // 容器里只该有测试注入的那一个 mock：配置类自己不该再建客户端（自建那份会去 ping）
                 assertEquals(1, context.getBeansOfType(MongoClient.class).size(),
                         storage + " 形态下不该额外建 Mongo 客户端");

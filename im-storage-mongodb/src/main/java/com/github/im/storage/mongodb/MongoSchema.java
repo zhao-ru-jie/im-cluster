@@ -1,5 +1,6 @@
 package com.github.im.storage.mongodb;
 
+import com.github.im.storage.mongodb.entity.FriendRequestEntity;
 import com.github.im.storage.mongodb.entity.GroupEntity;
 import com.github.im.storage.mongodb.entity.GroupMemberEntity;
 import com.github.im.storage.mongodb.entity.MessageDeleteEntity;
@@ -57,7 +58,8 @@ public final class MongoSchema {
             MessageDeleteEntity.class,
             GroupEntity.class,
             GroupMemberEntity.class,
-            RelationEntity.class);
+            RelationEntity.class,
+            FriendRequestEntity.class);
 
     /**
      * 曾经由本模块创建、后来废弃的索引：集合名 → 索引名。

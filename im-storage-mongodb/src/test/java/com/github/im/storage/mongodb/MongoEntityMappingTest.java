@@ -3,6 +3,8 @@ package com.github.im.storage.mongodb;
 import com.github.im.server.group.GroupInfo;
 import com.github.im.server.group.GroupRole;
 import com.github.im.server.message.StoredMessage;
+import com.github.im.server.relation.FriendRequest;
+import com.github.im.storage.mongodb.entity.FriendRequestEntity;
 import com.github.im.storage.mongodb.entity.GroupEntity;
 import com.github.im.storage.mongodb.entity.GroupMemberEntity;
 import com.github.im.storage.mongodb.entity.MessageDeleteEntity;
@@ -119,6 +121,7 @@ class MongoEntityMappingTest {
         assertEquals("alice:s:alice:bob:42", MessageDeleteEntity.idOf("alice", "s:alice:bob", 42L));
         assertEquals("g:100:alice", GroupMemberEntity.idOf("g:100", "alice"));
         assertEquals("FRIEND:alice:bob", RelationEntity.idOf(RelationEntity.TYPE_FRIEND, "alice", "bob"));
+        assertEquals("alice:bob", FriendRequestEntity.idOf("alice", "bob"));
 
         // 同一 (user, conversationId, seq) 必须得到同一个 _id：这是「重复删除被挡」的前提
         assertEquals(MessageDeleteEntity.idOf("alice", "g:100", 7L),
@@ -126,6 +129,24 @@ class MongoEntityMappingTest {
         // 有向：反向边必须是另一个 _id，否则好友关系会被写成一条
         assertNotEquals(RelationEntity.idOf(RelationEntity.TYPE_FRIEND, "alice", "bob"),
                 RelationEntity.idOf(RelationEntity.TYPE_FRIEND, "bob", "alice"));
+        // 申请同样有向：A 申请 B ≠ B 申请 A，共用 _id 会让两条申请互相覆盖
+        assertNotEquals(FriendRequestEntity.idOf("alice", "bob"), FriendRequestEntity.idOf("bob", "alice"));
+    }
+
+    @Test
+    @DisplayName("好友申请实体 → 模型转换无损（status / message / 两个时间戳都要在）")
+    void friendRequestRoundTrip() {
+        FriendRequestEntity entity = FriendRequestEntity.of("alice", "bob", "PENDING", "我是小李",
+                1_700_000_000_000L, 1_700_000_500_000L);
+
+        FriendRequest request = entity.toFriendRequest();
+
+        assertEquals("alice", request.fromId());
+        assertEquals("bob", request.toId());
+        assertEquals("PENDING", request.status());
+        assertEquals("我是小李", request.message());
+        assertEquals(1_700_000_000_000L, request.createdAt(), "首次申请时间不能被重新申请刷新");
+        assertEquals(1_700_000_500_000L, request.updatedAt());
     }
 
     // ==== 索引声明 ====
@@ -145,7 +166,7 @@ class MongoEntityMappingTest {
     }
 
     @Test
-    @DisplayName("其余集合：成员/关系是唯一键，反查走单列索引")
+    @DisplayName("其余集合：成员/关系/申请是唯一键，反查走单列索引")
     void otherIndexes() {
         assertTrue(isUnique(indexOptionsOf(GroupMemberEntity.class).get("uk_group_member")));
         assertTrue(indexOptionsOf(GroupMemberEntity.class).containsKey("idx_group_member_user"),
@@ -155,6 +176,20 @@ class MongoEntityMappingTest {
         assertTrue(indexOptionsOf(GroupEntity.class).containsKey("idx_group_owner"));
         assertEquals(2, indexOptionsOf(MessageDeleteEntity.class).size(),
                 "删除表只需要两个查询方向：某人某会话、某会话某条");
+    }
+
+    @Test
+    @DisplayName("im_friend_request：唯一键挡「一对用户两条申请」，toId 索引撑「谁在等我同意」")
+    void friendRequestIndexes() {
+        Map<String, Document> indexes = indexOptionsOf(FriendRequestEntity.class);
+
+        assertTrue(indexes.containsKey("uk_friend_request"),
+                "少了唯一索引，同一对用户被并发申请两次就会留下两条 PENDING，实际：" + indexes.keySet());
+        assertTrue(isUnique(indexes.get("uk_friend_request")));
+        assertTrue(indexes.containsKey("idx_friend_request_to"),
+                "「新的朋友」页按 toId 查收到的申请，没有这条索引就是全集合扫描：" + indexes.keySet());
+        assertFalse(Boolean.TRUE.equals(indexes.get("idx_friend_request_to").get("unique")),
+                "查询方向不是唯一约束：同一个人可以收到很多人的申请");
     }
 
     /** 实体声明的索引：名字 → IndexOptions（Spring Data 解析注解的结果，不连数据库） */

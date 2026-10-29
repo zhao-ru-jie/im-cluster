@@ -50,7 +50,7 @@ A 发给 B 的消息经 **Redis 在线路由表定位目标网关 + gRPC 实例�
 | `im-rpc` | gRPC 适配（客户端侧） | 按方向分包：`rpc.common`（channel 复用与 TLS、地址解析）、`rpc.ingress`（网关→IM：`RemoteMessageIngress`）、`rpc.push`（IM→网关：`RemoteGatewayPushPort` + 在线路由只读视图） | 依赖 jar |
 | `im-gateway` | **长连接服务** | Netty 双通道接入、会话管理、心跳、上行转发、下行推送、优雅摘流、连接数指标 | 库 |
 | `im-server` | **IM 服务** | 消息受理（幂等 + seq）、路由决策、离线兜底、历史消息、群成员；**不含任何存储实现** | 库 |
-| `im-storage-redis` | 存储实现插件（缺省） | `MessageRepository` / `GroupRepository` / `GroupMemberRepository` / `RelationRepository` 的 Redis 实现 | 依赖 jar |
+| `im-storage-redis` | 存储实现插件（缺省） | `MessageRepository` / `GroupRepository` / `GroupMemberRepository` / `RelationRepository` / `FriendRequestRepository` 的 Redis 实现 | 依赖 jar |
 | `im-storage-jdbc` | 存储实现插件（生产） | `MessageRepository` / `GroupMemberRepository` 的 MySQL 实现 + DDL | 依赖 jar |
 | `im-storage-mongodb` | 存储实现插件（文档形态） | 四个存储端口的 MongoDB 实现；实体映射（`@Document` / `@MongoId` / `@CompoundIndex`）+ 注解驱动的索引创建 | 依赖 jar |
 | `im-app` | 单体装配入口 | 同进程装配网关 + IM 服务，可执行 fat jar | fat jar |
@@ -468,21 +468,40 @@ java -cp im-gateway/target/classes com.github.im.gateway.auth.HmacTokenAuthentic
 存储与接口：
 
 ```
-Redis（默认）   im:rel:friend:{userId}  Set，好友（双向两份，O(1) 点查）
+Redis（默认）   im:user:{id}:friend-req:in / :out  Hash，field = 对方 userId，value = 申请单 JSON
+                im:rel:friend:{userId}  Set，好友（双向两份，O(1) 点查）
                 im:rel:block:{userId}   Set，黑名单（单向一份）
 MySQL          im_relation (owner_id, target_id, relation_type) 唯一键；好友双向两行、黑名单单向一行
+                im_friend_request (from_id, to_id) 唯一键；一条申请一行，status = PENDING/ACCEPTED/REJECTED
+MongoDB        im_relation / im_friend_request（_id = fromId:toId）
 
 GET    /relation/{userId}/friends              好友列表
-POST   /relation/{userId}/friends              ["bob"]   建立双向好友（幂等）
 DELETE /relation/{userId}/friends/{friendId}             解除好友（双向）
+
+GET    /relation/{userId}/requests             收到的 + 发出的申请（一次往返）
+POST   /relation/{userId}/requests              {"to":"bob","message":"我是小李"}   发送申请
+POST   /relation/{userId}/requests/{fromId}/accept      同意（userId 是被申请人）
+POST   /relation/{userId}/requests/{fromId}/reject      拒绝
+DELETE /relation/{userId}/requests/{toId}               撤回自己发出的申请
+
 GET    /relation/{userId}/blocks               黑名单
 POST   /relation/{userId}/blocks               ["spammer"]   拉黑
 DELETE /relation/{userId}/blocks/{blockedId}              取消拉黑
 ```
 
-> 不做「好友申请 → 通知 → 同意」的两阶段流程：它需要通知子系统（红点、未读、跨端已处理状态），
-> 属于业务侧。这些接口的定位是**由接入方的好友/组织架构系统同步过来**，IM 侧只消费「关系成立」这个事实。
-> 也仍没有群角色权限（群主/管理员/禁言）——那是群体系的一部分，见「已知限制」。
+> **好友关系必须经过对方同意**：`POST /relation/{userId}/friends`（一条请求直接写双向好友边）已被移除，
+> 建立关系的唯一入口是「申请 → 对方同意」。`addFriends` 只在 `RelationService#accept` 里被调用。
+> 状态机：`PENDING` --accept--> `ACCEPTED`（同时写双向好友边）/ --reject--> `REJECTED`；`CANCELLED` 表示申请人撤回
+> （记录直接删除）。`ACCEPTED/REJECTED` 是终态，重复调用返回 404（连点两下「同意」的第二下不会重复通知）。
+> 双方同时申请对方时直接互加，避免「两边都在等对方审批」；被拒绝后允许重新申请（覆盖回 `PENDING`）；
+> 被对方拉黑时返回统一的 `403`，不暴露「你被拉黑了」。
+>
+> 实时性靠两条下行帧（`im.relation-events.enabled` 可关）：
+> `relation.request` 推给被申请人（带 `fromId` + 验证消息），
+> `relation.update` 的 `ACCEPTED/REJECTED` 推给申请人、`CANCELLED` 推给被申请人。
+> 推送失败不回滚：申请已经落库，客户端下次拉 `/requests` 一样能看到。
+>
+> 仍没有群角色权限（群主/管理员/禁言）——那是群体系的一部分，见「已知限制」。
 
 ### 链路追踪（traceId）
 
@@ -789,6 +808,7 @@ MongoDB 形态用**实体映射**：`entity/` 下的 5 个 `@Document` 类持有
 | `im_message` | 一条消息，`_id = serverMsgId`（UUIDv7，消息身份） | `uk_msg_conv_seq` / `uk_msg_idem`（均唯一） |
 | `im_message_delete` | 用户级本地删除，`_id = userId:conversationId:seq` | `idx_msg_delete_user` / `idx_msg_delete_conv` |
 | `im_group` / `im_group_member` / `im_relation` | 群资料 / 群成员（含角色与禁言）/ 有向关系边 | `idx_group_owner` / `uk_group_member`+`idx_group_member_user` / `uk_relation`+`idx_relation_target` |
+| `im_friend_request` | 好友申请单，`_id = fromId:toId`，带 `status` / `message` / 两个时间戳 | `uk_friend_request`（唯一）+ `idx_friend_request_to` |
 
 ### 写入吞吐：group commit
 
@@ -1406,6 +1426,9 @@ im-cluster/
 │   ├── group/GroupMemberRepository.java      # 群成员端口（实现见 im-storage-*）
 │   ├── relation/MessageAcl.java              # 投递前准入：群成员 + 黑名单 + 可选好友（三档开关）
 │   ├── relation/RelationRepository.java      # 关系链端口（好友双向 / 黑名单单向）
+│   ├── relation/FriendRequestRepository.java # 好友申请端口（实现见 im-storage-*）
+│   ├── relation/RelationService.java         # 申请状态机：申请/同意/拒绝/撤回 + 幂等与互斥规则
+│   ├── relation/RelationEventNotifier.java   # relation.request / relation.update 下行通知
 │   ├── grpc/MessageIngressGrpcService.java   # @GrpcService：供远程网关上行
 │   └── controller/                           # /send、/conv/{conversationId}/messages、/group/...
 │
@@ -1414,7 +1437,8 @@ im-cluster/
 │   ├── RedisMessageRepository.java           # List 存 JSON + 撤回/删除用 Set
 │   ├── RedisGroupRepository.java             # 群资料 Hash（单字段改，避免并发覆盖）
 │   ├── RedisGroupMemberRepository.java       # 群成员 Set + 反向索引 + 角色/禁言
-│   └── RedisRelationRepository.java          # 好友双向两份 / 黑名单单向
+│   ├── RedisRelationRepository.java          # 好友双向两份 / 黑名单单向
+│   └── RedisFriendRequestRepository.java     # 收到的/发出的各一个 Hash，value 是申请单 JSON
 │
 ├── im-storage-jdbc/             # 存储实现插件（MySQL）
 │   ├── JdbcStorageConfig.java                # 条件装配：仅 im.storage=jdbc
@@ -1429,9 +1453,11 @@ im-cluster/
 │   ├── MongoGroupRepository.java
 │   ├── MongoGroupMemberRepository.java       # 角色 / 禁言挂在成员文档上，退群即一起消失
 │   ├── MongoRelationRepository.java          # 有向边：好友两条 / 黑名单一条
+│   ├── MongoFriendRequestRepository.java     # 申请单：_id = fromId:toId，$set + $setOnInsert
 │   ├── MongoSchema.java                      # 解析实体上的索引注解并建索引（幂等）
 │   └── entity/                               # 实体映射：MessageEntity / MessageDeleteEntity /
-│                                             #   GroupEntity / GroupMemberEntity / RelationEntity
+│                                             #   GroupEntity / GroupMemberEntity / RelationEntity /
+│                                             #   FriendRequestEntity
 │                                             #   （@Document + @MongoId + @CompoundIndex/@Indexed）
 │
 ├── im-app/                      # 单体装配入口
@@ -1483,6 +1509,11 @@ im-cluster/
   也没有「拉黑后历史会话如何处理」「删除好友后能否继续会话」这类产品策略。
   `im_relation` 的写入也不是原子的：好友是两行，中途失败会留下单边残留，
   而 `areFriends` 要求两侧都存在（所以残留只会让关系「看起来没建立」，不会误放行），重试即收敛。
+- **好友申请没有风控**：不限申请频率，不限「被拒绝后多久才能再申请」，也没有举报与骚扰治理。
+  `im_friend_request` 每对用户只保留<b>最近一条</b>（重新申请是覆盖），没有历史流水，
+  所以回答不了「这个人被多少人拒绝过」；需要这类画像时得另建事件表。
+  申请通知也只走在线推送：收件人不在线时那条 `relation.request` 会随 TTL 丢弃，
+  对方下次打开「新的朋友」靠 `/relation/{userId}/requests` 兜底（不是永久的离线未读）。
 - **状态回执只覆盖单聊**：`msg.state`（DELIVERED / READ）不推群聊。群里的「已读」是
   「谁读到第几号」的集合，要对前缀内每个发送者分发，扇出是「成员数 × 消息数」，
   得先有群已读的聚合视图（已读/未读人数）才谈得上正确。当前的群聊消息仍可查水位，只是不发帧。

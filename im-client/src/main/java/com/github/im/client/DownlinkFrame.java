@@ -218,6 +218,35 @@ public sealed interface DownlinkFrame {
     }
 
     /**
+     * 有人申请加你为好友。
+     *
+     * <p>不是消息帧：申请没有会话、没有 seq、不进离线队列。宿主应该把它变成一条
+     * 「新的朋友」入口上的红点，而不是在聊天列表里造一个假会话。
+     *
+     * @param fromId  申请人
+     * @param message 验证消息，可能为空串
+     */
+    record RelationRequest(String fromId, String message, long ts) implements DownlinkFrame {
+        @Override
+        public String type() {
+            return Frames.T_RELATION_REQUEST;
+        }
+    }
+
+    /**
+     * 好友申请被处理。
+     *
+     * @param peerId 另一方；{@code ACCEPTED/REJECTED} 时是审批人，{@code CANCELLED} 时是申请人
+     * @param change ACCEPTED / REJECTED / CANCELLED
+     */
+    record RelationUpdate(String peerId, String change, long ts) implements DownlinkFrame {
+        @Override
+        public String type() {
+            return Frames.T_RELATION_UPDATE;
+        }
+    }
+
+    /**
      * 不认识的帧类型。
      *
      * <p>不抛异常、不断连：服务端加新帧时，老客户端只是「不处理」，

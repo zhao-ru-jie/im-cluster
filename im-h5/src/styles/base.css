@@ -132,6 +132,15 @@ a {
   white-space: nowrap;
 }
 
+/*
+ * 标题位置显示的是状态而非实体名（「对方正在输入…」）。
+ * 不加粗、颜色浅一档：它是一句话，不该和「这是谁」抢同样的视觉权重。
+ */
+.nav-title.muted {
+  font-weight: 400;
+  color: var(--c-text-2);
+}
+
 .nav-subtitle {
   display: block;
   font-size: 11px;
@@ -655,12 +664,6 @@ a {
   to {
     transform: rotate(360deg);
   }
-}
-
-.typing-line {
-  padding: 2px 6px 6px;
-  font-size: 12px;
-  color: var(--c-text-3);
 }
 
 /* ------------------------------- 输入区 ------------------------------- */

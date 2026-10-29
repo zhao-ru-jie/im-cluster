@@ -558,6 +558,11 @@ public final class ImClient implements AutoCloseable {
             case DownlinkFrame.SessionLogin login -> notifyListener(() -> listener.onSessionLogin(login));
             case DownlinkFrame.ConvUpdate convUpdate ->
                     notifyListener(() -> listener.onConvUpdate(convUpdate));
+            // 好友申请：纯通知，不改本地表（申请列表由宿主按 REST 拉取，避免两套数据源打架）
+            case DownlinkFrame.RelationRequest request ->
+                    notifyListener(() -> listener.onRelationRequest(request));
+            case DownlinkFrame.RelationUpdate relationUpdate ->
+                    notifyListener(() -> listener.onRelationUpdate(relationUpdate));
             case DownlinkFrame.SessionKick kick -> handleKick(kick);
             case DownlinkFrame.Error error -> handleError(error);
             // 服务端探测必须立刻回：网关 90s 收不到任何上行就断开，

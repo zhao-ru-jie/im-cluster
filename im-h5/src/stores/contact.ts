@@ -1,17 +1,28 @@
 import { defineStore } from 'pinia';
 import { ApiError } from '@/api/http';
-import { DeviceApi, GroupApi, PresenceApi, RelationApi, type DeviceListResponse } from '@/api/rest';
+import {
+  DeviceApi,
+  FriendRequestApi,
+  GroupApi,
+  PresenceApi,
+  RelationApi,
+  type DeviceListResponse
+} from '@/api/rest';
 import { imSocket } from '@/api/ws';
 import { cacheProfile, cachedProfiles } from '@/core/db';
 import { groupIdOfConversation } from '@/core/format';
+import { beep, vibrate } from '@/core/notify';
 import type { UserProfile } from '@/types/local';
 import type {
   DownlinkFrame,
+  FriendRequestItem,
   GroupInfo,
   GroupRole,
   PresenceEntry,
   PresencePushFrame,
-  PresenceSnapshotFrame
+  PresenceSnapshotFrame,
+  RelationRequestFrame,
+  RelationUpdateFrame
 } from '@/types/protocol';
 import { useAuthStore } from './auth';
 import { useImStore } from './im';
@@ -24,10 +35,19 @@ interface GroupMembers {
   size: number;
 }
 
+/** 申请列表顺序：最近变动的排前面（与服务端 {@code order by updated_at desc} 一致） */
+function sortRequests(list: FriendRequestItem[]): FriendRequestItem[] {
+  return [...list].sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
 export const useContactStore = defineStore('contact', {
   state: () => ({
     friends: [] as string[],
     blocks: [] as string[],
+    /** 收到的 / 发出的好友申请（服务端是权威源，这里只是它的一份镜像） */
+    incoming: [] as FriendRequestItem[],
+    outgoing: [] as FriendRequestItem[],
+    requestsLoaded: false,
     /** userId -> 在线状态 */
     presence: {} as Record<string, PresenceEntry>,
     /** userId -> 本地资料（服务端没有资料接口，昵称头像只在本地） */
@@ -44,6 +64,17 @@ export const useContactStore = defineStore('contact', {
     friendCount: (state): number => state.friends.length,
     onlineFriends(state): string[] {
       return state.friends.filter((id) => state.presence[id]?.online);
+    },
+    /** 待我处理的申请：红点数字就用它的长度 */
+    pendingIncoming(state): FriendRequestItem[] {
+      return state.incoming.filter((item) => item.status === 'PENDING');
+    },
+    pendingIncomingCount(): number {
+      return this.pendingIncoming.length;
+    },
+    /** 我发出、对方还没处理的申请 */
+    pendingOutgoing(state): FriendRequestItem[] {
+      return state.outgoing.filter((item) => item.status === 'PENDING');
     },
     displayName: (state) => (userId: string): string => {
       if (!userId) return '';
@@ -80,8 +111,56 @@ export const useContactStore = defineStore('contact', {
         } else if (type === 'presence.snapshot') {
           const snapshot = frame as PresenceSnapshotFrame;
           (snapshot.states ?? []).forEach((state) => this.applyPresence(state.userId, state.online, state.lastSeen, state));
+        } else if (type === 'relation.request') {
+          this.onRelationRequest(frame as RelationRequestFrame);
+        } else if (type === 'relation.update') {
+          this.onRelationUpdate(frame as RelationUpdateFrame);
         }
       });
+    },
+
+    /**
+     * 有人申请加我：先插进列表（红点立刻出现），再响一声。
+     *
+     * <p>不在这里重新拉接口：推送帧已经带齐了渲染一条申请所需的全部字段，
+     * 为它再打一次 HTTP 只会让「提示」慢一个往返；列表的权威刷新留给 {@link #loadRequests}。
+     */
+    onRelationRequest(push: RelationRequestFrame): void {
+      const auth = useAuthStore();
+      this.upsertRequest('incoming', {
+        fromId: push.fromId,
+        toId: auth.userId,
+        status: 'PENDING',
+        message: push.message ?? '',
+        createdAt: push.ts,
+        updatedAt: push.ts
+      });
+      beep();
+      vibrate([20, 40, 20]);
+      useUiStore().toast(`${this.displayName(push.fromId)} 申请添加你为好友`, 'info', 3000);
+    },
+
+    /**
+     * 申请被处理。
+     *
+     * <p>{@code ACCEPTED} 时必须重拉好友列表：好友关系是服务端写的，本地只有一份镜像，
+     * 不重拉就表现为「对方已同意，但通讯录里还看不到他」。
+     */
+    onRelationUpdate(update: RelationUpdateFrame): void {
+      const name = this.displayName(update.peerId) || update.peerId;
+      if (update.change === 'ACCEPTED') {
+        this.markOutgoing(update.peerId, 'ACCEPTED');
+        void this.loadFriends();
+        useUiStore().success(`${name} 通过了你的好友申请`);
+        return;
+      }
+      if (update.change === 'REJECTED') {
+        this.markOutgoing(update.peerId, 'REJECTED');
+        useUiStore().toast(`${name} 拒绝了你的好友申请`);
+        return;
+      }
+      // CANCELLED：申请人撤回了，我列表里那条要消失
+      this.incoming = this.incoming.filter((item) => item.fromId !== update.peerId);
     },
 
     applyPresence(userId: string, online: boolean, lastSeen = 0, raw?: PresenceEntry): void {
@@ -117,7 +196,30 @@ export const useContactStore = defineStore('contact', {
       }
     },
 
-    async addFriend(friendId: string): Promise<boolean> {
+    /* ----------------------------- 好友申请 ----------------------------- */
+
+    /** 拉取「收到的 + 发出的」申请（一个接口拿两屏，避免弱网下的半成品列表） */
+    async loadRequests(): Promise<void> {
+      const auth = useAuthStore();
+      if (!auth.userId) return;
+      try {
+        const data = await FriendRequestApi.list(auth.userId);
+        this.incoming = sortRequests(data?.incoming ?? []);
+        this.outgoing = sortRequests(data?.outgoing ?? []);
+        this.requestsLoaded = true;
+      } catch (e) {
+        useUiStore().error((e as ApiError).message || '好友申请加载失败');
+      }
+    },
+
+    /**
+     * 发送好友申请。
+     *
+     * <p>不再有「直接加好友」：对方同意之前，双方都进不了对方的好友列表。
+     * 服务端返回的 {@code message} 优先展示（「已发送过申请」「你们已经是好友了」），
+     * 这些文案比前端硬编码的准。
+     */
+    async sendFriendRequest(friendId: string, message = ''): Promise<boolean> {
       const auth = useAuthStore();
       const id = friendId.trim();
       if (!id || id === auth.userId) {
@@ -125,14 +227,78 @@ export const useContactStore = defineStore('contact', {
         return false;
       }
       try {
-        const data = await RelationApi.addFriend(auth.userId, id);
-        this.friends = data.friends ?? this.friends;
-        useUiStore().success('已添加好友');
+        const data = await FriendRequestApi.send(auth.userId, id, message.trim());
+        if (data?.request) {
+          this.upsertRequest('outgoing', data.request);
+        }
+        // 「对方也在申请你」时服务端已经互加，好友列表要跟着变
+        if (data?.friends?.length) {
+          this.friends = data.friends;
+        }
+        useUiStore().success(data?.message || '好友申请已发送');
         return true;
       } catch (e) {
-        useUiStore().error((e as ApiError).message || '添加失败');
+        useUiStore().error((e as ApiError).message || '发送申请失败');
         return false;
       }
+    },
+
+    /** 同意：服务端会写双向好友边并通知申请人 */
+    async acceptRequest(fromId: string): Promise<void> {
+      const auth = useAuthStore();
+      try {
+        const data = await FriendRequestApi.accept(auth.userId, fromId);
+        if (data?.friends) {
+          this.friends = data.friends;
+        }
+        this.markIncoming(fromId, 'ACCEPTED');
+        useUiStore().success(data?.message || '已添加为好友');
+      } catch (e) {
+        useUiStore().error((e as ApiError).message || '操作失败');
+      }
+    },
+
+    async rejectRequest(fromId: string): Promise<void> {
+      const auth = useAuthStore();
+      try {
+        const data = await FriendRequestApi.reject(auth.userId, fromId);
+        this.markIncoming(fromId, 'REJECTED');
+        useUiStore().toast(data?.message || '已拒绝该申请');
+      } catch (e) {
+        useUiStore().error((e as ApiError).message || '操作失败');
+      }
+    },
+
+    /** 撤回自己发出的申请（只有 PENDING 能撤） */
+    async cancelRequest(toId: string): Promise<void> {
+      const auth = useAuthStore();
+      try {
+        await FriendRequestApi.cancel(auth.userId, toId);
+        this.outgoing = this.outgoing.filter((item) => item.toId !== toId);
+        useUiStore().toast('已撤回申请');
+      } catch (e) {
+        useUiStore().error((e as ApiError).message || '撤回失败');
+      }
+    },
+
+    /** 按 (fromId) 插入或覆盖收到的申请 */
+    upsertRequest(bucket: 'incoming' | 'outgoing', item: FriendRequestItem): void {
+      const key = bucket === 'incoming' ? 'fromId' : 'toId';
+      const list = this[bucket].filter((existing) => existing[key] !== item[key]);
+      list.push(item);
+      this[bucket] = sortRequests(list);
+    },
+
+    markIncoming(fromId: string, status: FriendRequestItem['status']): void {
+      this.incoming = this.incoming.map((item) =>
+        item.fromId === fromId ? { ...item, status, updatedAt: Date.now() } : item
+      );
+    },
+
+    markOutgoing(toId: string, status: FriendRequestItem['status']): void {
+      this.outgoing = this.outgoing.map((item) =>
+        item.toId === toId ? { ...item, status, updatedAt: Date.now() } : item
+      );
     },
 
     async removeFriend(friendId: string): Promise<void> {

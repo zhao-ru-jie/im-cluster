@@ -3,6 +3,7 @@ package com.github.im.storage.redis;
 import com.github.im.server.group.GroupMemberRepository;
 import com.github.im.server.group.GroupRepository;
 import com.github.im.server.message.MessageRepository;
+import com.github.im.server.relation.FriendRequestRepository;
 import com.github.im.server.relation.RelationRepository;
 import com.github.im.storage.redis.config.RedisStorageConfig;
 import org.junit.jupiter.api.DisplayName;
@@ -48,12 +49,14 @@ class RedisStorageConfigTest {
     }
 
     @Test
-    @DisplayName("缺省 → 四个存储端口都是 Redis 实现（与 im-storage-jdbc 端口一一对应）")
+    @DisplayName("缺省 → 全部存储端口都是 Redis 实现（与 im-storage-jdbc 端口一一对应）")
     void registersAllFourPortsByDefault() {
         try (AnnotationConfigApplicationContext context = context(Map.of())) {
             assertTrue(context.getBean(GroupRepository.class) instanceof RedisGroupRepository);
             assertTrue(context.getBean(GroupMemberRepository.class) instanceof RedisGroupMemberRepository);
             assertTrue(context.getBean(RelationRepository.class) instanceof RedisRelationRepository);
+            assertTrue(context.getBean(FriendRequestRepository.class) instanceof RedisFriendRequestRepository,
+                    "好友申请端口缺了会让 RelationService 起不来，缺省形态必须提供");
         }
     }
 
@@ -66,9 +69,11 @@ class RedisStorageConfigTest {
             assertEquals(0, context.getBeansOfType(GroupRepository.class).size());
             assertEquals(0, context.getBeansOfType(GroupMemberRepository.class).size());
             assertEquals(0, context.getBeansOfType(RelationRepository.class).size());
+            assertEquals(0, context.getBeansOfType(FriendRequestRepository.class).size());
             List<String> beanNames = List.of(context.getBeanDefinitionNames());
             assertTrue(beanNames.stream().noneMatch(name -> name.contains("messageRepository")
-                    || name.contains("groupRepository") || name.contains("relationRepository")));
+                    || name.contains("groupRepository") || name.contains("relationRepository")
+                    || name.contains("friendRequestRepository")));
         }
     }
 

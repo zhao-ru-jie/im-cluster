@@ -83,6 +83,10 @@ public final class Frames {
     public static final String T_SESSION_KICK = "session.kick";
     /** 下行：会话标记（置顶/免打扰）变更，同账号其它端需同步 */
     public static final String T_CONV_UPDATE = "conv.update";
+    /** 下行：有人申请加你为好友（{@code fromId} + 验证消息） */
+    public static final String T_RELATION_REQUEST = "relation.request";
+    /** 下行：好友申请被处理（ACCEPTED / REJECTED / CANCELLED） */
+    public static final String T_RELATION_UPDATE = "relation.update";
 
     private final ObjectMapper mapper;
 
@@ -322,6 +326,10 @@ public final class Frames {
                     root.path("muted").asBoolean(false),
                     text(root, "originDeviceId"),
                     root.path("ts").asLong(0));
+            case T_RELATION_REQUEST -> new DownlinkFrame.RelationRequest(
+                    text(root, "fromId"), text(root, "message"), root.path("ts").asLong(0));
+            case T_RELATION_UPDATE -> new DownlinkFrame.RelationUpdate(
+                    text(root, "peerId"), text(root, "change"), root.path("ts").asLong(0));
             default -> new DownlinkFrame.Unknown(type, root);
         };
     }

@@ -3,7 +3,9 @@ package com.github.im.storage.mongodb.config;
 import com.github.im.server.group.GroupMemberRepository;
 import com.github.im.server.group.GroupRepository;
 import com.github.im.server.message.MessageRepository;
+import com.github.im.server.relation.FriendRequestRepository;
 import com.github.im.server.relation.RelationRepository;
+import com.github.im.storage.mongodb.MongoFriendRequestRepository;
 import com.github.im.storage.mongodb.MongoGroupMemberRepository;
 import com.github.im.storage.mongodb.MongoGroupRepository;
 import com.github.im.storage.mongodb.MongoMessageRepository;
@@ -133,5 +135,11 @@ public class MongoStorageConfig {
     @Bean
     public RelationRepository relationRepository(MongoTemplate mongoTemplate) {
         return new MongoRelationRepository(mongoTemplate);
+    }
+
+    /** 好友申请（流程）：与关系边分属两个集合，理由见 FriendRequestEntity 注释 */
+    @Bean
+    public FriendRequestRepository friendRequestRepository(MongoTemplate mongoTemplate) {
+        return new MongoFriendRequestRepository(mongoTemplate);
     }
 }

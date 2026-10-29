@@ -190,6 +190,22 @@ public final class RedisKeys {
     }
 
     /**
+     * 我收到的好友申请（Hash：field = 申请人 userId，value = 申请单 JSON）。
+     *
+     * <p>为什么用 Hash 而不是 Set：申请单不止「谁申请了」，还有附言、状态（PENDING /
+     * ACCEPTED / REJECTED）和时间。Set 只装得下一个 userId，状态就得另找地方存，
+     * 而「列表 + 单条状态」分两处存，迟早出现列表里有、状态查不到的行。
+     */
+    public static String userFriendRequestsIn(String userId) {
+        return root + ":user:" + tag(userId) + ":friend-req:in";
+    }
+
+    /** 我发出的好友申请（Hash：field = 被申请人 userId，value 同上） */
+    public static String userFriendRequestsOut(String userId) {
+        return root + ":user:" + tag(userId) + ":friend-req:out";
+    }
+
+    /**
      * 已废弃的单聊离线 List 队列。
      *
      * <p>新的 ZSet 队列（{@link #userOfflineQueue}）取代它：旧结构的「读即消费」

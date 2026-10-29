@@ -104,6 +104,22 @@ public interface ImClientListener {
     }
 
     /**
+     * 有人申请加你为好友。
+     *
+     * <p>这是「新的朋友」入口上那个红点的来源。申请本身已经在服务端落库，
+     * 宿主也可以随时用 REST 拉全量列表；这条回调只负责「快」。
+     */
+    default void onRelationRequest(DownlinkFrame.RelationRequest request) {
+    }
+
+    /**
+     * 好友申请被处理：{@code ACCEPTED} 后双方已是好友（应刷新好友列表），
+     * {@code REJECTED} 是终态，{@code CANCELLED} 表示对方撤回了申请。
+     */
+    default void onRelationUpdate(DownlinkFrame.RelationUpdate update) {
+    }
+
+    /**
      * 服务端错误帧（上行被拒、协议错误、服务暂不可用）。
      *
      * <p>SDK 已按 {@code code} 处理过本地消息表（503 安排重投，4xx 标记失败），

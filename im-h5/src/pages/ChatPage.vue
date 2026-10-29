@@ -62,6 +62,14 @@ const typingText = computed(() => {
   return convType.value === 'GROUP' ? `${contact.displayName(entry.userId)} 正在输入…` : '对方正在输入…';
 });
 
+/**
+ * 导航栏标题：有人正在输入时整条替换成人名/状态文本，位置就是顶部正中（微信的做法）。
+ *
+ * <p>不用「在消息列表末尾加一行」：那行会在自己不滚动时看不见，而滚动后又会把最后一条
+ * 消息顶上去，等于用一条布局位移换一个状态提示。放标题位置既不占用消息区，也不打断阅读。
+ */
+const titleText = computed(() => typingText.value || title.value);
+
 const sheetActions = computed(() => {
   const message = selected.value;
   if (!message) return [];
@@ -216,7 +224,7 @@ watch(conversationId, () => {
 
 <template>
   <div class="page">
-    <NavBar :title="title" :subtitle="subtitle" solid>
+    <NavBar :title="titleText" :subtitle="subtitle" :title-muted="!!typingText" solid>
       <template #right>
         <button v-if="convType === 'GROUP'" class="nav-side-btn" @click="groupOpen = true">详情</button>
       </template>
@@ -244,8 +252,6 @@ watch(conversationId, () => {
           @retry="onRetry"
         />
       </template>
-
-      <div v-if="typingText" class="typing-line">{{ typingText }}</div>
     </div>
 
     <ChatComposer

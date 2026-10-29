@@ -3,7 +3,9 @@ package com.github.im.storage.redis.config;
 import com.github.im.server.group.GroupMemberRepository;
 import com.github.im.server.group.GroupRepository;
 import com.github.im.server.message.MessageRepository;
+import com.github.im.server.relation.FriendRequestRepository;
 import com.github.im.server.relation.RelationRepository;
+import com.github.im.storage.redis.RedisFriendRequestRepository;
 import com.github.im.storage.redis.RedisGroupMemberRepository;
 import com.github.im.storage.redis.RedisGroupRepository;
 import com.github.im.storage.redis.RedisMessageRepository;
@@ -75,5 +77,11 @@ public class RedisStorageConfig {
     @Bean
     public RelationRepository relationRepository(StringRedisTemplate redis) {
         return new RedisRelationRepository(redis);
+    }
+
+    /** 好友申请：收到的 / 发出的各一个 Hash，value 是整条申请单的 JSON */
+    @Bean
+    public FriendRequestRepository friendRequestRepository(StringRedisTemplate redis, ObjectMapper objectMapper) {
+        return new RedisFriendRequestRepository(redis, objectMapper);
     }
 }

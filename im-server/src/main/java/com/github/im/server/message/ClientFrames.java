@@ -157,6 +157,50 @@ public class ClientFrames {
      */
     public static final String TYPE_CONV_UPDATE = "conv.update";
 
+    /**
+     * 好友申请到达（{@code relation.request}），推给<b>被申请人</b>。
+     *
+     * <pre>
+     * {"ver":1,"type":"relation.request","fromId":"alice","message":"我是产品的小李","ts":1750000000000}
+     * </pre>
+     *
+     * <p>为什么不复用 {@code msg.push}：申请不是消息，没有会话、没有 seq、不进离线队列，
+     * 被拒绝后也不该在聊天记录里留下一条「你申请加对方好友」。用消息帧承载它，
+     * 客户端就得为一个不存在的 conversationId 造一个假会话来渲染气泡。
+     *
+     * <p>为什么带 {@code message}：验证消息是申请人写的唯一一句话，
+     * 不推过去的话被申请人只能看到一个光秃秃的 userId，无从判断该不该同意。
+     *
+     * <p>只推一条、不重试：申请本身已经落库，对方下次打开「新的朋友」列表照样看得到。
+     */
+    public static final String TYPE_RELATION_REQUEST = "relation.request";
+
+    /**
+     * 好友申请被处理（{@code relation.update}）。
+     *
+     * <pre>
+     * {"ver":1,"type":"relation.update","peerId":"bob","change":"ACCEPTED","ts":1750000000000}
+     * </pre>
+     *
+     * <p>三种 {@code change} 各推给一方，避免「谁该收到」出现两套判定：
+     * <ul>
+     *   <li>{@link #RELATION_ACCEPTED} / {@link #RELATION_REJECTED} → 推给<b>申请人</b>，
+     *       他需要知道结果；</li>
+     *   <li>{@link #RELATION_CANCELLED} → 推给<b>被申请人</b>，他列表里那条申请要消失。</li>
+     * </ul>
+     *
+     * <p>不推给「操作者自己」：那是他刚点的按钮，本地已经改过了（与 {@code conv.update}
+     * 用 {@code originDeviceId} 过滤自己的回声同理，这里推送粒度只到用户，干脆不发给自己）。
+     */
+    public static final String TYPE_RELATION_UPDATE = "relation.update";
+
+    /** 申请已通过：双方此刻已是好友（客户端据此刷新好友列表） */
+    public static final String RELATION_ACCEPTED = "ACCEPTED";
+    /** 申请被拒绝 */
+    public static final String RELATION_REJECTED = "REJECTED";
+    /** 申请人撤回了申请（被申请人列表里要移除） */
+    public static final String RELATION_CANCELLED = "CANCELLED";
+
     /** 撤回：会话级，广播给会话内所有人（含发送方自己的其他端） */
     public static final String CHANGE_RECALLED = "RECALLED";
     /** 本地删除：用户级，只推给操作者自己的其他端；对端不受影响 */
@@ -329,6 +373,38 @@ public class ClientFrames {
         frame.put("change", change);
         frame.put("actorId", actorId == null ? "" : actorId);
         frame.put("targetId", targetId == null ? "" : targetId);
+        frame.put("ts", ts);
+        return objectMapper.writeValueAsString(frame);
+    }
+
+    /**
+     * 好友申请到达帧。
+     *
+     * @param fromId  申请人（被申请人据此展示「谁要加你」并回传 accept/reject）
+     * @param message 验证消息，可能为空串
+     */
+    public String friendRequestFrame(String fromId, String message, long ts) {
+        Map<String, Object> frame = new LinkedHashMap<>();
+        frame.put("ver", VER);
+        frame.put("type", TYPE_RELATION_REQUEST);
+        frame.put("fromId", fromId);
+        frame.put("message", message == null ? "" : message);
+        frame.put("ts", ts);
+        return objectMapper.writeValueAsString(frame);
+    }
+
+    /**
+     * 好友申请状态帧。
+     *
+     * @param peerId 另一方（对 {@code ACCEPTED/REJECTED} 是审批人，对 {@code CANCELLED} 是申请人）
+     * @param change {@link #RELATION_ACCEPTED} / {@link #RELATION_REJECTED} / {@link #RELATION_CANCELLED}
+     */
+    public String relationUpdateFrame(String peerId, String change, long ts) {
+        Map<String, Object> frame = new LinkedHashMap<>();
+        frame.put("ver", VER);
+        frame.put("type", TYPE_RELATION_UPDATE);
+        frame.put("peerId", peerId);
+        frame.put("change", change);
         frame.put("ts", ts);
         return objectMapper.writeValueAsString(frame);
     }

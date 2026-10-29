@@ -103,6 +103,30 @@ CREATE TABLE IF NOT EXISTS im_relation
 ) ENGINE = InnoDB
   DEFAULT CHARSET = utf8mb4 COMMENT '关系链表（好友 / 黑名单）';
 
+-- 好友申请表：im.storage=jdbc 时承接 FriendRequestRepository（好友申请的两阶段流程）
+-- （默认 Redis 实现为 im:user:{id}:friend-req:in / :out 两个 Hash）
+--
+-- 为什么不复用 im_relation：那张表的唯一键是 (owner, target, relation_type)，
+-- 一条边只有「存在/不存在」，装不下 status（PENDING/ACCEPTED/REJECTED）、
+-- 验证消息和两个时间戳；而这些字段与「是不是好友」这个热路径查询无关。
+--
+-- 唯一键 (from_id, to_id)：同一对用户永远只有一条申请，重新申请是覆盖而不是新增。
+CREATE TABLE IF NOT EXISTS im_friend_request
+(
+    id         BIGINT       NOT NULL AUTO_INCREMENT,
+    from_id    VARCHAR(64)  NOT NULL COMMENT '申请人',
+    to_id      VARCHAR(64)  NOT NULL COMMENT '被申请人',
+    status     VARCHAR(16)  NOT NULL COMMENT 'PENDING / ACCEPTED / REJECTED',
+    message    VARCHAR(255) NOT NULL DEFAULT '' COMMENT '验证消息',
+    created_at BIGINT       NOT NULL COMMENT '首次申请时间（重新申请不刷新）',
+    updated_at BIGINT       NOT NULL COMMENT '最后一次状态变更时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_friend_request (from_id, to_id),
+    KEY idx_friend_request_to (to_id, updated_at),
+    KEY idx_friend_request_from (from_id, updated_at)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8mb4 COMMENT '好友申请表';
+
 -- 用户「本地删除」的消息：im.storage=jdbc 时承接 MessageRepository#markDeleted
 -- （默认 Redis 实现为 im:msg:del:{userId}:{conversationId} 集合）
 --

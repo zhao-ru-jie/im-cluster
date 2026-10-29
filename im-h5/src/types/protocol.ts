@@ -157,6 +157,39 @@ export interface ConvUpdateFrame {
   ts: number;
 }
 
+/** 有人申请加你为好友（{@code relation.request}），推给被申请人 */
+export interface RelationRequestFrame {
+  type: 'relation.request';
+  fromId: string;
+  /** 验证消息，可能为空串 */
+  message: string;
+  ts: number;
+}
+
+/** 好友申请的处理结果（ACCEPTED / REJECTED 推给申请人，CANCELLED 推给被申请人） */
+export type RelationChange = 'ACCEPTED' | 'REJECTED' | 'CANCELLED';
+
+export interface RelationUpdateFrame {
+  type: 'relation.update';
+  /** 另一方：ACCEPTED/REJECTED 时是审批人，CANCELLED 时是申请人 */
+  peerId: string;
+  change: RelationChange;
+  ts: number;
+}
+
+/** 好友申请单（服务端 {@code FriendRequest} 的同形 DTO） */
+export type FriendRequestStatus = 'PENDING' | 'ACCEPTED' | 'REJECTED';
+
+export interface FriendRequestItem {
+  fromId: string;
+  toId: string;
+  status: FriendRequestStatus;
+  message: string;
+  /** 首次申请时间（重新申请不刷新） */
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface ErrorFrame {
   type: 'error';
   clientMsgId?: string | null;
@@ -182,6 +215,8 @@ export type DownlinkFrame =
   | SessionKickFrame
   | SessionMigrateFrame
   | ConvUpdateFrame
+  | RelationRequestFrame
+  | RelationUpdateFrame
   | ErrorFrame
   | PingPongFrame
   | { type: 'connected'; userId: string; transport: string; ts: number }

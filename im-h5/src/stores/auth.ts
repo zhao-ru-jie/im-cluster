@@ -30,7 +30,7 @@ export function defaultEndpoints(): Endpoints {
   const host = location.hostname || '127.0.0.1';
   const httpProto = location.protocol === 'https:' ? 'https:' : 'http:';
   const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const sameOriginRest = ['', '80', '443', '8080'].includes(location.port) ? '' : `${httpProto}//${host}:8080`;
+  const sameOriginRest = ['', '80', '443', '8080'].includes(location.port) ? '' : `${httpProto}//${host}:8088`;
   const envRest = import.meta.env.VITE_REST_BASE as string | undefined;
   const envWs = import.meta.env.VITE_WS_BASE as string | undefined;
   return {

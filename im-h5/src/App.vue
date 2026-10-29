@@ -21,6 +21,8 @@ function boot(): void {
   booted = true;
   contact.bindFrames();
   void contact.loadProfiles();
+  // 待处理的好友申请决定通讯录 tab 上的红点，冷启动时先拉一次（不能只等推送）
+  void contact.loadRequests();
   void im.bootstrap();
 }
 

@@ -3,13 +3,16 @@ package com.github.im.storage.jdbc.config;
 import com.baomidou.mybatisplus.autoconfigure.ConfigurationCustomizer;
 import com.github.im.server.group.GroupMemberRepository;
 import com.github.im.server.group.GroupRepository;
+import com.github.im.server.relation.FriendRequestRepository;
 import com.github.im.server.relation.RelationRepository;
 import com.github.im.server.shard.ShardRouter;
 import com.github.im.server.message.MessageRepository;
+import com.github.im.storage.jdbc.JdbcFriendRequestRepository;
 import com.github.im.storage.jdbc.JdbcGroupMemberRepository;
 import com.github.im.storage.jdbc.JdbcGroupRepository;
 import com.github.im.storage.jdbc.JdbcMessageRepository;
 import com.github.im.storage.jdbc.JdbcRelationRepository;
+import com.github.im.storage.jdbc.mapper.FriendRequestMapper;
 import com.github.im.storage.jdbc.mapper.GroupMemberMapper;
 import com.github.im.storage.jdbc.mapper.GroupMapper;
 import com.github.im.storage.jdbc.mapper.MessageDeleteMapper;
@@ -143,5 +146,17 @@ public class JdbcStorageConfig {
     @Bean
     public RelationRepository relationRepository(RelationMapper relationMapper) {
         return new JdbcRelationRepository(relationMapper);
+    }
+
+    /**
+     * 好友申请（{@code im_friend_request}）。
+     *
+     * <p>建表语句在 {@code db/schema.sql} 里，跟随 {@code messageRepository} 的
+     * {@code im.db.init-schema} 一起执行——申请列表为空时的表现与「表不存在」时的表现
+     * 都是空列表，只能靠这行 DDL 保证不是后者。
+     */
+    @Bean
+    public FriendRequestRepository friendRequestRepository(FriendRequestMapper friendRequestMapper) {
+        return new JdbcFriendRequestRepository(friendRequestMapper);
     }
 }

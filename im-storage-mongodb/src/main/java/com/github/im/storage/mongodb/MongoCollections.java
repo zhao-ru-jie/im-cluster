@@ -30,6 +30,9 @@ public final class MongoCollections {
     /** 关系链（好友双向两条、黑名单单向一条） */
     public static final String RELATION = "im_relation";
 
+    /** 好友申请（一条文档 = 一对用户的一条申请，_id = fromId:toId） */
+    public static final String FRIEND_REQUEST = "im_friend_request";
+
     private MongoCollections() {
     }
 }
