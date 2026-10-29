@@ -57,13 +57,20 @@ im:
     # 降级地址：Nacos 关闭 / 初始化失败 / 拿不到健康实例时才用它；支持逗号分隔多地址，
     # 多个地址同样参与 gRPC 的 round_robin 轮询
     address: ${IM_SERVER_ADDR:127.0.0.1:9091}
-    # 单条上行的 deadline。为什么不是 300ms：这条 RPC 是跨进程的，IM 服务侧还要落 MySQL
-    # （jdbc 形态是一次 fsync）+ 分配 seq + 写会话扩散，多实例下还可能撞上首次建连。
-    # 300ms 会把「正常抖动」判成故障并回 503，让客户端退避重发，代价远大于多等几百毫秒；
-    # 真过载时它也拦不住（请求已经打进去了），只是把「慢」变成了「失败」。
-    timeout-ms: ${IM_SERVER_TIMEOUT_MS:1000}
+    # 单条上行的 deadline（submit / pullPending / ackPending / ackDelivered / listConversations 共用）。
+    # 为什么不用 300ms 或 1s：这条 RPC 是跨进程的，IM 服务侧还要发号 + 落存储 + 写会话扩散，
+    # 落库这一步在 mongodb 形态下是一次 Mongo 往返、jdbc 形态下是一次 fsync；多实例下还可能撞上首次建连。
+    # 上游比下游先放弃是纯亏损：请求已经打进去了，IM 服务的线程还在等存储，
+    # 而客户端拿到的是 503——既没省下服务端的资源，又把「慢」变成了「失败 + 重试放大」。
+    #
+    # 10s 的依据：它必须大于下游最慢那一步的合理上界（Mongo serverSelection 默认 5s）。
+    # 代价要认：
+    #   · mongod 真挂时，客户端要等满 10s 才收到 503；
+    #   · 这 10s 内 IM 服务的 gRPC 工作线程一直挂在存储调用上。
+    # 因此下游超时不能比它更大（见 im.mongo.uri 的 socketTimeoutMS），否则倒挂依旧。
+    timeout-ms: ${IM_SERVER_TIMEOUT_MS:10000}
     # 「暂时一个 READY 的 IM 实例都没有」时，排队等到 deadline 再失败，而不是立刻 503。
-    # 网关跑虚拟线程，等待几乎不占平台线程；让客户端少一次 1s+ 的退避重发。
+    # 网关跑虚拟线程，等待几乎不占平台线程；让客户端少一次 10s 的退避重发。
     wait-for-ready: ${IM_SERVER_WAIT_FOR_READY:true}
   gateway:
     # —— 长连接接入（Netty）——

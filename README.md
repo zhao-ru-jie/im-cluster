@@ -140,7 +140,7 @@ ack 先行换来「ack 延迟 = 落库延迟」的代价，三条约束必须一
 ### seq 发号与三道下界
 
 发号器**每条消息一次 Redis 原子 `INCR`**（Lua，key 为 `im:seq:{conversationId}`），返回值就是
-所有实例共同认可的会话内顺序。代价是一次 Redis 往返（本机 0.2~0.5ms，相对上行 300ms 的 deadline 可忽略）。
+所有实例共同认可的会话内顺序。代价是一次 Redis 往返（本机 0.2~0.5ms，相对上行 10s 的 deadline 可忽略）。
 
 **为什么不做本地号段缓存**：一次 `INCRBY N` 把号段缓存在进程内，会让同一会话的 seq 跨实例交错
 （A 发 1、2、3，B 发 101、102、103 → 客户端看到 `1, 101, 2, 102`）。客户端补洞的常规实现是
@@ -177,7 +177,7 @@ Tomcat 仍然保留，但只服务 `/admin/*`、`/actuator/*`、测试页面等�
 
 ### 上行业务的线程模型（event loop 不碰阻塞）
 
-一条 `msg.send` 的链路上有一次同步 gRPC（≤300ms）和若干 Redis/DB 往返。如果直接在
+一条 `msg.send` 的链路上有一次同步 gRPC（deadline 上限 10s）和若干 Redis/DB 往返。如果直接在
 `channelRead0` 里做，event loop 线程被占住，**挂在同一个线程上的所有连接一起停摆**，
 单实例上行并发被锁死在 `2×CPU`，而且任何一个下游抖动都会放大成全实例卡死。
 
@@ -1310,7 +1310,7 @@ kubectl apply -f k8s/im-node.yaml     # 或 im-gateway.yaml + im-server.yaml（�
 | 配置 | 环境变量 | 默认 | 说明 |
 |------|----------|------|------|
 | `im.ingress.transport` | `IM_INGRESS_TRANSPORT` | `local` | `local` / `shadow` / `grpc`（仅单体装配入口） |
-| `im.server.address` / `timeout-ms` / `wait-for-ready` | `IM_SERVER_ADDR` / `IM_SERVER_TIMEOUT_MS` / `IM_SERVER_WAIT_FOR_READY` | `127.0.0.1:9091` / `300` / `true` | 网关 → IM |
+| `im.server.address` / `timeout-ms` / `wait-for-ready` | `IM_SERVER_ADDR` / `IM_SERVER_TIMEOUT_MS` / `IM_SERVER_WAIT_FOR_READY` | `127.0.0.1:9091` / **网关 10000、单体 300** / `true` | 网关/单体 → IM。**上游超时必须大于下游最慢一步**，否则只是把「慢」变成「失败 + 重试放大」（10s 的依据见该配置行注释） |
 | `im.push.timeout-ms` / `wait-for-ready` | `IM_PUSH_TIMEOUT_MS` / `IM_PUSH_WAIT_FOR_READY` | `800` / `false` | IM → 网关，超时即落离线 |
 | `im.delivery.max-inflight` | `IM_DELIVERY_MAX_INFLIGHT` | `1024` | 异步推送并发上限，打满即退化为同步推送 |
 | `im.offline.frame-ttl` | `IM_OFFLINE_FRAME_TTL` | `7d` | 单聊离线队列与设备游标的过期时间 |

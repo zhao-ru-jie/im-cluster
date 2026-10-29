@@ -35,10 +35,25 @@ const recording = ref(false);
 const busy = ref(false);
 const recorder = new VoiceRecorder();
 
-/** 「正在输入」的重发间隔。服务端对 true 的去抖是 3s、对端 6s 自动过期，2s 重发既不丢状态也不至于每键一帧 */
-const TYPING_THROTTLE = 2000;
-/** 停手多久补一条 typing=false */
-const TYPING_IDLE = 2000;
+/**
+ * 「正在输入」的重发间隔：4s。
+ *
+ * <p>这个值的**下限**由对端的过期时间决定（{@code stores/im.ts} 的 {@code TYPING_TTL}=6s）：
+ * 重发间隔必须小于它，否则用户一直在打字、对面三个点却自己灭了。上限则由「越少越好」决定——
+ * 它不代表用户打字的速度，只代表「我还在这儿」的心跳。
+ *
+ * <p>取 4s 而不是贴着 6s：留 2s 给网络抖动与两端时钟差；同时 4s &gt; 服务端
+ * {@code TypingNotifier} 的 3s 去抖窗口，每次上行都会被真正扇出，没有白发的帧。
+ */
+const TYPING_THROTTLE = 4000;
+/**
+ * 停手多久补一条 typing=false：3s。
+ *
+ * <p>比「重发间隔」短一点（否则停手后对方还要多等一个周期才看到消失），
+ * 又不能太短：一句完整的话中间常有停顿（想下一句、切输入法），1~2s 就发 false
+ * 会让对面的「正在输入」反复闪。
+ */
+const TYPING_IDLE = 3000;
 
 let typingTimer = 0;
 let typingSentAt = 0;
@@ -76,6 +91,12 @@ function autoGrow(): void {
 
 function onInput(): void {
   autoGrow();
+  // 内容被删空就不再是「正在输入」：微信在输入框为空时同样不显示，
+  // 也让「全选删除后停在那儿」不会占着对方的状态栏
+  if (!text.value.trim()) {
+    stopTyping();
+    return;
+  }
   notifyTyping();
 }
 
@@ -131,6 +152,8 @@ async function handleFile(event: Event, kind: 'image' | 'video' | 'file'): Promi
 
 async function startRecord(event: Event): Promise<void> {
   event.preventDefault();
+  // 录音不是打字：不掐掉的话对方会看到「正在输入」一直挂着
+  stopTyping();
   if (!isVoiceSupported()) {
     emit('error', '当前浏览器不支持录音（微信 iOS 需要 14.3+）');
     return;

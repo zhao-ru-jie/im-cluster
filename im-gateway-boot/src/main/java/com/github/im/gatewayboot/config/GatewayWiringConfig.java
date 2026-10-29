@@ -33,9 +33,12 @@ import org.springframework.context.annotation.Configuration;
  *       「网关选中冷实例、首条消息把建连耗时（实测 260~340ms）塞进 deadline」的偶发 503。</li>
  * </ul>
  *
- * <p><b>超时</b>（默认 1s，见 {@code im.server.timeout-ms}）决定网关对「单条消息实时性」的耐心：
+ * <p><b>超时</b>（默认 10s，见 {@code im.server.timeout-ms}）决定网关对「单条消息实时性」的耐心：
  * 超时即回 {@code error 503} 让客户端退避重发，<b>不会</b>在网关侧重试，也不会因为 IM 服务慢而断开长连接。
- * 早先默认 300ms，与「建连 260~340ms」本就贴得太近——分离部署下 IM 服务还要落库，正常抖动就会撞线。
+ * 演变过程值得记一笔：300ms → 1s → 10s。300ms 与「建连 260~340ms」本就贴得太近；1s 在
+ * mongodb 形态下依然小于一次 {@code Mongo serverSelection}（默认 5s），于是出现「下游还在等、
+ * 上游已判失败」的倒挂——请求已经打进去了，IM 服务的线程还在等存储，客户端却拿到了 503。
+ * 放宽到 10s 是把预算还给下游：<b>上游超时必须大于下游的合理上界</b>，否则超时只制造重试放大。
  *
  * <p><b>仍然要预热</b>：deadline 放宽只是留余量，不该把「首次建连」这种可预期的耗时算进每条消息的预算里。
  *
@@ -87,13 +90,16 @@ public class GatewayWiringConfig {
     public MessageIngress messageIngress(GrpcChannelFactory channels,
                                          IngressTargets targets,
                                          IngressNameResolverProvider resolverProvider,
-                                         @Value("${im.server.timeout-ms:1000}") long timeoutMs,
+                                         @Value("${im.server.timeout-ms:10000}") long timeoutMs,
                                          @Value("${im.server.wait-for-ready:true}") boolean waitForReady) {
         // resolverProvider 作为参数只是为了确保「scheme 已注册」先于 channel 构建
         String target = IngressNameResolverProvider.SCHEME + ":///" + targets.serviceName();
-        log.info("[ingress] 长连接服务独立部署：上行 gRPC target={}（round_robin），当前可用 IM 服务实例 {}",
-                target, targets.current());
-        // 启动即等到 channel READY：否则首条消息会把建连（含被调方冷启动）算进 300ms 的 deadline。
+        // deadline 一定要打出来：它从 300ms 一路调到 10s，排障时「到底生效了多少」是最先要确认的事，
+        // 而它又不在任何一行业务日志里（超时日志只显示「用满了 deadline」）
+        log.info("[ingress] 长连接服务独立部署：上行 gRPC target={}（round_robin），当前可用 IM 服务实例 {}，"
+                        + "deadline={}ms waitForReady={}",
+                target, targets.current(), timeoutMs, waitForReady);
+        // 启动即等到 channel READY：否则首条消息会把建连（含被调方冷启动）算进这条 deadline。
         // 注意 READY 的语义：round_robin 聚合状态为 READY 只代表「至少一个实例就绪」，
         // 打开的实例个数由 NameResolver 的地址数决定，其余实例在后台陆续建连（不影响可用性）。
         channels.warmUp(target);

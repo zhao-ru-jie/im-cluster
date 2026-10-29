@@ -87,6 +87,10 @@ im:
     # 有了它才是「有界失败 + 消息上行按可重试返回」。30s 只是兜底，不是性能调优参数。
     uri: ${IM_MONGO_URI:mongodb://127.0.0.1:27017/?connectTimeoutMS=3000&serverSelectionTimeoutMS=5000&socketTimeoutMS=30000}
     database: ${IM_MONGO_DATABASE:im}
+    # 节点探测间隔：驱动默认 10s。mongod 抖一下之后，驱动要等下一次心跳才知道它回来了，
+    # 这段盲区里的请求全部按「无可用服务器」失败——本机尤其明显（Windows 前台 mongod 被
+    # 控制台选中会挂起整个进程）。5s 是折中；uri 里显式写 heartbeatFrequencyMS 时以 uri 为准。
+    heartbeat-ms: ${IM_MONGO_HEARTBEAT_MS:5000}
     # 启动时建索引（幂等）。生产上若由 DBA 脚本统一管理索引，可以关掉。
     # 注意：uk_msg_conv_seq / uk_msg_idem 这两条唯一索引是保序与幂等的最终防线（消息 ID 由 _id 自身保证），
     # 关掉自动创建不等于可以没有它们——只是改为由别处负责。

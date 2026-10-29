@@ -33,7 +33,9 @@ import java.util.function.Function;
  * 「每个业务请求的 RPC 次数」产生别名（2 实例 + 每条消息 2 次 RPC 时，submit 会永远落到同一个
  * 实例）。gRPC 的 LoadBalancer 工作在 subchannel 层，不存在这个问题。
  *
- * <p><b>超时语义</b>：由装配处传入（网关侧默认 1s，见 {@code im.server.timeout-ms}）。
+ * <p><b>超时语义</b>：由装配处传入（网关侧默认 10s，见 {@code im.server.timeout-ms}）。
+ * 这个值必须大于下游最慢那一步（如 Mongo 的 {@code serverSelectionTimeoutMS}），
+ * 否则上游先放弃只会留下「请求已打进去、线程还在等、客户端拿到 503」的纯亏损。
  * 超时/不可用时向上抛异常，由网关的 {@code SessionLifecycle} 转成 {@code error 503}（可重试）——
  * 连接保持不断，因为「连接」比「单条消息的实时性」更稀缺。
  *

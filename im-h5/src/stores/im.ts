@@ -801,7 +801,12 @@ export const useImStore = defineStore('im', {
       }
     },
 
-    /** 正在输入：2 秒不输入就发 false（与服务端 3s 去抖配合） */
+    /**
+     * 上报「正在输入」。
+     *
+     * <p>节流与「什么时候算停止输入」都在 {@code ChatComposer}（4s 重发 / 静默 3s 补 false），
+     * 这里只负责把帧发出去；服务端 {@code TypingNotifier} 再按 3s 窗口去抖后才扇出给对端。
+     */
     setTyping(conversationId: string, convType: ConvType, typing: boolean): void {
       imSocket.send({ type: 'typing', conversationId, convType, typing, clientTs: Date.now() });
     }
