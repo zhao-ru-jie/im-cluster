@@ -283,6 +283,6 @@ class RelationServiceTest {
             return PushResult.newBuilder().addAllDeliveredUserIds(task.getTargetUserIdsList()).build();
         };
         when(provider.getIfAvailable()).thenReturn(pushPort);
-        return new RelationEventNotifier(new ClientFrames(new ObjectMapper()), provider, enabled);
+        return new RelationEventNotifier(new ClientFrames(), provider, enabled);
     }
 }

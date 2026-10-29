@@ -1,7 +1,6 @@
 package com.github.im.client;
 
 import tools.jackson.databind.JsonNode;
-import tools.jackson.databind.ObjectMapper;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -88,16 +87,10 @@ public final class Frames {
     /** 下行：好友申请被处理（ACCEPTED / REJECTED / CANCELLED） */
     public static final String T_RELATION_UPDATE = "relation.update";
 
-    private final ObjectMapper mapper;
-
     public Frames() {
-        this(JsonUtils.mapper());
+
     }
 
-    /** 允许宿主注入自己的 mapper（例如统一开启某些序列化特性） */
-    public Frames(ObjectMapper mapper) {
-        this.mapper = mapper == null ? new ObjectMapper() : mapper;
-    }
 
     // ==== 上行编码 ====
 
@@ -263,7 +256,7 @@ public final class Frames {
      *                                  那意味着连接上的字节流已经错位，必须断开重连，不能继续猜
      */
     public DownlinkFrame parse(String payload) {
-        return parse(mapper.readTree(payload));
+        return parse(JsonUtils.toJsonNode(payload));
     }
 
     /**
@@ -344,7 +337,7 @@ public final class Frames {
     }
 
     private String write(Map<String, Object> frame) {
-        return mapper.writeValueAsString(frame);
+        return JsonUtils.toJson(frame);
     }
 
     private static String text(JsonNode node, String field) {

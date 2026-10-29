@@ -250,7 +250,7 @@ class DeliveredAckTest {
 
     private MessageService service() {
         return new MessageService(TestRedis.template(), repository, store(),
-                new ClientFrames(new ObjectMapper()), delivery, seqAllocator, watermarkStore(),
+                new ClientFrames(), delivery, seqAllocator, watermarkStore(),
                 new ConversationStore(TestRedis.template(), TTL, 1000), groupMembers, stateNotifier(),
                 null, null, null, Duration.ofMinutes(2), new MessageMetrics(null));
     }
@@ -265,7 +265,7 @@ class DeliveredAckTest {
                 return PushResult.newBuilder().addAllDeliveredUserIds(task.getTargetUserIdsList()).build();
             };
             when(provider.getIfAvailable()).thenReturn(pushPort);
-            notifier = new MessageStateNotifier(new ClientFrames(new ObjectMapper()), provider, true);
+            notifier = new MessageStateNotifier(new ClientFrames(), provider, true);
         }
         return notifier;
     }

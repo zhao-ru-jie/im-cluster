@@ -1,5 +1,6 @@
 package com.github.im.gateway.protocol;
 
+import com.github.im.gateway.utils.JsonUtils;
 import com.github.im.proto.presence.v1.PresenceState;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.JsonNode;
@@ -126,14 +127,12 @@ public class ClientFrames {
 
     public static final int VER = 1;
 
-    private final ObjectMapper objectMapper;
 
-    public ClientFrames(ObjectMapper objectMapper) {
-        this.objectMapper = objectMapper;
+    public ClientFrames() {
     }
 
     public JsonNode parse(String payload) {
-        return objectMapper.readTree(payload);
+        return JsonUtils.toJsonNode(payload);
     }
 
     /**
@@ -248,6 +247,6 @@ public class ClientFrames {
     }
 
     private String write(Map<String, Object> frame) {
-        return objectMapper.writeValueAsString(frame);
+        return JsonUtils.toJson(frame);
     }
 }

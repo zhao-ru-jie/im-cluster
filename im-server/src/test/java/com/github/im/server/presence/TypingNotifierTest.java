@@ -204,7 +204,7 @@ class TypingNotifierTest {
     @DisplayName("能被 Spring 容器实例化：多构造器时容器用的那个必须标 @Autowired")
     void springCanInstantiate() {
         try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
-            context.registerBean(ClientFrames.class, () -> new ClientFrames(new ObjectMapper()));
+            context.registerBean(ClientFrames.class, ClientFrames::new);
             context.registerBean(GroupMemberRepository.class, FakeGroupMembers::new);
             context.register(TypingNotifier.class);
             context.refresh();
@@ -229,7 +229,7 @@ class TypingNotifierTest {
                                     PushPort pushPort) {
         ObjectProvider<PushPort> provider = mock(ObjectProvider.class);
         when(provider.getIfAvailable()).thenReturn(pushPort);
-        return new TypingNotifier(new ClientFrames(new ObjectMapper()), provider, members,
+        return new TypingNotifier(new ClientFrames(), provider, members,
                 enabled, maxGroupMembers, dedupWindowMs);
     }
 

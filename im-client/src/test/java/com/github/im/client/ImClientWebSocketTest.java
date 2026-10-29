@@ -2,7 +2,6 @@ package com.github.im.client;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import tools.jackson.databind.ObjectMapper;
 
 import java.io.BufferedInputStream;
 import java.io.IOException;
@@ -36,8 +35,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 没有这层测试，只能靠人工冒烟去撞。
  */
 class ImClientWebSocketTest {
-
-    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     @Test
     @DisplayName("WebSocket 建连即认证：不发 connect 帧，能发消息并收到 ack")
@@ -168,11 +165,11 @@ class ImClientWebSocketTest {
     }
 
     private static String typeOf(String frame) {
-        return MAPPER.readTree(frame).path("type").asString("");
+        return JsonUtils.toJsonNode(frame).path("type").asString("");
     }
 
     private static String str(String frame, String field) {
-        return MAPPER.readTree(frame).path(field).asString(null);
+        return JsonUtils.toJsonNode(frame).path(field).asString(null);
     }
 
     private static String json(Object... keyValues) {
@@ -180,7 +177,7 @@ class ImClientWebSocketTest {
         for (int i = 0; i + 1 < keyValues.length; i += 2) {
             frame.put((String) keyValues[i], keyValues[i + 1]);
         }
-        return MAPPER.writeValueAsString(frame);
+        return JsonUtils.toJson(frame);
     }
 
     static final class Recorder implements ImClientListener {

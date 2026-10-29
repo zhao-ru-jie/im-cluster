@@ -195,7 +195,7 @@ class MessageAclTest {
                 emptyProvider(), mode, requireFriend);
         return new MessageService(TestRedis.template(), repository,
                 new OfflineMessageStore(TestRedis.template(), TTL, 500, TTL),
-                new ClientFrames(new ObjectMapper()), delivery, seqAllocator,
+                new ClientFrames(), delivery, seqAllocator,
                 new ClientWatermarkStore(TestRedis.template(), TTL),
                 new ConversationStore(TestRedis.template(), TTL, 1000),
                 groupMembers, null, acl, null, null, Duration.ofMinutes(2), new MessageMetrics(null));

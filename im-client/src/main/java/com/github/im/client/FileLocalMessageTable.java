@@ -1,7 +1,6 @@
 package com.github.im.client;
 
 import tools.jackson.databind.JsonNode;
-import tools.jackson.databind.ObjectMapper;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -47,7 +46,6 @@ public final class FileLocalMessageTable extends InMemoryLocalMessageTable {
     private static final long COMPACT_MIN_LINES = 1024;
 
     private final Path journal;
-    private final ObjectMapper mapper = new ObjectMapper();
 
     private BufferedWriter writer;
     private long writtenLines;
@@ -98,7 +96,7 @@ public final class FileLocalMessageTable extends InMemoryLocalMessageTable {
                 }
                 lines++;
                 try {
-                    restore(fromJson(mapper.readTree(line)));
+                    restore(fromJson(JsonUtils.toJsonNode(line)));
                 } catch (RuntimeException e) {
                     broken++;
                 }
@@ -197,7 +195,7 @@ public final class FileLocalMessageTable extends InMemoryLocalMessageTable {
         row.put("lastError", message.lastError());
         row.put("createdAt", message.createdAt());
         row.put("updatedAt", message.updatedAt());
-        return mapper.writeValueAsString(row);
+        return JsonUtils.toJson(row);
     }
 
     private LocalMessage fromJson(JsonNode node) {

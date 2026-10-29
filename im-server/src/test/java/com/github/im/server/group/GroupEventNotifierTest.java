@@ -195,7 +195,7 @@ class GroupEventNotifierTest {
     @DisplayName("能被 Spring 容器实例化：多构造器不能落到「找不到默认构造器」")
     void springCanInstantiate() {
         try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
-            context.registerBean(ClientFrames.class, () -> new ClientFrames(new ObjectMapper()));
+            context.registerBean(ClientFrames.class, ClientFrames::new);
             context.register(GroupEventNotifier.class);
             context.refresh();
 
@@ -219,7 +219,7 @@ class GroupEventNotifierTest {
     private GroupEventNotifier notifier(boolean enabled, PushPort pushPort) {
         ObjectProvider<PushPort> provider = mock(ObjectProvider.class);
         when(provider.getIfAvailable()).thenReturn(pushPort);
-        return new GroupEventNotifier(new ClientFrames(new ObjectMapper()), provider, enabled);
+        return new GroupEventNotifier(new ClientFrames(), provider, enabled);
     }
 
     /** 缩短窗口与水位的实例：用来验证去重的过期与回收，生产走默认常量 */
@@ -231,7 +231,7 @@ class GroupEventNotifierTest {
             return PushResult.newBuilder().addAllDeliveredUserIds(task.getTargetUserIdsList()).build();
         };
         when(provider.getIfAvailable()).thenReturn(pushPort);
-        return new GroupEventNotifier(new ClientFrames(new ObjectMapper()), provider, true,
+        return new GroupEventNotifier(new ClientFrames(), provider, true,
                 dedupWindowMs, pruneThreshold);
     }
 }

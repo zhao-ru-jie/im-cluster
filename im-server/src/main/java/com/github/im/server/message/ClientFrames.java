@@ -1,9 +1,9 @@
 package com.github.im.server.message;
 
 import com.github.im.contract.MessageEnvelope;
+import com.github.im.server.utils.JsonUtils;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.JsonNode;
-import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
 
 import java.util.LinkedHashMap;
@@ -207,11 +207,6 @@ public class ClientFrames {
     public static final String CHANGE_DELETED = "DELETED";
     private static final int VER = 1;
 
-    private final ObjectMapper objectMapper;
-
-    public ClientFrames(ObjectMapper objectMapper) {
-        this.objectMapper = objectMapper;
-    }
 
     /** 受理路径用：拿到 seq/serverMsgId 后立刻渲染出要推送的帧 */
     public String pushFrame(MessageEnvelope envelope, String serverMsgId, long seq, long createdAt) {
@@ -224,12 +219,12 @@ public class ClientFrames {
 
     /** 读路径用：把存储里的记录还原成帧（历史消息、离线补拉都走这里） */
     public String frameOf(StoredMessage message) {
-        return objectMapper.writeValueAsString(frameMap(message));
+        return JsonUtils.toJson(frameMap(message));
     }
 
     /** 同上，但按「是否已撤回」脱敏（补发已撤回的消息时不能再带原文） */
     public String frameOf(StoredMessage message, boolean recalled) {
-        return objectMapper.writeValueAsString(frameMap(message, recalled));
+        return JsonUtils.toJson(frameMap(message, recalled));
     }
 
     /**
@@ -253,7 +248,7 @@ public class ClientFrames {
         frame.put("seq", seq);
         frame.put("userId", userId);
         frame.put("ts", ts);
-        return objectMapper.writeValueAsString(frame);
+        return JsonUtils.toJson(frame);
     }
 
     /**
@@ -326,7 +321,7 @@ public class ClientFrames {
             return null;
         }
         try {
-            JsonNode node = objectMapper.readTree(rawFrame);
+            JsonNode node = JsonUtils.toJsonNode(rawFrame);
             String conversationId = node.path("conversationId").asString("");
             long seq = node.path("seq").asLong(0);
             return conversationId.isEmpty() || seq <= 0 ? null : new FrameRef(conversationId, seq);
@@ -344,7 +339,7 @@ public class ClientFrames {
      */
     public String recalledFrame(String rawFrame) {
         try {
-            JsonNode node = objectMapper.readTree(rawFrame);
+            JsonNode node = JsonUtils.toJsonNode(rawFrame);
             if (!(node instanceof ObjectNode object)) {
                 return rawFrame;
             }
@@ -352,7 +347,7 @@ public class ClientFrames {
             object.remove("attrs");
             object.put("contentType", MessageEnvelope.CT_TEXT);
             object.put("recalled", true);
-            return objectMapper.writeValueAsString(object);
+            return JsonUtils.toJson(object);
         } catch (RuntimeException e) {
             return rawFrame;
         }
@@ -374,7 +369,7 @@ public class ClientFrames {
         frame.put("actorId", actorId == null ? "" : actorId);
         frame.put("targetId", targetId == null ? "" : targetId);
         frame.put("ts", ts);
-        return objectMapper.writeValueAsString(frame);
+        return JsonUtils.toJson(frame);
     }
 
     /**
@@ -390,7 +385,7 @@ public class ClientFrames {
         frame.put("fromId", fromId);
         frame.put("message", message == null ? "" : message);
         frame.put("ts", ts);
-        return objectMapper.writeValueAsString(frame);
+        return JsonUtils.toJson(frame);
     }
 
     /**
@@ -406,7 +401,7 @@ public class ClientFrames {
         frame.put("peerId", peerId);
         frame.put("change", change);
         frame.put("ts", ts);
-        return objectMapper.writeValueAsString(frame);
+        return JsonUtils.toJson(frame);
     }
 
     /**
@@ -426,7 +421,7 @@ public class ClientFrames {
         frame.put("userId", userId);
         frame.put("typing", typing);
         frame.put("ts", ts);
-        return objectMapper.writeValueAsString(frame);
+        return JsonUtils.toJson(frame);
     }
 
     /**
@@ -443,7 +438,7 @@ public class ClientFrames {
         frame.put("userId", userId);
         frame.put("online", online);
         frame.put("ts", ts);
-        return objectMapper.writeValueAsString(frame);
+        return JsonUtils.toJson(frame);
     }
 
     /**
@@ -459,7 +454,7 @@ public class ClientFrames {
         frame.put("deviceId", deviceId);
         frame.put("transport", transport);
         frame.put("ts", ts);
-        return objectMapper.writeValueAsString(frame);
+        return JsonUtils.toJson(frame);
     }
 
     /**
@@ -477,7 +472,7 @@ public class ClientFrames {
         frame.put("muted", muted);
         frame.put("originDeviceId", originDeviceId == null ? "" : originDeviceId);
         frame.put("ts", ts);
-        return objectMapper.writeValueAsString(frame);
+        return JsonUtils.toJson(frame);
     }
 
     /**
@@ -502,6 +497,6 @@ public class ClientFrames {
         frame.put("change", change);
         frame.put("actorId", actorId);
         frame.put("ts", ts);
-        return objectMapper.writeValueAsString(frame);
+        return JsonUtils.toJson(frame);
     }
 }

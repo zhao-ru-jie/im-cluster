@@ -301,7 +301,7 @@ class MessageServicePullPendingTest {
 
     private MessageService service() {
         return new MessageService(TestRedis.template(), repository, store(),
-                new ClientFrames(new ObjectMapper()), delivery, seqAllocator, watermarkStore,
+                new ClientFrames(), delivery, seqAllocator, watermarkStore,
                 new ConversationStore(TestRedis.template(), TTL, 1000),
                 mock(GroupMemberRepository.class), null, null, null, null, Duration.ofMinutes(2),
                 new MessageMetrics(null));

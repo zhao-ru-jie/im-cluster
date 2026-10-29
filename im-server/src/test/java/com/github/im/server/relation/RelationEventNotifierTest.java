@@ -116,7 +116,7 @@ class RelationEventNotifierTest {
     @DisplayName("能被 Spring 容器实例化")
     void springCanInstantiate() {
         try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
-            context.registerBean(ClientFrames.class, () -> new ClientFrames(new ObjectMapper()));
+            context.registerBean(ClientFrames.class, ClientFrames::new);
             context.register(RelationEventNotifier.class);
             context.refresh();
 
@@ -137,6 +137,6 @@ class RelationEventNotifierTest {
     private RelationEventNotifier notifier(boolean enabled, PushPort pushPort) {
         ObjectProvider<PushPort> provider = mock(ObjectProvider.class);
         when(provider.getIfAvailable()).thenReturn(pushPort);
-        return new RelationEventNotifier(new ClientFrames(new ObjectMapper()), provider, enabled);
+        return new RelationEventNotifier(new ClientFrames(), provider, enabled);
     }
 }

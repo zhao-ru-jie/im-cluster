@@ -13,7 +13,6 @@ import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
-import tools.jackson.databind.ObjectMapper;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -39,8 +38,7 @@ import static org.mockito.Mockito.when;
  */
 class SessionLifecycleTypingOrderTest {
 
-    private final ObjectMapper mapper = new ObjectMapper();
-    private final ClientFrames frames = new ClientFrames(mapper);
+    private final ClientFrames frames = new ClientFrames();
 
     @Test
     @DisplayName("typing：同一连接的 true/false 按上行顺序上报（乱序会让对方只收到停止输入）")

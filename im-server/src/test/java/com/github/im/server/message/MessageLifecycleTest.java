@@ -18,7 +18,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import tools.jackson.databind.ObjectMapper;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -59,7 +58,6 @@ class MessageLifecycleTest {
     private static final Duration TTL = Duration.ofHours(1);
     private static final int MAX_RECENT = 1000;
 
-    private final ObjectMapper mapper = new ObjectMapper();
     private final DeliveryDispatcher delivery = mock(DeliveryDispatcher.class);
     private final SeqAllocator seqAllocator = mock(SeqAllocator.class);
     private final GroupMemberRepository groupMembers = mock(GroupMemberRepository.class);
@@ -240,7 +238,7 @@ class MessageLifecycleTest {
     }
 
     private ClientFrames frames() {
-        return new ClientFrames(mapper);
+        return new ClientFrames();
     }
 
     private OfflineMessageStore offline() {

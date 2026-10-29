@@ -2,7 +2,6 @@ package com.github.im.client;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
 import java.net.ServerSocket;
@@ -16,7 +15,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -34,8 +32,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * </ul>
  */
 class ImClientIntegrationTest {
-
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    
     private static final String CONV = "s:alice:bob";
 
     @Test
@@ -153,10 +150,10 @@ class ImClientIntegrationTest {
                 assertEquals(3, listener.gaps.get(0)[1]);
 
                 String recv = recvFrames.get(0);
-                assertEquals(1, MAPPER.readTree(recv).path("acks").size(),
+                assertEquals(1, JsonUtils.toJsonNode(recv).path("acks").size(),
                         "recv 按会话聚合：同一个会话多条只报最大 seq");
-                assertEquals(CONV, MAPPER.readTree(recv).path("acks").get(0).path("conversationId").asString());
-                assertEquals(3, MAPPER.readTree(recv).path("acks").get(0).path("seq").asLong());
+                assertEquals(CONV, JsonUtils.toJsonNode(recv).path("acks").get(0).path("conversationId").asString());
+                assertEquals(3, JsonUtils.toJsonNode(recv).path("acks").get(0).path("seq").asLong());
                 assertEquals(0, client.pendingRecvCount(), "上报完应清空攒批缓冲");
 
                 assertEquals(Map.of(CONV, 3L), client.watermarks(),
@@ -210,11 +207,11 @@ class ImClientIntegrationTest {
     }
 
     private static String typeOf(String frame) {
-        return MAPPER.readTree(frame).path("type").asString("");
+        return JsonUtils.toJsonNode(frame).path("type").asString("");
     }
 
     private static String str(String frame, String field) {
-        return MAPPER.readTree(frame).path(field).asString(null);
+        return JsonUtils.toJsonNode(frame).path(field).asString(null);
     }
 
     private static List<String> types(List<String> frames) {
@@ -252,7 +249,7 @@ class ImClientIntegrationTest {
         for (int i = 0; i + 1 < keyValues.length; i += 2) {
             frame.put((String) keyValues[i], keyValues[i + 1]);
         }
-        return MAPPER.writeValueAsString(frame);
+        return JsonUtils.toJson(frame);
     }
 
     /** 记录回调结果的监听器：测试断言的就是「宿主能看到什么」 */

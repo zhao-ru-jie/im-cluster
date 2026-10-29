@@ -23,21 +23,20 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 只会表现成「消息能发出去但对方永远收不到」。
  */
 class FramesTest {
-
-    private final ObjectMapper mapper = new ObjectMapper();
+    
     private final Frames frames = new Frames();
 
     @Test
     @DisplayName("connect 帧：userId 必带，deviceId/token 为空时不下发")
     void connectFrame() {
-        JsonNode full = mapper.readTree(frames.connect("alice", "mobile", "v1.123.sig"));
+        JsonNode full = JsonUtils.toJsonNode(frames.connect("alice", "mobile", "v1.123.sig"));
         assertEquals(1, full.path("ver").asInt());
         assertEquals("connect", full.path("type").asString());
         assertEquals("alice", full.path("userId").asString());
         assertEquals("mobile", full.path("deviceId").asString());
         assertEquals("v1.123.sig", full.path("token").asString());
 
-        JsonNode minimal = mapper.readTree(frames.connect("alice", null, null));
+        JsonNode minimal = JsonUtils.toJsonNode(frames.connect("alice", null, null));
         assertFalse(minimal.has("deviceId"), "deviceId 留空应由服务端落到 default 槽位，而不是发空串");
         assertFalse(minimal.has("token"), "auth.mode=off 时不该硬塞空 token");
     }
@@ -47,7 +46,7 @@ class FramesTest {
     void sendFrameTextOnly() {
         OutgoingMessage message = OutgoingMessage.builder()
                 .clientMsgId("c-1").to("bob").body("hi").clientTs(1_700_000_000_000L).build();
-        JsonNode node = mapper.readTree(frames.send(message));
+        JsonNode node = JsonUtils.toJsonNode(frames.send(message));
 
         assertEquals("msg.send", node.path("type").asString());
         assertEquals("c-1", node.path("clientMsgId").asString());
@@ -64,7 +63,7 @@ class FramesTest {
         OutgoingMessage message = OutgoingMessage.builder()
                 .clientMsgId("c-2").to("bob").contentType("IMAGE")
                 .attrs("{\"url\":\"https://cdn/x.png\"}").build();
-        JsonNode node = mapper.readTree(frames.send(message));
+        JsonNode node = JsonUtils.toJsonNode(frames.send(message));
 
         assertEquals("IMAGE", node.path("contentType").asString());
         assertTrue(node.path("attrs").isString(), "attrs 必须是字符串，不能展开成对象");
@@ -76,7 +75,7 @@ class FramesTest {
     void sendFrameGroup() {
         OutgoingMessage message = OutgoingMessage.builder()
                 .conversationId("g:g1").convType(OutgoingMessage.CONV_GROUP).body("hello").build();
-        JsonNode node = mapper.readTree(frames.send(message.normalized()));
+        JsonNode node = JsonUtils.toJsonNode(frames.send(message.normalized()));
 
         assertEquals("g:g1", node.path("conversationId").asString());
         assertEquals("GROUP", node.path("convType").asString());
@@ -86,7 +85,7 @@ class FramesTest {
     @Test
     @DisplayName("msg.recv：acks 是数字 seq 的数组，不是字符串")
     void recvFrameIsBatchWithNumericSeq() {
-        JsonNode node = mapper.readTree(frames.recv(List.of(
+        JsonNode node = JsonUtils.toJsonNode(frames.recv(List.of(
                 new Frames.DeliveredAck("s:alice:bob", 5),
                 new Frames.DeliveredAck("g:g1", 12))));
 
@@ -103,7 +102,7 @@ class FramesTest {
         Map<String, Long> watermarks = new LinkedHashMap<>();
         watermarks.put("s:alice:bob", 100L);
         watermarks.put("g:g1", 42L);
-        JsonNode node = mapper.readTree(frames.sync(watermarks));
+        JsonNode node = JsonUtils.toJsonNode(frames.sync(watermarks));
 
         assertEquals("sync", node.path("type").asString());
         assertEquals(100, node.path("watermarks").path("s:alice:bob").asLong());
@@ -206,11 +205,11 @@ class FramesTest {
     @Test
     @DisplayName("pong / read / ping 的字段")
     void miscUplinkFrames() {
-        JsonNode pong = mapper.readTree(frames.pong());
+        JsonNode pong = JsonUtils.toJsonNode(frames.pong());
         assertEquals("pong", pong.path("type").asString());
         assertTrue(pong.path("ts").isNumber());
 
-        JsonNode read = mapper.readTree(frames.read("s:alice:bob", 12));
+        JsonNode read = JsonUtils.toJsonNode(frames.read("s:alice:bob", 12));
         assertEquals("msg.read", read.path("type").asString());
         assertEquals("s:alice:bob", read.path("conversationId").asString());
         assertEquals(12, read.path("seq").asLong());
@@ -222,14 +221,14 @@ class FramesTest {
     @Test
     @DisplayName("typing 上行：空字段不下发，typing 是布尔而不是字符串")
     void typingFrame() {
-        JsonNode node = mapper.readTree(frames.typing("s:alice:bob", null, null, true));
+        JsonNode node = JsonUtils.toJsonNode(frames.typing("s:alice:bob", null, null, true));
         assertEquals("typing", node.path("type").asString());
         assertEquals("s:alice:bob", node.path("conversationId").asString());
         assertTrue(node.path("typing").isBoolean(), "typing 必须是布尔：服务端用 asBoolean 读");
         assertTrue(node.path("typing").asBoolean());
         assertFalse(node.has("to"), "给了会话就不该再带 to，两个都带只会让服务端多一次判定");
 
-        JsonNode stop = mapper.readTree(frames.typing(null, "bob", null, false));
+        JsonNode stop = JsonUtils.toJsonNode(frames.typing(null, "bob", null, false));
         assertEquals("bob", stop.path("to").asString());
         assertFalse(stop.path("typing").asBoolean(), "typing=false 必须如实编码，它是对方三个点熄灭的唯一信号");
         assertFalse(stop.has("conversationId"));
@@ -238,7 +237,7 @@ class FramesTest {
     @Test
     @DisplayName("presence.get 上行：userIds 是数组")
     void presenceGetFrame() {
-        JsonNode node = mapper.readTree(frames.presenceGet(List.of("bob", "carol")));
+        JsonNode node = JsonUtils.toJsonNode(frames.presenceGet(List.of("bob", "carol")));
         assertEquals("presence.get", node.path("type").asString());
         assertTrue(node.path("userIds").isArray(), "字符串会被服务端当成「一个人一个字符」");
         assertEquals(2, node.path("userIds").size());

@@ -2,6 +2,7 @@ package com.github.im.server.push;
 
 import com.github.im.contract.VendorPushPort;
 import com.github.im.contract.VendorPushRequest;
+import com.github.im.server.utils.JsonUtils;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -55,18 +56,15 @@ public class HttpVendorPush implements VendorPushPort {
 
     private static final Logger log = LoggerFactory.getLogger(HttpVendorPush.class);
 
-    private final ObjectMapper objectMapper;
     private final HttpClient client;
     private final String endpoint;
     private final String token;
     private final Duration timeout;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 
-    public HttpVendorPush(ObjectMapper objectMapper,
-                          @Value("${im.vendor-push.endpoint:}") String endpoint,
+    public HttpVendorPush(@Value("${im.vendor-push.endpoint:}") String endpoint,
                           @Value("${im.vendor-push.token:}") String token,
                           @Value("${im.vendor-push.timeout:3s}") Duration timeout) {
-        this.objectMapper = objectMapper;
         this.endpoint = endpoint;
         this.token = token;
         this.timeout = timeout;
@@ -102,7 +100,7 @@ public class HttpVendorPush implements VendorPushPort {
             HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(endpoint))
                     .timeout(timeout)
                     .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(payload)));
+                    .POST(HttpRequest.BodyPublishers.ofString(JsonUtils.toJson(payload)));
             if (token != null && !token.isBlank()) {
                 builder.header("Authorization", "Bearer " + token);
             }

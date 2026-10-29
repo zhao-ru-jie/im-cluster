@@ -1,10 +1,10 @@
 package com.github.im.gateway.transport;
 
+import com.github.im.gateway.utils.JsonUtils;
 import com.github.im.proto.ingress.v1.DeliveredAck;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.JsonNode;
-import tools.jackson.databind.ObjectMapper;
 
 import java.util.List;
 
@@ -29,7 +29,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class SessionLifecycleFrameParsingTest {
 
-    private final ObjectMapper mapper = new ObjectMapper();
 
     @Test
     @DisplayName("msg.read：conversationId + seq 解析成已读位置")
@@ -168,6 +167,6 @@ class SessionLifecycleFrameParsingTest {
     }
 
     private JsonNode parse(String json) {
-        return mapper.readTree(json);
+        return JsonUtils.toJsonNode(json);
     }
 }
