@@ -147,6 +147,14 @@ public class ConversationStore {
     private final Duration listTtl;
     private final int fanoutLimit;
 
+    /**
+     * 单批查多少人的已读位置。
+     *
+     * <p>群上限 5000 人，一批 500 意味着最多 10 次流水线；单批再大就会让 Cluster 下某一节点
+     * 一次收几千条命令，反而把延迟抖动放大到其它业务的头上。
+     */
+    private static final int READ_SEQ_BATCH = 500;
+
     public ConversationStore(StringRedisTemplate redis,
                              @Value("${im.conversation.list-ttl:30d}") Duration listTtl,
                              @Value("${im.conversation.fanout-limit:1000}") int fanoutLimit) {
@@ -407,6 +415,40 @@ public class ConversationStore {
         Map<String, Long> result = new LinkedHashMap<>(ids.size());
         for (int i = 0; i < ids.size(); i++) {
             result.put(ids.get(i), parseLong(raw.get(i), 0L));
+        }
+        return result;
+    }
+
+    /**
+     * 批量读「同一个会话、多个用户」的已读位置（群已读聚合用）。
+     *
+     * <p>这是 {@link #readSeqs(String, Collection)} 的<b>转置</b>：那个是「一个人看多个会话」，
+     * 这个是「一个会话看多个人」。两者没法共用一次 pipeline——前者的 key 是同一个 Hash 的多个
+     * field，后者的 key 是每个人的 Hash（{@code im:user:{u}:read}）。逐人 {@code HGET} 在万人群里
+     * 就是一万次往返，所以这里按批 pipeline。
+     *
+     * <p>不同用户的 key 落在不同 slot（hash tag 是 {@code {userId}}），Cluster 下由客户端按节点分组；
+     * 因此这里显式<b>分批</b>（{@link #READ_SEQ_BATCH}），避免一次流水线把几千条命令压到单个节点。
+     *
+     * @return userId → 该会话的已读 seq；从未上报过的人是 {@code 0}（与 {@link #readSeq} 一致）
+     */
+    public Map<String, Long> readSeqsOf(String conversationId, Collection<String> userIds) {
+        List<String> ids = List.copyOf(new LinkedHashSet<>(userIds));
+        if (ids.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, Long> result = new LinkedHashMap<>(ids.size());
+        for (int from = 0; from < ids.size(); from += READ_SEQ_BATCH) {
+            List<String> batch = ids.subList(from, Math.min(from + READ_SEQ_BATCH, ids.size()));
+            List<Object> raw = redis.executePipelined((RedisCallback<Object>) connection -> {
+                for (String userId : batch) {
+                    connection.hashCommands().hGet(key(readKey(userId)), bytes(conversationId));
+                }
+                return null;
+            });
+            for (int i = 0; i < batch.size(); i++) {
+                result.put(batch.get(i), parseLong(raw.get(i), 0L));
+            }
         }
         return result;
     }

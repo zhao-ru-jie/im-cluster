@@ -12,6 +12,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -241,6 +242,31 @@ class ConversationStoreTest {
         assertEquals(0, store.readSeqs(userId, List.of(a, b)).get(b));
         assertEquals(20, store.metas(List.of(a, b)).get(b).lastSeq());
         assertEquals("GROUP", store.metas(List.of(a, b)).get(b).type());
+    }
+
+    @Test
+    @DisplayName("批量读同一会话里多个人的已读位置（群已读聚合的转置查询）")
+    void batchReadsCoverAllMembersInOneConversation() {
+        ConversationStore store = store();
+        String alice = newUser();
+        String bob = newUser();
+        String carol = newUser();
+        // 一个从没读过的人
+        String dave = newUser();
+        String groupConversation = newConversation();
+        store.updateMeta(groupConversation, "GROUP", 100, 1000, "alice", "hi", "m100");
+        store.markRead(alice, groupConversation, 100, 100);
+        store.markRead(bob, groupConversation, 40, 100);
+
+        Map<String, Long> readSeqs = store.readSeqsOf(groupConversation,
+                List.of(alice, bob, carol, dave, alice));
+
+        assertEquals(100, readSeqs.get(alice));
+        assertEquals(40, readSeqs.get(bob));
+        assertEquals(0, readSeqs.get(carol), "没上报过的成员必须是 0，不能缺席");
+        assertEquals(0, readSeqs.get(dave));
+        assertEquals(4, readSeqs.size(), "重复的 userId 要去重");
+        assertTrue(store.readSeqsOf(groupConversation, List.of()).isEmpty());
     }
 
     @Test

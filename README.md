@@ -327,11 +327,41 @@ TCP      : IdleStateHandler(按原始字节计时) → LengthFieldBasedFrameDeco
 - `msg.recv` **必须攒批**（几条或 50~100ms 一次），逐条 ACK 会把「消息数」放大成「RPC 数」；
   服务端按会话取 max，重复上报无害。
 - 已送达 / 已读回执**只推单聊**：群聊的「已读」是按人统计的集合，扇出是「成员数 × 消息数」，
-  属于另一个模型（群已读聚合），塞进单点回执只会得到一条没人能解释清楚的帧。
+  所以群里不发逐条回执帧；群的「谁读了 / 还有几人没读」改为**按需聚合**
+  （`GET /conv/{conversationId}/read-stat`，见下一节的「群已读聚合」）。
 - 回执**只前进**：进程内按 `会话 + 状态` 去重，重复上报不会让对端收到一串相同帧；
   推送失败也不重试——下一条消息会带更大的 `seq` 把对端显示自愈。
 - 端到端 ACK 会**抬高补发起点**（`max(锚点, 设备游标+1, 客户端水位+1)`），
   所以确认过的消息不会再被补发一遍；ACK 不是指标，它改变投递行为。
+
+#### 群已读聚合：谁读了、还有几人没读
+
+群里没有逐条回执帧（理由见上），所以「已读人数」是**按需聚合**出来的：
+
+```
+GET /conv/g:{groupId}/read-stat?userId=alice&seq=100&limit=100
+→ {"code":0,"convType":"GROUP","seq":100,"viewerReadSeq":100,
+   "total":3,"readCount":2,"unreadCount":1,"truncated":false,
+   "members":[{"userId":"carol","readSeq":120,"read":true},
+              {"userId":"bob","readSeq":100,"read":true},
+              {"userId":"dave","readSeq":40,"read":false}]}
+```
+
+- **数据源是现成的**：每人的 `im:user:read:{userId}` 里已经有 `conversationId -> seq`，
+  聚合 = 群成员列表 + 一次批量 `HGET`（pipeline 分批 500，万人群 10 批）。
+  **没有新增 key、没有新增写放大**，也没多出第二份会不一致的真相；
+- **分母不含该消息的发送者**：「已读 3/3」比「已读 4/4」有用。发送者靠 `seq` 反查消息得到；
+  消息已被裁剪（Redis 形态只留最近 1000 条）时不排除——宁可分母大一号，也不要因为历史缺失
+  把整条消息的已读状态变空；
+- **计数全量、名单可截断**：`limit` 只影响 `members`（默认 100、上限 500），
+  `readCount + unreadCount == total` 在任何 limit 下都成立；`members` 已读在前、
+  按 `readSeq` 倒序（刚读完的靠前），客户端不用再排；
+- **短 TTL 快照缓存**：`im.read-stat.cache-ttl`（默认 `2s`）缓存的是「成员 + 各自 readSeq」，
+  与 seq 无关，所以滑一屏问十几条消息只打一次存储；代价是最多 2 秒滞后。
+  例外：**调用者自己的已读位置永远取实时值**——「我刚读完却显示未读」是最刺眼的错；
+- **必须是会话参与者**：群聊要求是群成员（`SISMEMBER`），单聊要求 `userId` 属于 `s:a:b`。
+  已读名单本身就是隐私（谁在潜水、谁多久没打开），不能任人查；
+- 单聊也能查，但单聊已有实时 `msg.state`，这个接口主要为群聊服务。
 
 #### 消息生命周期：撤回与删除
 
@@ -623,6 +653,7 @@ message accepted: traceId=trace-e2e-0001 conv=s:alice:bob seq=13 msgId=01a166bb-
 ```
 GET  /conv?userId=alice&limit=50                        会话列表，置顶优先，其次按最后消息时间倒序，带 unread/pinned/muted
 POST /conv/{conversationId}/read?userId=alice&seq=100    上报已读（只前进，服务端 cap 到 lastSeq）
+GET  /conv/{conversationId}/read-stat?userId=alice&seq=100   群已读聚合：谁读了 / 还有几人没读（见「群已读聚合」）
 POST /conv/{conversationId}/flag?userId=alice&pinned=true            置顶（不改免打扰）
 POST /conv/{conversationId}/flag?userId=alice&muted=false            取消免打扰（不改置顶）
 ```
@@ -1319,6 +1350,7 @@ kubectl apply -f k8s/im-node.yaml     # 或 im-gateway.yaml + im-server.yaml（�
 | `im.watermark.ttl` | `IM_WATERMARK_TTL` | `30d` | 客户端消费水位保留时长（delivered 对账数据） |
 | `im.conversation.list-ttl` | `IM_CONVERSATION_LIST_TTL` | `30d` | 会话列表 / 已读位置保留时长（长期无消息自然消失） |
 | `im.conversation.fanout-limit` | `IM_CONVERSATION_FANOUT_LIMIT` | `1000` | 会话列表写扩散的人数上限，超过则只更新元信息（靠群反查表补齐） |
+| `im.read-stat.cache-ttl` | — | `2s` | 群已读聚合的成员快照缓存时长；`0` 关闭（每次聚合都查存储） |
 | `im.node.grpc-port` / `grpc-host` | `IM_GRPC_PORT` / `IM_GRPC_HOST` | `9090` / 自动探测 | 实例 ID |
 | `im.node.grpc.tls.enabled` / `trust-cert` | `IM_GRPC_TLS` / `IM_GRPC_TRUST` | `false` / 空 | gRPC TLS |
 | `im.node.grpc.health-check-enabled` | `IM_GRPC_HEALTH_CHECK` | `true` | 客户端健康检查（排除 NOT_SERVING 实例） |
@@ -1420,6 +1452,7 @@ im-cluster/
 │   ├── message/OfflineMessageStore.java      # 离线消息
 │   ├── message/ClientFrames.java             # 下行 msg.push / msg.state 帧序列化（实时与历史同构）
 │   ├── message/MessageStateNotifier.java     # 状态回执：把 delivered/read 推回发送方（仅单聊）
+│   ├── message/MessageReadStatService.java   # 群已读聚合：谁读了/还有几人没读（按需算，不落库）
 │   ├── message/MessageUpdateNotifier.java    # 变更事件：撤回广播全会话、删除只推操作者自己的端
 │   ├── message/MessageDigests.java           # 会话摘要与媒体占位符（列表与通知共用同一份文案）
 │   ├── push/HttpVendorPush.java              # 厂商推送（离线通知）：HTTP 中转，默认关闭
@@ -1514,9 +1547,11 @@ im-cluster/
   所以回答不了「这个人被多少人拒绝过」；需要这类画像时得另建事件表。
   申请通知也只走在线推送：收件人不在线时那条 `relation.request` 会随 TTL 丢弃，
   对方下次打开「新的朋友」靠 `/relation/{userId}/requests` 兜底（不是永久的离线未读）。
-- **状态回执只覆盖单聊**：`msg.state`（DELIVERED / READ）不推群聊。群里的「已读」是
-  「谁读到第几号」的集合，要对前缀内每个发送者分发，扇出是「成员数 × 消息数」，
-  得先有群已读的聚合视图（已读/未读人数）才谈得上正确。当前的群聊消息仍可查水位，只是不发帧。
+- **群聊没有实时已读回执，只有按需聚合**：`msg.state`（DELIVERED / READ）不推群聊，
+  群的「谁读了 / 还有几人没读」走 `GET /conv/{conversationId}/read-stat`（见「群已读聚合」）。
+  所以群里的已读人数<b>不会</b>像单聊那样随对方阅读即时跳到气泡上——客户端要在打开详情
+  或定时刷新时拉一次。要做成 Telegram 那种实时跳动，得在写路径上维护「每条消息的已读集合」
+  （Bitmap/Set），那是另一套写放大模型，与「未读游标相减」的现设计互斥。
 - **富媒体只传 URL，不传字节**：`attrs.url` 指向对象存储，上传/下载/鉴权/清理都不在本项目范围内
   （也没有内置上传接口）。服务端不校验 URL 是否可达——那是接入方与存储之间的事。
 - **`contentType` / `attrs` 需要库表同步升级**：老库升级要手工执行 `schema.sql` 头部注释里的
