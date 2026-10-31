@@ -174,15 +174,17 @@ class GroupEventNotifierTest {
     @Test
     @DisplayName("过期键会被回收：去重表规模只跟窗口内的动作数相关")
     void staleKeysArePruned() throws Exception {
-        // 窗口放大到 200ms，造数据期间不会有键过期，计数才是确定的
-        GroupEventNotifier notifier = notifier(200, 8);
+        // 窗口放到 1s：造数据期间不会有键过期，计数才是确定的。
+        // 200ms 不够——首次调用要加载类，10 次写完已经超过一个窗口，
+        // 于是前几条在循环里就被 pruneIfDue 回收，断言变成 9（与去重逻辑无关）。
+        GroupEventNotifier notifier = notifier(1_000, 8);
 
         for (int i = 0; i < 10; i++) {
             notifier.notifyChange("g1", ClientFrames.GROUP_MUTED, "alice", "u" + i, List.of("alice"));
         }
         assertEquals(10, notifier.tracked(), "没过期的键一条都不能丢，否则重试会重复提示");
 
-        TimeUnit.MILLISECONDS.sleep(300);
+        TimeUnit.MILLISECONDS.sleep(1_200);
 
         // 这一条顶过水位、且距上次清理已超过窗口 → 触发回收
         notifier.notifyChange("g1", ClientFrames.GROUP_MUTED, "alice", "fresh", List.of("alice"));

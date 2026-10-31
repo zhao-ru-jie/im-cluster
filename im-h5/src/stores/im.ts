@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia';
 import { ApiError } from '@/api/http';
-import { ConvApi, sendViaRest } from '@/api/rest';
+import { ConvApi, ReadStatApi, sendViaRest } from '@/api/rest';
 import { imSocket, type SocketState } from '@/api/ws';
 import { cacheConversations, cacheMessages, cachedConversations, cachedMessages, deleteCachedMessage } from '@/core/db';
 import { digestOf, groupConversationId, singleConversationId } from '@/core/format';
@@ -13,10 +13,12 @@ import type {
   ConvUpdateFrame,
   DownlinkFrame,
   ErrorFrame,
+  GroupUpdateFrame,
   MsgAckFrame,
   MsgPushFrame,
   MsgStateFrame,
   MsgUpdateFrame,
+  ReadStatItem,
   SessionKickFrame,
   SessionLoginFrame,
   SessionMigrateFrame,
@@ -78,7 +80,9 @@ export const useImStore = defineStore('im', {
     loadingHistory: false,
     typing: {} as Record<string, { userId: string; at: number }>,
     /** conversationId -> userId -> 该用户确认到的最大 seq */
-    watermarks: {} as Record<string, Record<string, { delivered: number; read: number }>>
+    watermarks: {} as Record<string, Record<string, { delivered: number; read: number }>>,
+    /** `conversationId#seq` -> 群已读聚合快照（按 seq 缓存：同一条消息反复点只查一次） */
+    readStats: {} as Record<string, ReadStatItem>
   }),
 
   getters: {
@@ -98,7 +102,10 @@ export const useImStore = defineStore('im', {
     lastSeqOf: (state) => (conversationId: string): number => {
       const list = state.messages[conversationId] ?? [];
       return list.reduce((max, msg) => (msg.seq > max ? msg.seq : max), 0);
-    }
+    },
+    /** 已拉过的群已读快照；seq=0 表示「最新一条」，执行 query 前拿不到，所以查不到就返回 undefined */
+    readStatOf: (state) => (conversationId: string, seq: number): ReadStatItem | undefined =>
+      state.readStats[`${conversationId}#${seq}`]
   },
 
   actions: {
@@ -241,9 +248,13 @@ export const useImStore = defineStore('im', {
           }, TYPING_TTL);
           break;
         }
-        case 'group.update':
+        case 'group.update': {
+          const update = frame as GroupUpdateFrame;
+          // 入群申请/审批这几类变更的做法与「改群名」不同，交给 contact store 分流
+          useContactStore().onGroupUpdate(update);
           void useContactStore().refreshAllGroups();
           break;
+        }
         case 'session.login': {
           const login = frame as SessionLoginFrame;
           const auth = useAuthStore();
@@ -781,6 +792,29 @@ export const useImStore = defineStore('im', {
         ConvApi.read(conversationId, auth.userId, maxSeq).catch(() => {
           /* 下次打开会话会再推进一次 */
         });
+      }
+    },
+
+    /**
+     * 拉一条消息的群已读聚合（`seq=0` = 会话最新一条）。
+     *
+     * <p>群里没有逐条回执帧（扇出是「成员数 × 消息数」），已读人数只能按需聚合；
+     * 服务端有 2 秒快照缓存，这里不再叠客户端缓存，只把结果按 seq 存一份给 UI 反复渲染。
+     */
+    async loadReadStat(conversationId: string, seq = 0): Promise<ReadStatItem | null> {
+      const auth = useAuthStore();
+      try {
+        const res = await ReadStatApi.stat(conversationId, auth.userId, seq);
+        if (res.code !== 0 || !res.conversationId) {
+          useUiStore().toast(res.message || '已读情况暂时查不到', 'error');
+          return null;
+        }
+        const stat = res as ReadStatItem;
+        this.readStats[`${conversationId}#${stat.seq}`] = stat;
+        return stat;
+      } catch (e) {
+        useUiStore().error((e as ApiError).message || '已读情况加载失败');
+        return null;
       }
     },
 

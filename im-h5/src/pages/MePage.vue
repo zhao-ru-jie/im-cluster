@@ -61,7 +61,15 @@ async function saveProfile(): Promise<void> {
 async function clearCache(): Promise<void> {
   if (!window.confirm('清空本地缓存的会话和消息？登录状态会保留。')) return;
   await clearAll();
-  ui.success('缓存已清空');
+  // 清完之后本机就是「新端」：显式要一次回放，否则要等用户逐条点开会话才有内容
+  im.requestReplay();
+  ui.success('缓存已清空，正在重新同步最近消息');
+}
+
+/** 手动要一次新端回放（服务端只在设备首次上线时自动回放） */
+function resync(): void {
+  im.requestReplay();
+  ui.success('已请求重新同步最近消息');
 }
 
 function logout(): void {
@@ -128,6 +136,13 @@ onMounted(() => {
             <div class="cell-main">
               <div class="cell-title"><span class="cell-title-text">退出其它设备</span></div>
               <div class="cell-sub">保留本机 {{ auth.deviceId }}</div>
+            </div>
+            <span class="cell-arrow" />
+          </button>
+          <button class="cell" @click="resync">
+            <div class="cell-main">
+              <div class="cell-title"><span class="cell-title-text">重新同步最近消息</span></div>
+              <div class="cell-sub">让服务端回放最近 M 个会话 × 每个最近 N 条</div>
             </div>
             <span class="cell-arrow" />
           </button>

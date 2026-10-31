@@ -95,6 +95,26 @@ public class ClientFrames {
     public static final String GROUP_UNMUTED = "UNMUTED";
     /** 群已解散 */
     public static final String GROUP_DISMISSED = "DISMISSED";
+    /**
+     * 有人提交入群申请。
+     *
+     * <p>接收方刻意<b>不是</b>全体成员：待审列表只有群主与管理员能看（{@code role.canManageGroup}），
+     * 推给所有人等于把「谁想进这个群」广播出去——那是隐私，不是公告。
+     * 申请人本人也在接收方里（他的其他端要看到「已提交」）。
+     */
+    public static final String GROUP_JOIN_REQUESTED = "JOIN_REQUESTED";
+    /** 入群申请被通过：申请人此刻才成为成员，必须显式并进接收方（他此前不在成员集合里） */
+    public static final String GROUP_JOIN_APPROVED = "JOIN_APPROVED";
+    /** 入群申请被拒绝（同上：申请人可能从来不是成员，退化成成员集合就会漏推） */
+    public static final String GROUP_JOIN_REJECTED = "JOIN_REJECTED";
+    /**
+     * 群主转让。
+     *
+     * <p>为什么不能复用 {@link #GROUP_ROLE_CHANGED}：转让同时改了群资料的 {@code owner_id}
+     * 与两个人的角色，客户端要据此重算「谁能解散群 / 谁能设管理员」这一整片菜单，
+     * 混进「设/撤管理员」会让它以为只是多了一个管理员。
+     */
+    public static final String GROUP_OWNER_TRANSFERRED = "OWNER_TRANSFERRED";
 
     /**
      * 「正在输入」状态（{@code typing.push}）。

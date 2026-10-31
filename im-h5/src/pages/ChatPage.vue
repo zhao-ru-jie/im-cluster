@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import ActionSheet from '@/components/ActionSheet.vue';
+import Avatar from '@/components/Avatar.vue';
 import ChatComposer from '@/components/ChatComposer.vue';
 import MessageBubble from '@/components/MessageBubble.vue';
 import NavBar from '@/components/NavBar.vue';
@@ -12,7 +13,7 @@ import { useContactStore } from '@/stores/contact';
 import { useImStore } from '@/stores/im';
 import { useUiStore } from '@/stores/ui';
 import type { ChatMessage } from '@/types/local';
-import type { ConvType } from '@/types/protocol';
+import type { ConvType, ReadStatItem } from '@/types/protocol';
 
 const route = useRoute();
 const router = useRouter();
@@ -24,8 +25,10 @@ const ui = useUiStore();
 const bodyRef = ref<HTMLElement | null>(null);
 const preview = ref('');
 const sheetOpen = ref(false);
-const groupOpen = ref(false);
 const selected = ref<ChatMessage | null>(null);
+/** 群消息的已读聚合：群里没有逐条回执帧，点一次查一次 */
+const readStat = ref<ReadStatItem | null>(null);
+const readStatOpen = ref(false);
 
 const conversationId = computed(() => String(route.params.conversationId ?? ''));
 const convType = computed<ConvType>(() => {
@@ -40,7 +43,6 @@ const peer = computed(() =>
     : peerOfConversation(conversationId.value, auth.userId)
 );
 const messages = computed(() => im.messagesOf(conversationId.value));
-const group = computed(() => contact.groupOf(peer.value));
 
 const title = computed(() => {
   if (convType.value === 'GROUP') return contact.groupNameOf(conversationId.value);
@@ -76,6 +78,8 @@ const sheetActions = computed(() => {
   const list: Array<{ key: string; label: string; danger?: boolean }> = [];
   if (message.contentType === 'TEXT' && message.body) list.push({ key: 'copy', label: '复制' });
   if (message.from === auth.userId && message.seq > 0 && !message.recalled) {
+    // 群聊的已读只能按需聚合（扇出是「成员数 × 消息数」，服务端不推逐条回执）
+    if (convType.value === 'GROUP') list.push({ key: 'read', label: '已读情况' });
     list.push({ key: 'recall', label: '撤回' });
   }
   list.push({ key: 'delete', label: '删除', danger: true });
@@ -145,6 +149,11 @@ async function onSheetSelect(key: string): Promise<void> {
     }
     return;
   }
+  if (key === 'read') {
+    readStat.value = await im.loadReadStat(conversationId.value, message.seq);
+    if (readStat.value) readStatOpen.value = true;
+    return;
+  }
   if (key === 'recall') {
     await im.recall(message);
     return;
@@ -197,11 +206,9 @@ function onVisibility(): void {
   if (document.visibilityState === 'visible') im.markRead(conversationId.value);
 }
 
-async function leaveGroup(): Promise<void> {
-  groupOpen.value = false;
-  if (!window.confirm('退出后不再接收该群消息，确定退出？')) return;
-  await contact.leaveGroup(peer.value);
-  void router.replace('/conversations');
+/** 群资料 / 成员 / 邀请码 / 入群审批都在群详情页，聊天页只留一个入口 */
+function openGroupDetail(): void {
+  void router.push({ name: 'group', params: { groupId: peer.value } });
 }
 
 onMounted(() => {
@@ -226,7 +233,7 @@ watch(conversationId, () => {
   <div class="page">
     <NavBar :title="titleText" :subtitle="subtitle" :title-muted="!!typingText" solid>
       <template #right>
-        <button v-if="convType === 'GROUP'" class="nav-side-btn" @click="groupOpen = true">详情</button>
+        <button v-if="convType === 'GROUP'" class="nav-side-btn" @click="openGroupDetail">详情</button>
       </template>
     </NavBar>
 
@@ -264,17 +271,30 @@ watch(conversationId, () => {
 
     <ActionSheet :visible="sheetOpen" :actions="sheetActions" @select="onSheetSelect" @close="sheetOpen = false" />
 
-    <div v-if="groupOpen" class="sheet-mask" @click.self="groupOpen = false">
+    <div v-if="readStatOpen && readStat" class="sheet-mask" @click.self="readStatOpen = false">
       <div class="sheet">
         <div class="group-card">
-          <div class="cell-title">{{ title }}</div>
-          <div class="small muted group-line">{{ group?.announcement || '暂无群公告' }}</div>
-          <div class="small muted group-line">{{ subtitle }}</div>
+          <div class="cell-title">
+            已读 {{ readStat.readCount }}/{{ readStat.total }}
+            <span class="small muted">（第 {{ readStat.seq }} 条）</span>
+          </div>
+          <div class="small muted group-line">
+            {{ readStat.unreadCount }} 人未读{{ readStat.truncated ? ` · 明细只显示前 ${readStat.members.length} 人` : '' }}
+          </div>
         </div>
-        <div class="sheet-actions">
-          <button class="sheet-action danger" @click="leaveGroup">退出群聊</button>
+        <div class="read-list">
+          <div v-for="member in readStat.members" :key="member.userId" class="read-row">
+            <Avatar
+              :user-id="member.userId"
+              :name="contact.displayName(member.userId)"
+              :src="contact.avatarOf(member.userId)"
+              :size="28"
+            />
+            <span class="read-name">{{ contact.displayName(member.userId) }}</span>
+            <span class="tag" :class="{ green: member.read }">{{ member.read ? '已读' : '未读' }}</span>
+          </div>
         </div>
-        <button class="sheet-cancel" @click="groupOpen = false">取消</button>
+        <button class="sheet-cancel" @click="readStatOpen = false">关闭</button>
       </div>
     </div>
 
@@ -302,5 +322,35 @@ watch(conversationId, () => {
 .group-line {
   margin-top: 6px;
   line-height: 1.5;
+}
+
+.read-list {
+  max-height: 46vh;
+  overflow-y: auto;
+  margin: 0 8px;
+  background: #fff;
+  border-radius: 12px;
+}
+
+.read-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--c-line, #f0f0f0);
+  color: var(--c-text);
+}
+
+.read-row:last-child {
+  border-bottom: none;
+}
+
+.read-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
 }
 </style>

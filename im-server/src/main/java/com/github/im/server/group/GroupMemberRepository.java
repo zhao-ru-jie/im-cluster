@@ -1,6 +1,9 @@
 package com.github.im.server.group;
 
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -32,6 +35,61 @@ public interface GroupMemberRepository {
      * 不允许退化成「投给群 ID」，否则会往离线队列塞进永远不会被拉取的数据。
      */
     List<String> membersOf(String groupId);
+
+    /**
+     * 分页取群成员（成员列表接口用）。
+     *
+     * <p>为什么不能只靠 {@link #membersOf}：5000 人群的成员列表此前是「一次全量返回」，
+     * 客户端拿到 5000 条才切页——既浪费带宽，也让服务端每次都做一次 O(N) 序列化。
+     *
+     * <p><b>为什么按 userId 字典序</b>：offset 分页要求顺序稳定，否则翻页会重复/漏人。
+     * Redis 的 Set 本身无序，按 userId 排序是唯一不需要额外存储（不需要再维护一个
+     * 加入时间的有序结构）的稳定顺序。代价是「管理员不会自动排在第一页」——那需要
+     * 另一种「角色优先」的列表设计，不在这里混。
+     *
+     * @param offset 从 0 开始；负数按 0 处理
+     * @param limit  {@code <= 0} 表示「取到末尾」
+     */
+    default List<String> membersOf(String groupId, int offset, int limit) {
+        List<String> all = new ArrayList<>(membersOf(groupId));
+        all.sort(Comparator.naturalOrder());
+        int from = Math.max(offset, 0);
+        if (from >= all.size()) {
+            return List.of();
+        }
+        int to = limit <= 0 ? all.size() : (int) Math.min((long) from + limit, all.size());
+        return new ArrayList<>(all.subList(from, to));
+    }
+
+    /**
+     * 成员数。
+     *
+     * <p>存在理由是「拉人前要判人数上限」：那件事只需要一个数字，此前却要拉全量成员。
+     * 默认实现退回 {@link #membersOf}，Redis 实现覆盖成 {@code SCARD}（O(1)）。
+     */
+    default long memberCount(String groupId) {
+        return membersOf(groupId).size();
+    }
+
+    /**
+     * 批量取禁言到期时间（成员列表渲染用）。
+     *
+     * <p>默认实现逐个 {@link #mutedUntil}：N 个成员就是 N 次往返。5000 人群的成员列表此前
+     * 正是栽在这里——接口本身没分页，还叠加了 N+1 查询。Redis 实现覆盖成一次 {@code HGETALL}。
+     *
+     * @return userId → 仍在禁言期内的到期时间（已过期的不出现在结果里）
+     */
+    default Map<String, Long> mutesOf(String groupId) {
+        Map<String, Long> result = new LinkedHashMap<>();
+        long now = System.currentTimeMillis();
+        for (String userId : membersOf(groupId)) {
+            long until = mutedUntil(groupId, userId);
+            if (until > now) {
+                result.put(userId, until);
+            }
+        }
+        return result;
+    }
 
     /**
      * 某用户加入的群 ID 列表（反向索引：{@code userId -> groupId}）。
@@ -70,6 +128,31 @@ public interface GroupMemberRepository {
 
     /** 批量取角色（成员列表渲染用，避免逐人查询） */
     Map<String, GroupRole> rolesOf(String groupId);
+
+    /**
+     * 批量取<b>指定几个人的</b>角色（成员列表分页用）。
+     *
+     * <p>{@link #rolesOf(String)} 是「这个群的全部角色」，它内部要先拉全量成员再回填 MEMBER——
+     * 为了一页 50 个人去构造一张 5000 项的 map 是白费力气。这里只回答「这些人各是什么角色」。
+     *
+     * <p>默认实现逐个 {@link #roleOf}（N 次往返）；Redis 实现覆盖成一次 {@code HMGET}，
+     * 因为角色 Hash 里只有非 MEMBER 的条目（通常个位数）。
+     *
+     * @return 入参里那些<b>是成员</b>的人；非成员不会出现在结果里（与 {@link #roleOf} 的 null 语义一致）
+     */
+    default Map<String, GroupRole> rolesOf(String groupId, Collection<String> userIds) {
+        Map<String, GroupRole> result = new LinkedHashMap<>();
+        if (userIds == null) {
+            return result;
+        }
+        for (String userId : userIds) {
+            GroupRole role = roleOf(groupId, userId);
+            if (role != null) {
+                result.put(userId, role);
+            }
+        }
+        return result;
+    }
 
     /**
      * 单人禁言的到期时间。

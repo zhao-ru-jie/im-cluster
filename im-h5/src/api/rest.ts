@@ -5,9 +5,12 @@ import type {
   DeviceItem,
   FriendRequestItem,
   GroupInfo,
+  GroupInviteItem,
+  GroupJoinRequestItem,
   GroupRole,
   MsgPushFrame,
-  PresenceEntry
+  PresenceEntry,
+  ReadStatItem
 } from '@/types/protocol';
 
 /**
@@ -149,6 +152,157 @@ export const GroupApi = {
   },
   disband(groupId: string, operatorId: string): Promise<GroupMetaResponse> {
     return api('POST', withQuery(`/group/${encodeURIComponent(groupId)}/disband`, { operatorId }));
+  }
+};
+
+/* ---------------------------- 入群申请 / 邀请码 ---------------------------- */
+
+export interface JoinActionResponse {
+  code: number;
+  message?: string;
+  request?: GroupJoinRequestItem;
+}
+
+export interface PendingJoinsResponse {
+  code: number;
+  message?: string;
+  groupId: string;
+  total: number;
+  offset: number;
+  limit: number;
+  requests: GroupJoinRequestItem[];
+}
+
+export interface InvitesResponse {
+  code: number;
+  message?: string;
+  groupId: string;
+  /** 邀请链接前缀，服务端配置项决定（`im://group/join` / https 落地页） */
+  linkBase: string;
+  invites: GroupInviteItem[];
+}
+
+export interface InviteCreateResponse {
+  code: number;
+  message?: string;
+  invite: GroupInviteItem;
+  /** 直接给用户复制/生成二维码的完整链接 */
+  link: string;
+}
+
+export interface JoinByInviteResponse {
+  code: number;
+  message?: string;
+  groupId: string;
+  /** true = 这个码要审批，本次只是提交了申请，不是「已加入」 */
+  approvalPending: boolean;
+  group?: GroupInfo;
+}
+
+/**
+ * 扫码/点链接进来的唯一入口是「码」，没有独立的二维码接口。
+ *
+ * <p>不发 throwOnBizError:false 的那几个（提交申请、审批、生成码）：失败文案
+ * （「你已经是群成员」「码已过期」「只有群主或管理员可以审批」）就是要给用户看的。
+ */
+export const GroupJoinApi = {
+  /** 提交入群申请（需要审批的群；满员/已是成员会直接返回业务错误） */
+  request(groupId: string, userId: string, message = ''): Promise<JoinActionResponse> {
+    return api<JoinActionResponse>(
+      'POST',
+      withQuery(`/group/${encodeURIComponent(groupId)}/join-requests`, { userId, message })
+    );
+  },
+  /** 我在这群里的申请状态（没有申请过时服务端返回 404，按「无」处理） */
+  myRequest(groupId: string, userId: string): Promise<JoinActionResponse> {
+    return api<JoinActionResponse>(
+      'GET',
+      `/group/${encodeURIComponent(groupId)}/join-requests/${encodeURIComponent(userId)}`,
+      undefined,
+      { throwOnBizError: false }
+    );
+  },
+  /** 待审列表（仅群主/管理员；读接口抖动时降级成空列表，调用方按 code 判断） */
+  pending(groupId: string, operatorId: string, offset = 0, limit = 50): Promise<PendingJoinsResponse> {
+    return api<PendingJoinsResponse>(
+      'GET',
+      withQuery(`/group/${encodeURIComponent(groupId)}/join-requests`, { operatorId, offset, limit }),
+      undefined,
+      { throwOnBizError: false }
+    );
+  },
+  approve(groupId: string, applicantId: string, operatorId: string): Promise<GroupMetaResponse> {
+    return api<GroupMetaResponse>(
+      'POST',
+      withQuery(`/group/${encodeURIComponent(groupId)}/join-requests/${encodeURIComponent(applicantId)}/approve`, {
+        operatorId
+      })
+    );
+  },
+  reject(groupId: string, applicantId: string, operatorId: string): Promise<GroupMetaResponse> {
+    return api<GroupMetaResponse>(
+      'POST',
+      withQuery(`/group/${encodeURIComponent(groupId)}/join-requests/${encodeURIComponent(applicantId)}/reject`, {
+        operatorId
+      })
+    );
+  },
+  createInvite(
+    groupId: string,
+    operatorId: string,
+    options: { ttlHours?: number; maxUses?: number; approvalRequired?: boolean } = {}
+  ): Promise<InviteCreateResponse> {
+    return api<InviteCreateResponse>(
+      'POST',
+      withQuery(`/group/${encodeURIComponent(groupId)}/invites`, {
+        operatorId,
+        ttlHours: options.ttlHours ?? 0,
+        maxUses: options.maxUses ?? 0,
+        approvalRequired: options.approvalRequired ?? false
+      })
+    );
+  },
+  invites(groupId: string, operatorId: string): Promise<InvitesResponse> {
+    return api<InvitesResponse>(
+      'GET',
+      withQuery(`/group/${encodeURIComponent(groupId)}/invites`, { operatorId }),
+      undefined,
+      { throwOnBizError: false }
+    );
+  },
+  revokeInvite(groupId: string, code: string, operatorId: string): Promise<GroupMetaResponse & { code: number }> {
+    return api(
+      'DELETE',
+      withQuery(`/group/${encodeURIComponent(groupId)}/invites/${encodeURIComponent(code)}`, { operatorId })
+    );
+  },
+  /** 用邀请码加入（或提交申请，看返回的 approvalPending） */
+  join(userId: string, code: string): Promise<JoinByInviteResponse> {
+    return api<JoinByInviteResponse>('POST', withQuery('/group/join', { userId, code }));
+  }
+};
+
+/* ------------------------------- 群已读 ------------------------------- */
+
+export interface ReadStatResponse extends Partial<ReadStatItem> {
+  code: number;
+  message?: string;
+}
+
+export const ReadStatApi = {
+  /**
+   * 群聊已读聚合：`seq=0` 表示「最新一条」。
+   *
+   * <p>服务端有 2 秒快照缓存——滑动一屏连续问十几条只会打一次存储，
+   * 所以这里不需要客户端再压一层缓存。
+   */
+  stat(conversationId: string, userId: string, seq = 0, limit = 50): Promise<ReadStatResponse> {
+    return api<ReadStatResponse>(
+      'GET',
+      withQuery(`/conv/${encodeURIComponent(conversationId)}/read-stat`, { userId, seq, limit }),
+      undefined,
+      { throwOnBizError: false }
+    );
   }
 };
 

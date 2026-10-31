@@ -95,6 +95,18 @@ onMounted(async () => {
             <span class="cell-arrow" />
           </div>
         </div>
+        <div class="cell" @click="router.push('/join')">
+          <div class="new-friend-icon group-icon">＋</div>
+          <div class="cell-main">
+            <div class="cell-title">
+              <span class="cell-title-text">加入群聊</span>
+            </div>
+            <div class="cell-sub">用邀请码或邀请链接进群</div>
+          </div>
+          <div class="cell-extra">
+            <span class="cell-arrow" />
+          </div>
+        </div>
       </div>
 
       <div v-if="showAdd" class="field section">
@@ -204,5 +216,11 @@ onMounted(async () => {
   align-items: center;
   justify-content: center;
   font-size: 22px;
+}
+
+.group-icon {
+  background: #e8f1ff;
+  color: #5b8ff9;
+  font-weight: 600;
 }
 </style>

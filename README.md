@@ -709,7 +709,8 @@ POST /conv/{conversationId}/flag?userId=alice&muted=false            取消免�
 |---|---|---|
 | 会话 | `{conversationId}` | `im:conv:{c}:meta` / `:msgs` / `:seq` / `:recalled` / `:idem:{from}\|{msgId}` |
 | 用户 | `{userId}` | `im:user:{u}:convs` / `:read` / `:flags` / `:wm:{device}` / `:offline:*` / `:friends` … |
-| 群 | `{groupId}` | `im:group:{g}:members` |
+| 群 | `{groupId}` | `im:group:{g}:members` / `:roles` / `:mutes` / `:join-req` / `:invites` |
+| 邀请码 | `{code}` | `im:invite:{code}`（tag 用码：扫码时手里只有码，必须一次定位到群） |
 
 **这次改造修掉了一个真实缺陷**：改造前 `im:seq:{c}` 与 `im:idem:{from}|{msgId}` 都没有 tag，
 而 `SeqAllocator` 的「幂等查询 + 发号」合并脚本同时访问这两个 key —— 在 Redis Cluster 上
@@ -1034,6 +1035,67 @@ CREATE TABLE im_group_member (
 反查的用途是**大群会话列表的补齐**——群消息的会话列表是写扩散的，超过 `im.conversation.fanout-limit`
 会跳过写扩散，成员的列表只能靠反查在读时补出来。少了它，大群成员「明明在群里却看不到会话」。
 退群时两边必须一起摘，否则退群的人会一直看到那个群。
+
+#### 成员列表分页
+
+`GET /group/{id}/members?offset=0&limit=50` → `{total, offset, limit, size, hasMore, members[], roles{}, mutes{}}`。
+
+- **顺序是 userId 字典序**：offset 分页必须有一个稳定顺序，否则翻页会重复或漏人。Redis 的 Set
+  本身无序，按 userId 排序是唯一不需要额外存储（不必再维护一份「加入时间」有序结构）的稳定选择；
+  代价是「管理员不会自动排第一页」——那需要另一种「角色优先」的列表设计，不在这里混；
+- **`size` 是本页条数、`total` 是群人数**（旧版 `size` 就是总人数，这是本次唯一的行为变更）；
+- **每页只查这一页的人**：`rolesOf(groupId, userIds)` 一次 `HMGET`、`mutesOf(groupId)` 一次 `HGETALL`。
+  此前成员列表是「全量成员 + 逐个 `mutedUntil`」，5000 人群 = 5000 次往返 + 一份 5000 项响应；
+- 群详情 `GET /group/{id}` 仍是全量视图（管理面板一次拿全），但不再 N+1 查禁言。
+
+#### 入群的三条路
+
+| 路径 | 谁可以 | 门槛 |
+|---|---|---|
+| 成员直接拉人 `POST /group/{id}/members` | 任何成员 | 无（熟人场景） |
+| 入群申请 `POST /group/{id}/join-requests` | 任何非成员 | 群主 / 管理员审批 |
+| 邀请码 / 链接 / 二维码 `POST /group/join?code=` | 拿到码的人 | 由码的 `approvalRequired` 决定 |
+
+申请：
+
+```
+POST /group/{groupId}/join-requests?userId=bob&message=想进群        提交（幂等：一人一条，不刷新首次申请时间）
+GET  /group/{groupId}/join-requests?operatorId=alice&offset=0&limit=50  待审列表（群主/管理员，分页）
+POST /group/{groupId}/join-requests/bob/approve?operatorId=alice     通过 → 加成员 + JOIN_APPROVED
+POST /group/{groupId}/join-requests/bob/reject?operatorId=alice      拒绝 → 留 REJECTED，只推申请人
+GET  /group/{groupId}/join-requests/bob                              申请人查自己的状态
+```
+
+- 满员时申请直接 413：不给人留一条永远处理不了的申请；
+- 待审列表是隐私（谁想进这个群），只有 `canManageGroup` 能看；申请事件也只推**审批人 + 申请人**，
+  不是群成员集合；
+- 终态重复处理返回 404：多个管理员同时看列表是常态，谁点慢一步都会撞上同一个申请。
+
+邀请码（二维码就是这条链接的图形化，服务端只为「码」建模，不建第二张表）：
+
+```
+POST   /group/{groupId}/invites?operatorId=&ttlHours=168&maxUses=0&approvalRequired=false
+GET    /group/{groupId}/invites?operatorId=               当前有效码（含 linkBase，客户端据此拼链接/画码）
+DELETE /group/{groupId}/invites/{code}?operatorId=        吊销
+POST   /group/join?userId=carol&code=xxxx                 用码加入（approvalPending=true 表示只提交了申请）
+```
+
+- `code` 是 10 位随机串，**不复用 `groupId`**：链接会被转发到群外，用群 ID 当邀请码等于把不可枚举的群 ID 公开；
+- `maxUses` 的校验与自增在**同一段 Lua** 里：走「读-判-写」的话，并发扫码会让 `maxUses=1` 的链接放进两个人；
+- **普通成员建的码强制 `approvalRequired=true`**：否则任何成员都能生成一条「点一下就进人」的链接，
+  等于绕过管理员。群主/管理员建的码可以按参数决定是否直接入群；
+- 已在群里的人用码 → 幂等成功且**不消耗**次数（先查成员身份，再原子取用）。
+
+#### 转让群主
+
+`POST /group/{groupId}/owner/{targetId}?operatorId=`：新群主 OWNER、原群主降 **ADMIN**、群资料 `owner_id` 同步。
+
+- 这是唯一需要改两处（群资料 + 两个成员角色）的动作，所以它不能混进 `POST /roles/{id}?role=OWNER`
+  ——那个接口至今拒绝 OWNER，就是为了让「谁是群主」只有一个入口；
+- **写入顺序是先给后降**：先给新群主 OWNER → 改群资料 → 最后降原群主。中途失败最坏剩两个 OWNER
+  （任一方可再转让，自愈）；反过来最坏是零个 OWNER，那意味着群永久无主、不可恢复；
+- 原群主降 ADMIN 而不是 MEMBER：转让通常发生在「退居二线」，直接降成普通成员会让他瞬间失去管理能力；
+- 转让解锁了「原群主退群」——此前这条路是 409（群不能没有主）。
 
 **扇出成本与两步优化**。一条群消息 =「按人查在线路由」+「按实例 gRPC 下发」。5000 人群若逐个
 `SMEMBERS` 查路由，就是 5000 次串行往返（1~2.5s），这是群消息延迟的全部来源：
@@ -1403,6 +1465,9 @@ kubectl apply -f k8s/im-node.yaml     # 或 im-gateway.yaml + im-server.yaml（�
 | `im.replay.per-conversation` | — | `20` | 每个会话回放多少条 |
 | `im.replay.max-frames` | — | `300` | 一轮回放的帧总数上限；超出部分报 `replay_truncated` |
 | `im.replay.marker-ttl` | — | `30d` | 「这台设备已回放过」标记的 TTL；过期后下次上线会再回放一次（客户端去重） |
+| `im.group.join-request-ttl` | — | `7d` | 待审入群申请的存活时长；过期自然消失，审批列表不会堆积 |
+| `im.group.invite-ttl` | — | `30d` | 邀请码的兜底上限（`expiresAt=0` 的长期码也不会永久存在） |
+| `im.group.invite-link` | — | `im://group/join?code=` | 邀请链接前缀；客户端拿它拼链接、生成二维码 |
 | `im.node.grpc-port` / `grpc-host` | `IM_GRPC_PORT` / `IM_GRPC_HOST` | `9090` / 自动探测 | 实例 ID |
 | `im.node.grpc.tls.enabled` / `trust-cert` | `IM_GRPC_TLS` / `IM_GRPC_TRUST` | `false` / 空 | gRPC TLS |
 | `im.node.grpc.health-check-enabled` | `IM_GRPC_HEALTH_CHECK` | `true` | 客户端健康检查（排除 NOT_SERVING 实例） |
@@ -1426,6 +1491,10 @@ kubectl apply -f k8s/im-node.yaml     # 或 im-gateway.yaml + im-server.yaml（�
 | `im:seq:{conversationId}` | IM 服务 | IM 服务 |
 | `im:idem:{from}\|{clientMsgId}` | IM 服务 | IM 服务 |
 | `im:group:members:{groupId}` | IM 服务（`im.storage=redis`） | IM 服务（群聊扇出） |
+| `im:group:{groupId}:roles` / `:mutes` | IM 服务 | IM 服务（角色与禁言；roles 只存非 MEMBER） |
+| `im:group:{groupId}:join-req` (Hash) | IM 服务 | IM 服务（待审入群申请，默认 7d TTL） |
+| `im:group:{groupId}:invites` (Set) | IM 服务 | IM 服务（该群放出去的邀请码，只做列出/吊销索引） |
+| `im:invite:{code}` (Hash) | IM 服务 | IM 服务（邀请码本体；`uses` 由 Lua 原子自增） |
 | `im:group:user:{userId}` (SET) | IM 服务（`im.storage=redis`） | IM 服务（反查「我加入了哪些群」，大群会话列表补齐） |
 | `im:conv:meta:{convId}` (Hash) | IM 服务 | IM 服务（会话元信息：last_seq / last_time / 最后一条摘要） |
 | `im:user:convs:{userId}` (ZSet) | IM 服务 | IM 服务（会话列表，score = 最后消息时间） |
@@ -1510,6 +1579,7 @@ im-cluster/
 │   ├── message/MessageUpdateNotifier.java    # 变更事件：撤回广播全会话、删除只推操作者自己的端
 │   ├── message/MessageDigests.java           # 会话摘要与媒体占位符（列表与通知共用同一份文案）
 │   ├── push/HttpVendorPush.java              # 厂商推送（离线通知）：HTTP 中转，默认关闭
+│   ├── group/GroupJoinStore.java             # 入群申请 + 邀请码端口（短生命周期状态，只落 Redis）
 │   ├── group/GroupMemberRepository.java      # 群成员端口（实现见 im-storage-*）
 │   ├── relation/MessageAcl.java              # 投递前准入：群成员 + 黑名单 + 可选好友（三档开关）
 │   ├── relation/RelationRepository.java      # 关系链端口（好友双向 / 黑名单单向）

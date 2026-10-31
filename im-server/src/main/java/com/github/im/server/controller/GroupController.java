@@ -23,18 +23,21 @@ import java.util.Optional;
  * <pre>
  * POST   /group?ownerId=alice&name=销售群                    建群（返回不可枚举的 groupId）
  * GET    /group/{groupId}                                    群详情（成员 + 角色 + 禁言）
- * GET    /group/{groupId}/members                            成员列表（含角色、禁言）
+ * GET    /group/{groupId}/members?offset=0&limit=50          成员列表（分页；total/hasMore）
  * POST   /group/{groupId}/rename?operatorId=&name=           改名（仅群主）
  * POST   /group/{groupId}/announcement?operatorId=&text=     公告（群主/管理员）
  * POST   /group/{groupId}/mute-all?operatorId=&muted=true    全员禁言（群主/管理员）
  * POST   /group/{groupId}/max-members?operatorId=&max=500    人数上限（仅群主）
  * POST   /group/{groupId}/members?operatorId=                拉人（body: ["bob","carol"]）
  * DELETE /group/{groupId}/members/{targetId}?operatorId=     踢人（角色需严格高于对方）
- * POST   /group/{groupId}/leave?userId=                      退群（群主 409）
+ * POST   /group/{groupId}/leave?userId=                      退群（群主 409：先转让或解散）
  * POST   /group/{groupId}/roles/{targetId}?operatorId=&role=ADMIN   设/撤管理员（仅群主）
+ * POST   /group/{groupId}/owner/{targetId}?operatorId=       转让群主（仅群主；原群主降为管理员）
  * POST   /group/{groupId}/mute/{targetId}?operatorId=&seconds=600   单人禁言；seconds<=0 解除
  * POST   /group/{groupId}/disband?operatorId=                解散（仅群主，逻辑删除）
  * </pre>
+ *
+ * <p>入群申请与邀请码（链接 / 二维码）见 {@link GroupJoinController}。
  *
  * <p>所有权限判断都在 {@link GroupService} 里，这个类只做参数搬运与 JSON 拼装——
  * 把规则写在 controller 会导致「接口拦了但消息准入没拦」，那是这类系统最典型的漏洞形态。
@@ -83,30 +86,48 @@ public class GroupController {
     }
 
     /**
-     * 成员列表。
+     * 成员列表（分页）。
      *
-     * <p>和 {@link #detail} 的区别只是「不返回群资料」：扇出与成员来源在服务端，
-     * 客户端刷新成员列表时不需要顺带拉一遍群名/公告，少一次无意义的刷新。
+     * <pre>
+     * GET /group/{groupId}/members                     第一页（默认 50 条）
+     * GET /group/{groupId}/members?offset=50&limit=50  下一页
+     * </pre>
+     *
+     * <p>和 {@link #detail} 的区别是「不返回群资料」+「分页」：扇出与成员来源都在服务端，
+     * 客户端刷新成员列表不需要顺带拉群名/公告，也不该为了看一屏去收 5000 条。
+     *
+     * <p>响应里 {@code size} 是<b>本页条数</b>，总人数看 {@code total}——
+     * 与旧版本（{@code size} 即总人数）语义不同，这是这次唯一的行为变更。
+     * {@code roles} / {@code mutes} 也只含本页的人。
      */
     @GetMapping("/{groupId}/members")
-    public Map<String, Object> members(@PathVariable String groupId) {
-        Optional<GroupService.GroupDetail> detail = groupService.detail(groupId);
-        if (detail.isEmpty()) {
-            Map<String, Object> body = new LinkedHashMap<>();
-            body.put("code", 404);
-            body.put("message", "group not found");
+    public Map<String, Object> members(@PathVariable String groupId,
+                                       @RequestParam(name = "offset", defaultValue = "0") int offset,
+                                       @RequestParam(name = "limit", defaultValue = "0") int limit) {
+        GroupService.MemberPage page = groupService.members(groupId, offset, limit);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("code", page.code());
+        if (page.code() != 0) {
+            body.put("message", page.message());
             return body;
         }
-        GroupService.GroupDetail view = detail.get();
-        Map<String, String> roles = new LinkedHashMap<>();
-        view.roles().forEach((userId, role) -> roles.put(userId, role.name()));
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("code", 0);
         body.put("groupId", groupId);
-        body.put("size", view.roles().size());
-        body.put("members", List.copyOf(view.roles().keySet()));
+        body.put("total", page.total());
+        body.put("offset", page.offset());
+        body.put("limit", page.limit());
+        body.put("hasMore", page.hasMore());
+        body.put("size", page.members().size());
+        body.put("members", page.members().stream().map(GroupService.MemberView::userId).toList());
+        Map<String, String> roles = new LinkedHashMap<>();
+        Map<String, Long> mutes = new LinkedHashMap<>();
+        for (GroupService.MemberView member : page.members()) {
+            roles.put(member.userId(), member.role().name());
+            if (member.mutedUntil() > 0) {
+                mutes.put(member.userId(), member.mutedUntil());
+            }
+        }
         body.put("roles", roles);
-        body.put("mutes", view.mutes());
+        body.put("mutes", mutes);
         return body;
     }
 
@@ -178,6 +199,20 @@ public class GroupController {
     public Map<String, Object> disband(@PathVariable String groupId,
                                        @RequestParam(name = "operatorId") String operatorId) {
         return result(groupService.disband(operatorId, groupId));
+    }
+
+    /**
+     * 转让群主：{@code targetId} 成为新群主，原群主降为管理员。
+     *
+     * <p>单独一个端点而不是复用 {@code /roles/{targetId}?role=OWNER}：转让要同时改
+     * 群资料的 {@code ownerId} 与两个人的角色，混进「设角色」会让「谁是群主」出现两个真相来源
+     * （所以那个接口至今拒绝 {@code role=OWNER}）。
+     */
+    @PostMapping("/{groupId}/owner/{targetId}")
+    public Map<String, Object> transferOwnership(@PathVariable String groupId,
+                                                 @PathVariable String targetId,
+                                                 @RequestParam(name = "operatorId") String operatorId) {
+        return result(groupService.transferOwnership(operatorId, groupId, targetId));
     }
 
     private Map<String, Object> result(GroupService.GroupResult result) {

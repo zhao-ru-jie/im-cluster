@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -13,6 +14,7 @@ import java.util.Optional;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -43,8 +45,10 @@ class GroupServiceTest {
 
     private final InMemoryGroupRepository groups = new InMemoryGroupRepository();
     private final InMemoryGroupMemberRepository members = new InMemoryGroupMemberRepository();
+    private final InMemoryGroupJoinStore joins = new InMemoryGroupJoinStore();
     /** notifier 传 null：这些用例只关心规则与状态，不需要下行事件 */
-    private final GroupService service = new GroupService(groups, members, null);
+    private final GroupService service = new GroupService(groups, members, null, joins,
+            "im://group/join?code=");
 
     // ==== 建群 ====
 
@@ -293,6 +297,213 @@ class GroupServiceTest {
         assertEquals("sender is not a member of group " + nowhere, service.canSpeak(nowhere, "alice"));
     }
 
+    // ==== 成员列表分页 ====
+
+    @Test
+    @DisplayName("成员分页：按 userId 字典序、total 是全量、hasMore 正确")
+    void membersArePagedWithStableOrder() {
+        String groupId = newGroup("alice", 0);
+        service.addMembers("alice", groupId, List.of("bob", "carol", "dave", "erin"));
+
+        GroupService.MemberPage first = service.members(groupId, 0, 2);
+        assertEquals(0, first.code(), first.message());
+        assertEquals(5, first.total(), "total 是群人数，不是本页条数");
+        assertEquals(2, first.members().size());
+        assertTrue(first.hasMore());
+        assertEquals(List.of("alice", "bob"), first.members().stream()
+                        .map(GroupService.MemberView::userId).toList(),
+                "顺序必须稳定（userId 字典序），否则 offset 翻页会重复或漏人");
+        assertEquals(GroupRole.OWNER, first.members().get(0).role());
+
+        GroupService.MemberPage tail = service.members(groupId, 4, 2);
+        assertEquals(1, tail.members().size());
+        assertFalse(tail.hasMore());
+
+        GroupService.MemberPage beyond = service.members(groupId, 99, 2);
+        assertTrue(beyond.members().isEmpty());
+        assertEquals(5, beyond.total(), "越界的页也要能报告总人数");
+    }
+
+    @Test
+    @DisplayName("成员页只带本页的禁言状态")
+    void memberPageCarriesMutes() {
+        String groupId = newGroup("alice", 0);
+        service.addMembers("alice", groupId, List.of("bob"));
+        assertEquals(0, service.mute("alice", groupId, "bob", 600).code());
+
+        GroupService.MemberPage page = service.members(groupId, 0, 10);
+        Map<String, Long> mutes = new HashMap<>();
+        page.members().forEach(member -> mutes.put(member.userId(), member.mutedUntil()));
+        assertTrue(mutes.get("bob") > 0, "被禁言的人要带上到期时间");
+        assertEquals(0L, mutes.get("alice"), "没被禁言的人是 0");
+    }
+
+    // ==== 入群申请 ====
+
+    @Test
+    @DisplayName("入群申请：提交 → 待审 → 通过后成为成员；重复审批按已处理返回")
+    void joinRequestApproveFlow() {
+        String groupId = newGroup("alice", 0);
+        assertEquals(0, service.requestJoin(groupId, "bob", "想进群").code());
+
+        GroupService.JoinRequestPage pending = service.pendingJoins("alice", groupId, 0, 10);
+        assertEquals(1, pending.total());
+        assertEquals("bob", pending.requests().get(0).applicantId());
+        assertEquals(GroupJoinRequest.STATUS_PENDING, pending.requests().get(0).status());
+
+        assertEquals(0, service.approveJoin("alice", groupId, "bob").code());
+        assertTrue(members.isMember(groupId, "bob"));
+        assertEquals(404, service.approveJoin("alice", groupId, "bob").code(),
+                "多管理员同时审批会撞车，第二次必须按已处理回");
+        assertEquals(0, service.pendingJoins("alice", groupId, 0, 10).total());
+    }
+
+    @Test
+    @DisplayName("重复申请不堆条目，也不刷新首次申请时间")
+    void repeatedJoinRequestIsIdempotent() {
+        String groupId = newGroup("alice", 0);
+        service.requestJoin(groupId, "bob", "第一次");
+        long createdAt = joins.findRequest(groupId, "bob").createdAt();
+
+        service.requestJoin(groupId, "bob", "第二次");
+        GroupService.JoinRequestPage pending = service.pendingJoins("alice", groupId, 0, 10);
+        assertEquals(1, pending.total(), "同一个人只能有一条申请");
+        assertEquals(createdAt, pending.requests().get(0).createdAt(), "排序依据不能被刷新");
+        assertEquals("第二次", pending.requests().get(0).message(), "附言倒是应该更新");
+    }
+
+    @Test
+    @DisplayName("待审列表只有群主/管理员能看：普通成员 403")
+    void pendingJoinsRequireManager() {
+        String groupId = newGroup("alice", 0);
+        service.addMembers("alice", groupId, List.of("bob"));
+        service.requestJoin(groupId, "dave", "");
+
+        assertEquals(403, service.pendingJoins("bob", groupId, 0, 10).code(),
+                "「谁想进这个群」是隐私，不能给普通成员看");
+        assertEquals(0, service.pendingJoins("alice", groupId, 0, 10).code());
+    }
+
+    @Test
+    @DisplayName("满员时直接拒绝申请，不让人白等")
+    void joinRequestRejectedWhenGroupIsFull() {
+        String groupId = newGroup("alice", 2);
+        service.addMembers("alice", groupId, List.of("bob"));
+
+        assertEquals(413, service.requestJoin(groupId, "dave", "").code());
+        assertEquals(0, service.pendingJoins("alice", groupId, 0, 10).total(),
+                "进不来就别留一条永远处理不了的申请");
+    }
+
+    @Test
+    @DisplayName("已是成员还申请 → 409")
+    void joinRequestFromExistingMemberIsConflict() {
+        String groupId = newGroup("alice", 0);
+        service.addMembers("alice", groupId, List.of("bob"));
+        assertEquals(409, service.requestJoin(groupId, "bob", "").code());
+    }
+
+    // ==== 邀请码（邀请链接 / 二维码） ====
+
+    @Test
+    @DisplayName("邀请码：管理员建的码直接入群；用满次数后 410，未知码 404")
+    void inviteCodeJoinsDirectlyAndStopsAtLimit() {
+        String groupId = newGroup("alice", 0);
+        GroupService.InviteResult created = service.createInvite("alice", groupId, 24, 1, false);
+        assertEquals(0, created.code(), created.message());
+        assertTrue(created.link().endsWith(created.invite().code()), "链接要能直接给出去/画二维码");
+        String code = created.invite().code();
+
+        GroupService.JoinByInviteResult joined = service.joinByInvite("bob", code);
+        assertEquals(0, joined.code(), joined.message());
+        assertFalse(joined.approvalPending());
+        assertTrue(members.isMember(groupId, "bob"));
+
+        assertEquals(410, service.joinByInvite("carol", code).code(), "限 1 次的码不能再用");
+        assertEquals(404, service.joinByInvite("dave", "not-a-code").code());
+    }
+
+    @Test
+    @DisplayName("普通成员建的邀请码强制要求审批：用码只是提交申请")
+    void memberCreatedInviteRequiresApproval() {
+        String groupId = newGroup("alice", 0);
+        service.addMembers("alice", groupId, List.of("bob"));
+
+        GroupService.InviteResult created = service.createInvite("bob", groupId, 0, 1, false);
+        assertEquals(0, created.code(), created.message());
+        assertTrue(created.invite().approvalRequired(),
+                "否则普通成员能生成一条「点一下就把人放进来」的链接，直接绕过管理员");
+
+        GroupService.JoinByInviteResult joined = service.joinByInvite("carol", created.invite().code());
+        assertEquals(0, joined.code());
+        assertTrue(joined.approvalPending());
+        assertFalse(members.isMember(groupId, "carol"), "需要审批的码不等于入场券");
+        assertEquals(1, service.pendingJoins("alice", groupId, 0, 10).total());
+
+        // 限 1 次的码：审批流也要计数，否则它会被无限次用来「敲门」
+        assertEquals(410, service.joinByInvite("dave", created.invite().code()).code());
+    }
+
+    @Test
+    @DisplayName("吊销邀请码后立刻失效；已在群里的成员用码是幂等成功且不消耗次数")
+    void revokeInviteAndIdempotentJoin() {
+        String groupId = newGroup("alice", 0);
+        String code = service.createInvite("alice", groupId, 0, 1, false).invite().code();
+
+        assertEquals(0, service.joinByInvite("bob", code).code());
+        // bob 已是成员：再来一次算成功，但不能再扣一次名额（名额已被第一次用掉）
+        GroupService.JoinByInviteResult again = service.joinByInvite("bob", code);
+        assertEquals(0, again.code(), "已在群里应当幂等成功，而不是报「码已用尽」");
+
+        assertEquals(0, service.revokeInvite("alice", groupId, code).code());
+        assertEquals(404, service.joinByInvite("carol", code).code(), "吊销后按不存在处理");
+        assertTrue(service.invites("alice", groupId).invites().isEmpty());
+    }
+
+    @Test
+    @DisplayName("邀请码列表与吊销只有群主/管理员能做")
+    void inviteManagementRequiresManager() {
+        String groupId = newGroup("alice", 0);
+        service.addMembers("alice", groupId, List.of("bob"));
+        String code = service.createInvite("alice", groupId, 0, 0, false).invite().code();
+
+        assertEquals(403, service.invites("bob", groupId).code());
+        assertEquals(403, service.revokeInvite("bob", groupId, code).code());
+    }
+
+    // ==== 群主转让 ====
+
+    @Test
+    @DisplayName("转让群主：新群主 OWNER、原群主降 ADMIN、群资料同步，且解锁「原群主退群」")
+    void transferOwnershipMovesRolesAndProfile() {
+        String groupId = newGroup("alice", 0);
+        service.addMembers("alice", groupId, List.of("bob", "carol"));
+
+        assertEquals(0, service.transferOwnership("alice", groupId, "bob").code());
+        assertEquals(GroupRole.OWNER, members.roleOf(groupId, "bob"));
+        assertEquals(GroupRole.ADMIN, members.roleOf(groupId, "alice"),
+                "降成普通成员会让他瞬间失去管理能力，通常是误操作");
+        assertEquals("bob", groups.find(groupId).orElseThrow().ownerId(),
+                "群资料的 ownerId 是转让的唯一权威，必须同步");
+
+        // 转让之前这条路是 409（群不能没有主）
+        assertEquals(0, service.leave("alice", groupId).code());
+    }
+
+    @Test
+    @DisplayName("转让边界：只有群主能转、只能转给成员、不能转给自己；roles 接口仍不能造群主")
+    void transferOwnershipGuardRails() {
+        String groupId = newGroup("alice", 0);
+        service.addMembers("alice", groupId, List.of("bob"));
+
+        assertEquals(403, service.transferOwnership("bob", groupId, "alice").code());
+        assertEquals(404, service.transferOwnership("alice", groupId, "stranger").code());
+        assertEquals(400, service.transferOwnership("alice", groupId, "alice").code());
+        assertEquals(400, service.setRole("alice", groupId, "bob", GroupRole.OWNER).code(),
+                "设角色仍然不能造出第二个群主——转让是唯一入口");
+        assertEquals(GroupRole.OWNER, members.roleOf(groupId, "alice"), "失败的转让不能留下副作用");
+    }
+
     // ==== 辅助 ====
 
     private String newGroup(String ownerId, int maxMembers) {
@@ -438,6 +649,95 @@ class GroupServiceTest {
             } else {
                 muteByUser.put(userId, untilMillis);
             }
+        }
+    }
+
+    /**
+     * 内存版入群存储。
+     *
+     * <p>复刻 {@code RedisGroupJoinStore} 的两处关键语义：申请按 {@code (groupId, applicantId)}
+     * 覆盖（同一人只有一条）、邀请码取用<b>先判后增</b>（限量码用满即拒）。
+     */
+    private static final class InMemoryGroupJoinStore implements GroupJoinStore {
+
+        private final Map<String, Map<String, GroupJoinRequest>> requests = new HashMap<>();
+        private final Map<String, GroupInvite> invites = new HashMap<>();
+
+        @Override
+        public void saveRequest(GroupJoinRequest request) {
+            requests.computeIfAbsent(request.groupId(), key -> new HashMap<>())
+                    .put(request.applicantId(), request);
+        }
+
+        @Override
+        public GroupJoinRequest findRequest(String groupId, String applicantId) {
+            return requests.getOrDefault(groupId, Map.of()).get(applicantId);
+        }
+
+        @Override
+        public List<GroupJoinRequest> pendingRequests(String groupId) {
+            List<GroupJoinRequest> pending = new ArrayList<>();
+            for (GroupJoinRequest request : requests.getOrDefault(groupId, Map.of()).values()) {
+                if (request.isPending()) {
+                    pending.add(request);
+                }
+            }
+            pending.sort(Comparator.comparingLong(GroupJoinRequest::createdAt)
+                    .thenComparing(GroupJoinRequest::applicantId));
+            return pending;
+        }
+
+        @Override
+        public void deleteRequest(String groupId, String applicantId) {
+            Map<String, GroupJoinRequest> byUser = requests.get(groupId);
+            if (byUser != null) {
+                byUser.remove(applicantId);
+            }
+        }
+
+        @Override
+        public void saveInvite(GroupInvite invite) {
+            invites.put(invite.code(), invite);
+        }
+
+        @Override
+        public GroupInvite findInvite(String code) {
+            return invites.get(code);
+        }
+
+        @Override
+        public List<GroupInvite> invitesOf(String groupId) {
+            long now = System.currentTimeMillis();
+            List<GroupInvite> result = new ArrayList<>();
+            for (GroupInvite invite : invites.values()) {
+                if (invite.groupId().equals(groupId) && invite.usable(now)) {
+                    result.add(invite);
+                }
+            }
+            result.sort(Comparator.comparingLong(GroupInvite::createdAt).reversed());
+            return result;
+        }
+
+        @Override
+        public void revokeInvite(String groupId, String code) {
+            invites.remove(code);
+        }
+
+        @Override
+        public InviteUse useInvite(String code, long now) {
+            GroupInvite invite = invites.get(code);
+            if (invite == null) {
+                return InviteUse.of(InviteUse.Status.NOT_FOUND, null);
+            }
+            if (invite.expired(now)) {
+                return InviteUse.of(InviteUse.Status.EXPIRED, invite);
+            }
+            if (invite.exhausted()) {
+                return InviteUse.of(InviteUse.Status.EXHAUSTED, invite);
+            }
+            GroupInvite used = invite.withUses(invite.uses() + 1);
+            invites.put(code, used);
+            return InviteUse.of(InviteUse.Status.OK, used);
         }
     }
 }

@@ -264,6 +264,33 @@ public final class RedisKeys {
         return root + ":group:" + tag(groupId) + ":mutes";
     }
 
+    /**
+     * 入群申请（Hash：{@code applicantId -> 申请单 JSON}，带 TTL）。
+     *
+     * <p>用一个 Hash 而不是「每人一条 key」：审批人看的是「这个群有哪些人在等」，
+     * 一次 {@code HGETALL} 就是完整的待审列表；按人拆 key 就得维护一个索引再加 N 次往返，
+     * 而审批列表本来就有上限（同一群体量远小于成员数）。
+     */
+    public static String groupJoinRequests(String groupId) {
+        return root + ":group:" + tag(groupId) + ":join-req";
+    }
+
+    /** 群的邀请码集合（Set：code），只用于「列出 / 吊销」，权威数据在 {@link #groupInvite(String)} */
+    public static String groupInvites(String groupId) {
+        return root + ":group:" + tag(groupId) + ":invites";
+    }
+
+    /**
+     * 单个邀请码（Hash：group_id / inviter_id / created_at / expires_at / max_uses / uses /
+     * approval_required，带 TTL）。
+     *
+     * <p>tag 用 {@code code} 而不是 {@code groupId}：扫码加入时手里只有码，
+     * 必须能<b>一次</b>从码定位到群；把它放进群 slot 就得先知道群才能查码，是个循环。
+     */
+    public static String groupInvite(String code) {
+        return root + ":invite:" + tag(code);
+    }
+
     // ==== 路由（tag = {userId}） ====
 
     /** 在线路由：SET{网关实例 ID}，带 TTL，由网关心跳续期；多端时可能多个实例 */

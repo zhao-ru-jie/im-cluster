@@ -102,6 +102,30 @@ public class RedisGroupMemberRepository implements GroupMemberRepository {
         return roles;
     }
 
+    /**
+     * 一次 {@code HMGET} 取这几个人的角色。
+     *
+     * <p>刻意<b>不</b>像 {@link #roleOf} 那样先判成员资格：调用方（成员列表分页）的 id 本来就来自
+     * 成员集合，再补一次 {@code SISMEMBER} 只是把 1 次往返变 2 次。角色的缺省值是 MEMBER，
+     * 所以 Hash 里查不到的人按 MEMBER 回填即可。
+     */
+    @Override
+    public Map<String, GroupRole> rolesOf(String groupId, Collection<String> userIds) {
+        Map<String, GroupRole> result = new HashMap<>();
+        if (userIds == null || userIds.isEmpty()) {
+            return result;
+        }
+        List<Object> fields = new ArrayList<>(userIds);
+        List<Object> stored = redis.opsForHash().multiGet(rolesKey(groupId), fields);
+        int index = 0;
+        for (String userId : userIds) {
+            Object raw = index < stored.size() ? stored.get(index) : null;
+            index++;
+            result.put(userId, raw == null ? GroupRole.MEMBER : GroupRole.parse(String.valueOf(raw)));
+        }
+        return result;
+    }
+
     @Override
     public long mutedUntil(String groupId, String userId) {
         if (groupId == null || userId == null) {
@@ -149,6 +173,49 @@ public class RedisGroupMemberRepository implements GroupMemberRepository {
     public List<String> membersOf(String groupId) {
         Set<String> members = redis.opsForSet().members(membersKey(groupId));
         return members == null ? List.of() : new ArrayList<>(members);
+    }
+
+    /** O(1)：拉人前判人数上限只需要一个数字，不该为此拉全量成员 */
+    @Override
+    public long memberCount(String groupId) {
+        Long size = redis.opsForSet().size(membersKey(groupId));
+        return size == null ? 0L : size;
+    }
+
+    /**
+     * 一次 {@code HGETALL} 取全部禁言状态。
+     *
+     * <p>此前成员列表对每个人各查一次 {@code mutedUntil}：5000 人群就是 5000 次往返，
+     * 而这张 Hash 里通常只有个位数条目。顺手把过期的字段删掉（与 {@link #mutedUntil} 同样的清理策略）。
+     */
+    @Override
+    public Map<String, Long> mutesOf(String groupId) {
+        Map<Object, Object> stored = redis.opsForHash().entries(mutesKey(groupId));
+        if (stored.isEmpty()) {
+            return Map.of();
+        }
+        long now = System.currentTimeMillis();
+        Map<String, Long> result = new HashMap<>(stored.size());
+        List<Object> expired = new ArrayList<>();
+        for (Map.Entry<Object, Object> entry : stored.entrySet()) {
+            String userId = String.valueOf(entry.getKey());
+            long until;
+            try {
+                until = Long.parseLong(String.valueOf(entry.getValue()));
+            } catch (NumberFormatException e) {
+                expired.add(userId);
+                continue;
+            }
+            if (until > now) {
+                result.put(userId, until);
+            } else {
+                expired.add(userId);
+            }
+        }
+        if (!expired.isEmpty()) {
+            redis.opsForHash().delete(mutesKey(groupId), expired.toArray());
+        }
+        return result;
     }
 
     @Override

@@ -40,6 +40,18 @@ const router = createRouter({
       component: () => import('@/pages/FriendRequestsPage.vue')
     },
     {
+      // 群详情/群管理：资料、成员、邀请码、入群申请审批都在这一页
+      path: '/group/:groupId',
+      name: 'group',
+      component: () => import('@/pages/GroupDetailPage.vue')
+    },
+    {
+      // 邀请链接落地页：`?code=xxx` 会自动填好
+      path: '/join',
+      name: 'join',
+      component: () => import('@/pages/JoinGroupPage.vue')
+    },
+    {
       path: '/me',
       name: 'me',
       component: () => import('@/pages/MePage.vue')

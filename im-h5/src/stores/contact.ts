@@ -4,6 +4,7 @@ import {
   DeviceApi,
   FriendRequestApi,
   GroupApi,
+  GroupJoinApi,
   PresenceApi,
   RelationApi,
   type DeviceListResponse
@@ -17,7 +18,10 @@ import type {
   DownlinkFrame,
   FriendRequestItem,
   GroupInfo,
+  GroupInviteItem,
+  GroupJoinRequestItem,
   GroupRole,
+  GroupUpdateFrame,
   PresenceEntry,
   PresencePushFrame,
   PresenceSnapshotFrame,
@@ -54,6 +58,16 @@ export const useContactStore = defineStore('contact', {
     profiles: {} as Record<string, UserProfile>,
     groups: {} as Record<string, GroupInfo>,
     groupMembers: {} as Record<string, GroupMembers>,
+    /** groupId -> 待审入群申请（只有群主/管理员拿得到；未加载过的群不在表里） */
+    joinRequests: {} as Record<string, GroupJoinRequestItem[]>,
+    /** groupId -> 待审总数（分页接口的 total，可能大于本地这一页） */
+    joinRequestTotals: {} as Record<string, number>,
+    /** groupId -> 当前有效邀请码 */
+    invites: {} as Record<string, GroupInviteItem[]>,
+    /** 邀请链接前缀，由服务端下发（`im://group/join` 或 https 落地页） */
+    inviteLinkBase: '',
+    /** groupId -> 我自己在这群里的申请（null = 没有申请过） */
+    myJoinRequests: {} as Record<string, GroupJoinRequestItem | null>,
     devices: [] as DeviceListResponse['devices'],
     devicesControllable: true,
     loading: false,
@@ -95,7 +109,18 @@ export const useContactStore = defineStore('contact', {
       const roles = state.groupMembers[groupId]?.roles;
       if (!roles) return 'MEMBER';
       return roles[auth.userId] ?? 'MEMBER';
-    }
+    },
+    /** 群主或管理员才能看待审列表 / 管邀请码（服务端用同一个判定） */
+    canManageGroup: (state) => (groupId: string): boolean => {
+      const auth = useAuthStore();
+      const role = state.groupMembers[groupId]?.roles?.[auth.userId];
+      return role === 'OWNER' || role === 'ADMIN';
+    },
+    pendingJoinsOf: (state) => (groupId: string): GroupJoinRequestItem[] =>
+      state.joinRequests[groupId] ?? [],
+    invitesOf: (state) => (groupId: string): GroupInviteItem[] => state.invites[groupId] ?? [],
+    myJoinRequestOf: (state) => (groupId: string): GroupJoinRequestItem | null | undefined =>
+      state.myJoinRequests[groupId]
   },
 
   actions: {
@@ -476,6 +501,184 @@ export const useContactStore = defineStore('contact', {
     async disband(groupId: string): Promise<void> {
       await this.guard(() => GroupApi.disband(groupId, useAuthStore().userId), '群已解散');
       await useImStore().refreshConversations(true);
+    },
+
+    /* --------------------------- 入群申请 / 邀请码 --------------------------- */
+
+    /**
+     * 群变更下行。
+     *
+     * <p>不同 {@code change} 要刷的东西不一样：全量刷一遍等于每次改动都打三四个接口，
+     * 而申请人根本看不到待审列表（那是 403）。
+     */
+    onGroupUpdate(frame: GroupUpdateFrame): void {
+      const auth = useAuthStore();
+      if (frame.change === 'JOIN_REQUESTED') {
+        // 接收方 = 群主/管理员 + 申请人本人（他其它端的「已提交」状态）
+        if (frame.targetId === auth.userId) void this.loadMyJoinRequest(frame.groupId);
+        if (this.canManageGroup(frame.groupId)) void this.loadPendingJoins(frame.groupId);
+        return;
+      }
+      if (frame.change === 'JOIN_APPROVED' || frame.change === 'JOIN_REJECTED') {
+        if (frame.targetId && frame.targetId !== auth.userId) return;
+        void this.loadMyJoinRequest(frame.groupId);
+        if (frame.change === 'JOIN_APPROVED') {
+          // 通过之后才成为成员：群资料要重新拉，会话列表里也会多一条
+          void this.loadGroup(frame.groupId, false);
+          void useImStore().refreshConversations(true);
+        }
+        return;
+      }
+      // 资料 / 成员 / 角色 / 禁言 / 群主转让
+      void this.loadGroup(frame.groupId, this.groupMembers[frame.groupId] !== undefined);
+    },
+
+    /** 待审入群申请（仅群主/管理员；403 不是错误，只是没有这个视角） */
+    async loadPendingJoins(groupId: string, offset = 0, limit = 50): Promise<void> {
+      const auth = useAuthStore();
+      try {
+        const res = await GroupJoinApi.pending(groupId, auth.userId, offset, limit);
+        if (res.code !== 0) {
+          if (res.code !== 403 && res.code !== 404) useUiStore().error(res.message || '加载入群申请失败');
+          this.joinRequests[groupId] = [];
+          this.joinRequestTotals[groupId] = 0;
+          return;
+        }
+        this.joinRequests[groupId] = res.requests ?? [];
+        this.joinRequestTotals[groupId] = res.total ?? this.joinRequests[groupId].length;
+      } catch (e) {
+        useUiStore().error((e as ApiError).message || '加载入群申请失败');
+      }
+    },
+
+    async approveJoin(groupId: string, applicantId: string): Promise<boolean> {
+      const ok = await this.guard(
+        () => GroupJoinApi.approve(groupId, applicantId, useAuthStore().userId),
+        '已通过入群申请'
+      );
+      if (ok) {
+        this.dropPendingJoin(groupId, applicantId);
+        // 通过 = 多了一个成员：成员表与会话列表都要跟着变
+        await this.loadGroup(groupId);
+        void useImStore().refreshConversations(true);
+      }
+      return ok;
+    },
+
+    async rejectJoin(groupId: string, applicantId: string): Promise<boolean> {
+      const ok = await this.guard(
+        () => GroupJoinApi.reject(groupId, applicantId, useAuthStore().userId),
+        '已拒绝入群申请'
+      );
+      if (ok) this.dropPendingJoin(groupId, applicantId);
+      return ok;
+    },
+
+    dropPendingJoin(groupId: string, applicantId: string): void {
+      const list = this.joinRequests[groupId];
+      if (!list) return;
+      this.joinRequests[groupId] = list.filter((item) => item.applicantId !== applicantId);
+      this.joinRequestTotals[groupId] = Math.max(0, (this.joinRequestTotals[groupId] ?? list.length) - 1);
+    },
+
+    /** 直接提交入群申请（需要审批的群） */
+    async requestJoin(groupId: string, message = ''): Promise<boolean> {
+      const auth = useAuthStore();
+      try {
+        const res = await GroupJoinApi.request(groupId, auth.userId, message);
+        this.myJoinRequests[groupId] = res.request ?? null;
+        useUiStore().success('已提交申请，等待管理员通过');
+        return true;
+      } catch (e) {
+        useUiStore().error((e as ApiError).message || '提交申请失败');
+        return false;
+      }
+    },
+
+    /** 我在这群里的申请状态（没申请过时服务端返回 404，按「无」记录） */
+    async loadMyJoinRequest(groupId: string): Promise<void> {
+      const auth = useAuthStore();
+      try {
+        const res = await GroupJoinApi.myRequest(groupId, auth.userId);
+        this.myJoinRequests[groupId] = res.code === 0 ? res.request ?? null : null;
+      } catch {
+        /* 读接口抖动：保留上一次的结论，不要清成「没申请过」 */
+      }
+    },
+
+    async loadInvites(groupId: string): Promise<void> {
+      try {
+        const res = await GroupJoinApi.invites(groupId, useAuthStore().userId);
+        if (res.code !== 0) {
+          if (res.code !== 403 && res.code !== 404) useUiStore().error(res.message || '加载邀请码失败');
+          this.invites[groupId] = [];
+          return;
+        }
+        this.invites[groupId] = res.invites ?? [];
+        if (res.linkBase) this.inviteLinkBase = res.linkBase;
+      } catch (e) {
+        useUiStore().error((e as ApiError).message || '加载邀请码失败');
+      }
+    },
+
+    async createInvite(
+      groupId: string,
+      options: { ttlHours?: number; maxUses?: number; approvalRequired?: boolean } = {}
+    ): Promise<GroupInviteItem | null> {
+      try {
+        const res = await GroupJoinApi.createInvite(groupId, useAuthStore().userId, options);
+        const invite = res.invite ?? null;
+        if (invite) {
+          // link 是服务端拼好的完整链接（客户端拿 code 生成二维码时也用它）
+          if (res.link) invite.link = res.link;
+          this.invites[groupId] = [invite, ...(this.invites[groupId] ?? [])];
+        }
+        useUiStore().success('邀请码已生成');
+        return invite;
+      } catch (e) {
+        useUiStore().error((e as ApiError).message || '生成邀请码失败');
+        return null;
+      }
+    },
+
+    async revokeInvite(groupId: string, code: string): Promise<void> {
+      try {
+        await GroupJoinApi.revokeInvite(groupId, code, useAuthStore().userId);
+        this.invites[groupId] = (this.invites[groupId] ?? []).filter((item) => item.code !== code);
+        useUiStore().success('已吊销该邀请码');
+      } catch (e) {
+        useUiStore().error((e as ApiError).message || '吊销失败');
+      }
+    },
+
+    /**
+     * 用邀请码加入。
+     *
+     * <p>三种结果要分开处理：直接进群（刷新会话、进聊天）、需要审批（只是提交了申请）、
+     * 失败（码过期/次数用尽/群满员，服务端给的文案直接展示）。
+     */
+    async joinByInvite(code: string): Promise<{ ok: boolean; approvalPending: boolean; groupId: string }> {
+      const auth = useAuthStore();
+      const trimmed = code.trim();
+      if (!trimmed) {
+        useUiStore().error('请输入邀请码');
+        return { ok: false, approvalPending: false, groupId: '' };
+      }
+      try {
+        const res = await GroupJoinApi.join(auth.userId, trimmed);
+        if (res.group) this.groups[res.group.groupId] = res.group;
+        if (res.approvalPending) {
+          useUiStore().success('已提交申请，等待管理员通过');
+        } else {
+          useUiStore().success('已加入群聊');
+          await this.loadGroup(res.groupId, true);
+          await useImStore().refreshConversations(true);
+        }
+        return { ok: true, approvalPending: !!res.approvalPending, groupId: res.groupId ?? '' };
+      } catch (e) {
+        useUiStore().error((e as ApiError).message || '加入失败');
+        return { ok: false, approvalPending: false, groupId: '' };
+      }
     },
 
     async guard(call: () => Promise<{ code: number; message?: string; group?: GroupInfo }>, successText: string): Promise<boolean> {

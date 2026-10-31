@@ -25,7 +25,16 @@ export type GroupChange =
   | 'ROLE_CHANGED'
   | 'MUTED'
   | 'UNMUTED'
-  | 'DISMISSED';
+  | 'DISMISSED'
+  /**
+   * 入群申请：`JOIN_REQUESTED` 只推给群主/管理员（待审列表是隐私，不是公告）
+   * 与申请人本人的其它端；`JOIN_APPROVED / JOIN_REJECTED` 只推给申请人。
+   */
+  | 'JOIN_REQUESTED'
+  | 'JOIN_APPROVED'
+  | 'JOIN_REJECTED'
+  /** 群主转让：同时改了群资料的 ownerId 与两个人的角色，客户端要重算整片管理菜单 */
+  | 'OWNER_TRANSFERRED';
 
 /** 媒体/文件的附加信息。线上是 **JSON 字符串**，收发两端各自 stringify / parse */
 export interface MediaAttrs {
@@ -324,4 +333,61 @@ export interface DeviceItem {
   transport: string;
   gateway: string;
   loginAt: number;
+}
+
+/** 入群申请单（服务端 {@code GroupJoinRequest} 的同形 DTO） */
+export type JoinRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
+
+export interface GroupJoinRequestItem {
+  groupId: string;
+  /** 权限轴是「群主 + 全部管理员」这个会变的集合，所以没有单一审批人字段 */
+  applicantId: string;
+  status: JoinRequestStatus;
+  /** 申请理由，服务端按 120 字截断 */
+  message: string;
+  /** 首次申请时间：重新申请不刷新它（审批列表按「谁等得最久」排序） */
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** 邀请码本体；`link` 只有管理端列表/创建接口会带（`im://group/join?code=xxx`） */
+export interface GroupInviteItem {
+  code: string;
+  groupId: string;
+  inviterId: string;
+  createdAt: number;
+  /** 0 = 不显式过期，靠服务端的兜底 TTL 回收 */
+  expiresAt: number;
+  /** 0 = 不限次数 */
+  maxUses: number;
+  uses: number;
+  /** true = 用这个码进来还要管理员点通过 */
+  approvalRequired: boolean;
+  link?: string;
+}
+
+/** 群已读聚合里的单个成员 */
+export interface ReadStatMember {
+  userId: string;
+  /** 该成员在这个会话上的已读位置 */
+  readSeq: number;
+  read: boolean;
+}
+
+/**
+ * 群已读聚合（`GET /conv/{conversationId}/read-stat`）。
+ *
+ * `total` 不含该消息的发送者，`readCount + unreadCount === total`；
+ * `members` 只是明细，被 `limit` 截断时 `truncated=true` 但计数仍是全量。
+ */
+export interface ReadStatItem {
+  conversationId: string;
+  convType: ConvType;
+  seq: number;
+  viewerReadSeq: number;
+  total: number;
+  readCount: number;
+  unreadCount: number;
+  truncated: boolean;
+  members: ReadStatMember[];
 }
