@@ -1,6 +1,7 @@
 package com.github.im.server.message;
 
 import com.github.im.contract.RedisKeys;
+import com.github.im.contract.resilience.RedisDegrade;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -172,7 +173,12 @@ public class ClientWatermarkStore {
         if (redis == null || userId == null || conversationId == null) {
             return 0L;
         }
-        Object raw = redis.opsForHash().get(keyOf(userId, deviceId), conversationId);
+        // 兜底值刻意是 0 而不是进程内那份水位：那份是「会话维度、跨设备取大」，
+        // 拿来当某一台设备的已确认位置会让别的设备漏补一段。0 = 从最早开始补，
+        // 多补一遍是安全的（客户端按 seq 去重），少补是真丢消息。
+        Object raw = RedisDegrade.call("watermark.get",
+                () -> redis.opsForHash().get(keyOf(userId, deviceId), conversationId),
+                () -> null);
         if (raw == null) {
             return 0L;
         }
@@ -197,12 +203,15 @@ public class ClientWatermarkStore {
         }
         List<String> ids = List.copyOf(new LinkedHashSet<>(conversationIds));
         byte[] key = keyOf(userId, deviceId).getBytes(StandardCharsets.UTF_8);
-        List<Object> raw = redis.executePipelined((RedisCallback<Object>) connection -> {
-            for (String conversationId : ids) {
-                connection.hashCommands().hGet(key, conversationId.getBytes(StandardCharsets.UTF_8));
-            }
-            return null;
-        });
+        // 同 deliveredSeq：Redis 不可用时返回空表 = 每段都从头补，宁可多补也不漏
+        List<Object> raw = RedisDegrade.call("watermark.batch",
+                () -> redis.executePipelined((RedisCallback<Object>) connection -> {
+                    for (String conversationId : ids) {
+                        connection.hashCommands().hGet(key, conversationId.getBytes(StandardCharsets.UTF_8));
+                    }
+                    return null;
+                }),
+                List::of);
         Map<String, Long> result = new LinkedHashMap<>();
         for (int i = 0; i < ids.size(); i++) {
             Object value = raw.get(i);

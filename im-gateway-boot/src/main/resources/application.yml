@@ -8,6 +8,10 @@ spring:
     redis:
       host: ${SPRING_DATA_REDIS_HOST:localhost}
       port: ${SPRING_DATA_REDIS_PORT:6379}
+      # 网关的路由表读写也在 Redis 上：连接/命令超时必须短，否则一次 Redis 抖动会把
+      # WebSocket 上行（每条都要查路由）全部拖到超时。
+      timeout: ${IM_REDIS_TIMEOUT:1s}
+      connect-timeout: ${IM_REDIS_CONNECT_TIMEOUT:1s}
   # 优雅关闭：Tomcat 停止时先让存量请求收尾（真正的连接摘流由 GatewayDrainService 负责）
   lifecycle:
     timeout-per-shutdown-phase: 60s
@@ -38,6 +42,11 @@ management:
       probes:
         enabled: true        # 提供 /actuator/health/readiness|liveness 供 K8s 探针使用
       show-details: never
+  health:
+    redis:
+      # 网关也关掉 Redis 健康指示器：路由表不可读时网关仍能服务本机连接，
+      # 判 DOWN 只会让 K8s 重启一个本来是健康的进程（重启治不好共享 Redis）。
+      enabled: false
   metrics:
     tags:
       application: ${spring.application.name}

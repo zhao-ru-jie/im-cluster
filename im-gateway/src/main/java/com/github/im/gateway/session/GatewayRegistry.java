@@ -1,6 +1,7 @@
 package com.github.im.gateway.session;
 
 import com.github.im.contract.RedisKeys;
+import com.github.im.contract.resilience.RedisDegrade;
 import com.github.im.gateway.node.NodeAddressResolver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -154,16 +155,18 @@ public class GatewayRegistry {
      */
     public void unbindUser(String userId) {
         String key = RedisKeys.gatewayUser(userId);
-        try {
-            Long removed = redis.opsForSet().remove(key, localInstanceId);
-            if (removed != null && removed > 0 && isSetEmpty(key)) {
+        RedisDegrade.run("route.unbind", () -> {
+            try {
+                Long removed = redis.opsForSet().remove(key, localInstanceId);
+                if (removed != null && removed > 0 && isSetEmpty(key)) {
+                    redis.delete(key);
+                }
+            } catch (RuntimeException e) {
+                // 旧类型 key（String）或 Redis 瞬时故障：删掉让它自愈，不要让断开回调抛异常
+                log.warn("[route] 清理路由失败，删除重建：key={} err={}", key, e.getMessage());
                 redis.delete(key);
             }
-        } catch (RuntimeException e) {
-            // 旧类型 key（String）或 Redis 瞬时故障：删掉让它自愈，不要让断开回调抛异常
-            log.warn("[route] 清理路由失败，删除重建：key={} err={}", key, e.getMessage());
-            redis.delete(key);
-        }
+        });
     }
 
     /**
@@ -281,14 +284,22 @@ public class GatewayRegistry {
     }
 
     private void safeSadd(String key, String member, Duration ttl) {
-        try {
-            redis.opsForSet().add(key, member);
-        } catch (RuntimeException e) {
-            log.warn("[route] key 类型不兼容，删除重建：key={} err={}", key, e.getMessage());
-            redis.delete(key);
-            redis.opsForSet().add(key, member);
+        // 第二次 add / expire 也必须受保护：原来 Redis 真宕机时这两句会把异常抛回连接建立流程，
+        // 结果是「网关因为路由表写不进去而连不上」——路由只是可重建的缓存，不该有这个权力。
+        boolean written = RedisDegrade.run("route.bind", () -> {
+            try {
+                redis.opsForSet().add(key, member);
+            } catch (RuntimeException e) {
+                log.warn("[route] key 类型不兼容，删除重建：key={} err={}", key, e.getMessage());
+                redis.delete(key);
+                redis.opsForSet().add(key, member);
+            }
+        });
+        if (!written) {
+            log.debug("[route] 路由登记降级（Redis 不可用），本实例仍是连接的权威：key={}", key);
+            return;
         }
-        redis.expire(key, ttl);
+        RedisDegrade.run("route.bind.ttl", () -> redis.expire(key, ttl));
     }
 
     /** 本网关实例 ID（= 本实例 gRPC 可达地址 host:port） */

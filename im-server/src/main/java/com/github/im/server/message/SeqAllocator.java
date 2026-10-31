@@ -1,15 +1,19 @@
 package com.github.im.server.message;
 
 import com.github.im.contract.RedisKeys;
+import com.github.im.contract.resilience.RedisDegrade;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Component;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -48,6 +52,23 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>为什么用 Lua 而不是「先 GET 再 INCR」：两者之间会被其它实例插入，导致写回旧值；
  * Lua 在 Redis 内串行执行，天然原子。
  *
+ * <h2>Redis 不可用时的降级（{@link RedisDegrade}）</h2>
+ *
+ * <p>上面论证的是「<b>正常态</b>不要预取号段」，因为多实例各自的号段会交错、破坏会话内保序。
+ * 但 Redis 是共享单点：它挂掉时如果只会抛异常，整条上行链路就变成 5xx。所以这里另有一条
+ * <b>只在故障期启用</b>的降级通道 {@link #degradedNext}：
+ *
+ * <ul>
+ *   <li>号源是 {@code max(本进程已知, 已落库最大 seq) + 1}，只在本进程内单调；</li>
+ *   <li>单实例部署下完全正确（唯一写者）；多实例同时降级时可能撞号——由消息表的
+ *       {@code (conversation_id, seq)} 唯一键拒绝，表现为「这一次写入失败、客户端重试」，
+ *       <b>不会</b>出现静默乱序或覆盖；</li>
+ *   <li>不在正常态预热任何号，故障恢复后立刻回到 Redis 权威（下界会被抬到已落库值）。</li>
+ * </ul>
+ *
+ * <p>幂等键同时写一份进程内表（{@link #rememberIdem}）：重复上行绝大多数发生在同一个实例的重试，
+ * Redis 不可用时这份本地表仍然能吃掉重复，落库失败的重试不会变成两条消息。
+ *
  * @author zhaorujie
  * @since 1.0.0
  */
@@ -58,6 +79,19 @@ public class SeqAllocator {
 
     /** 每多少条消息重新查一次「已落库最大 seq」来校准下界（摊薄成 1/100 次 DB 查询） */
     private static final int FLOOR_REFRESH_EVERY = 100;
+
+    /** 进程内幂等表的容量上限：只服务于「同一实例的快速重试」，不需要存太久 */
+    private static final int LOCAL_IDEM_LIMIT = 4096;
+
+    /* 熔断/降级粒度（RedisDegrade 按操作名分别统计） */
+    private static final String OP_NEXT = "seq.next";
+    private static final String OP_ALLOCATE = "seq.allocate";
+    private static final String OP_COLD_START = "seq.coldStart";
+
+    /** 脚本约定：seq 计数器不存在时返回 -1，要走冷启动（查库算下界） */
+    private static final long MISSING = -1L;
+    /** 兜底信号：Redis 不可用。与 {@link #MISSING} 必须分开，否则「挂掉」会被当成「冷 key」去查库 */
+    private static final long UNAVAILABLE = Long.MIN_VALUE;
 
     /** 合并脚本的三种返回状态：幂等命中 / 计数器不存在 / 拿到新号 */
     private static final String ALLOC_HIT = "hit";
@@ -131,6 +165,20 @@ public class SeqAllocator {
     /** conversationId -> 本进程的已知下界与取号计数（不含任何「预留号」，发号本身始终走 Redis） */
     private final Map<String, ConversationSeq> conversations = new ConcurrentHashMap<>();
 
+    /**
+     * 进程内幂等表：{@code idemKey -> 原值（serverMsgId|seq）}，LRU + 有界。
+     *
+     * <p>只存「已经落库成功」的记录，所以和 Redis 里那份语义一致；命中时连 Redis 都不用打，
+     * 顺带省掉正常态下重试的一次往返。
+     */
+    private final Map<String, String> localIdem = Collections.synchronizedMap(
+            new LinkedHashMap<>(256, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+                    return size() > LOCAL_IDEM_LIMIT;
+                }
+            });
+
     public SeqAllocator(StringRedisTemplate redis,
                         MessageRepository messageRepository,
                         ClientWatermarkStore watermarkStore) {
@@ -150,10 +198,21 @@ public class SeqAllocator {
             state.raiseFloor(storageFloor(conversationId));
         }
         String key = RedisKeys.convSeq(conversationId);
-        Long seq = redis.execute(NEXT_SEQ, List.of(key), String.valueOf(state.floor()));
-        if (seq != null && seq > 0) {
+        long floor = state.floor();
+        Long seq = RedisDegrade.call(OP_NEXT,
+                () -> {
+                    Long value = redis.execute(NEXT_SEQ, List.of(key), String.valueOf(floor));
+                    // 脚本自己用 -1 表示「计数器不存在」；null 是驱动返回不出来的异常情况，一并当不存在
+                    return value == null ? MISSING : value;
+                },
+                () -> UNAVAILABLE);
+        if (seq > 0) {
             state.raiseFloor(seq);
+            state.exitDegraded();
             return seq;
+        }
+        if (seq == UNAVAILABLE) {
+            return degradedNext(conversationId, state);
         }
         return coldStart(conversationId, state, key);
     }
@@ -175,22 +234,29 @@ public class SeqAllocator {
      * @param conversationId 会话 ID
      */
     public Allocation allocate(String idemKey, String conversationId) {
+        // 进程内幂等先判：重复上行绝大多数是同一个实例的重试，这一条连 Redis 都不用打。
+        // 命中时也不消耗 seq —— 与 Redis 那份语义一致。
+        String local = idemKey == null ? null : localIdem.get(idemKey);
+        if (local != null) {
+            return Allocation.replay(local);
+        }
+
         ConversationSeq state = conversations.computeIfAbsent(conversationId, _ -> new ConversationSeq());
         if (state.needsFloorRefresh()) {
             state.raiseFloor(storageFloor(conversationId));
         }
         String seqKey = RedisKeys.convSeq(conversationId);
-        List<String> raw;
-        try {
-            raw = executeAllocate(idemKey, seqKey, String.valueOf(state.floor()));
-        } catch (RuntimeException e) {
-            // 脚本被禁用 / 集群 slot 不匹配等：退回老路径，宁可多一次往返也不让消息失败
-            log.warn("[seq] 合并脚本执行失败，退回逐条取号：conv={} err={}", conversationId, e.getMessage());
-            return Allocation.fresh(next(conversationId));
+        String floor = String.valueOf(state.floor());
+        List<String> raw = RedisDegrade.call(OP_ALLOCATE,
+                () -> executeAllocate(idemKey, seqKey, floor),
+                () -> null);
+        if (raw == null) {
+            // 脚本失败或已短路：不再「退回逐条取号」（那条路同样打 Redis），直接走本地降级通道
+            return Allocation.fresh(degradedNext(conversationId, state));
         }
-        if (raw == null || raw.size() < 3) {
-            log.warn("[seq] 合并脚本返回异常结果 {}，退回逐条取号：conv={}", raw, conversationId);
-            return Allocation.fresh(next(conversationId));
+        if (raw.size() < 3) {
+            log.warn("[seq] 合并脚本返回异常结果 {}，退回本地降级取号：conv={}", raw, conversationId);
+            return Allocation.fresh(degradedNext(conversationId, state));
         }
         String status = raw.get(0);
         if (ALLOC_HIT.equals(status)) {
@@ -201,7 +267,26 @@ public class SeqAllocator {
         }
         long seq = Long.parseLong(raw.get(2));
         state.raiseFloor(seq);
+        state.exitDegraded();
         return Allocation.fresh(seq);
+    }
+
+    /**
+     * 记住一条<b>已经落库成功</b>的幂等记录（进程内 + 由调用方写 Redis）。
+     *
+     * <p>值必须与 Redis 里存的那份完全一致（{@code "{serverMsgId}|{seq}"}），
+     * 这样 Redis 恢复后两条路径的回放结果不会分叉。
+     */
+    public void rememberIdem(String idemKey, String idemValue) {
+        if (idemKey == null || idemKey.isBlank() || idemValue == null || idemValue.isBlank()) {
+            return;
+        }
+        localIdem.put(idemKey, idemValue);
+    }
+
+    /** 仅用于可观测性 / 测试：进程内幂等表规模 */
+    public int localIdemSize() {
+        return localIdem.size();
     }
 
     @SuppressWarnings("unchecked")
@@ -213,15 +298,43 @@ public class SeqAllocator {
     private long coldStart(String conversationId, ConversationSeq state, String key) {
         long floor = Math.max(state.floor(), watermarkStore.maxSeqOf(conversationId));
         floor = Math.max(floor, storageFloor(conversationId));
-        Long seq = redis.execute(INIT_SEQ, List.of(key), String.valueOf(floor));
-        if (seq == null || seq <= 0) {
-            // Redis 异常的极端情况：不让消息无声失败，退回本地推算值（真撞号由唯一索引兜住）
-            log.error("[seq] 会话 {} 取号异常，退回本地推算值 {}", conversationId, floor + 1);
-            seq = floor + 1;
+        long initFloor = floor;
+        Long seq = RedisDegrade.call(OP_COLD_START,
+                () -> redis.execute(INIT_SEQ, List.of(key), String.valueOf(initFloor)),
+                () -> UNAVAILABLE);
+        if (seq == null || seq <= 0 || seq == UNAVAILABLE) {
+            // Redis 连不上：不退化成「凭空 floor+1 然后当作正常号」，而是走带标记的降级通道
+            return degradedNext(conversationId, state);
         }
         state.raiseFloor(seq);
+        state.exitDegraded();
         log.info("[seq] 会话 {} 计数器初始化：初始 seq={}，下界={}", conversationId, seq, floor);
         return seq;
+    }
+
+    /**
+     * Redis 不可用时的降级发号（详见类注释的「降级」一节）。
+     *
+     * <p>号源 = {@code max(本进程已知, 已落库最大 seq) + 1}。进入降级时<b>强制</b>查一次库重新校准下界
+     * （正常态是每 {@value #FLOOR_REFRESH_EVERY} 次才查一次），避免拿一个过期的本地值继续发号；
+     * 之后整个降级期不再重复查库（Redis 故障时不该把压力转嫁给数据库）。
+     *
+     * <p>这里发的号是「尽力而为」：单实例正确，多实例可能撞号，由消息表唯一键兜底。
+     */
+    private long degradedNext(String conversationId, ConversationSeq state) {
+        // 整段必须串行：如果只把「进入降级」做成 CAS，别的线程会在第一个线程查完库、
+        // 抬好下界之前就发出 floor+1 —— 并发测试里第一个号直接是 1，比已落库的 42 还小。
+        // 降级本身就是错误路径，这里付一把会话级锁换取「不发重复/倒退的号」是值得的。
+        synchronized (state) {
+            if (state.enterDegraded()) {
+                state.raiseFloor(storageFloor(conversationId));
+                log.error("[seq] Redis 取号不可用，会话 {} 转入本地降级发号（下界 {}）；"
+                        + "多实例同时降级时可能撞号，落库由 (conversation_id, seq) 唯一键拒绝", conversationId, state.floor());
+            }
+            long seq = state.nextAfterFloor();
+            log.debug("[seq] 会话 {} 降级取号 seq={}", conversationId, seq);
+            return seq;
+        }
     }
 
     /** 已落库的最大 seq；读库失败不阻断发号（Redis 计数器通常已经是权威值） */
@@ -260,6 +373,8 @@ public class SeqAllocator {
         private final AtomicLong floor = new AtomicLong();
         /** 取号次数，用于把 DB 下界校准摊薄到 1/{@value FLOOR_REFRESH_EVERY} */
         private final AtomicLong issued = new AtomicLong();
+        /** 是否处于「Redis 不可用」的降级期；用来避免每次降级都查库、并只在进入时打一次告警 */
+        private final AtomicBoolean degraded = new AtomicBoolean();
 
         boolean needsFloorRefresh() {
             return issued.incrementAndGet() % FLOOR_REFRESH_EVERY == 0;
@@ -273,6 +388,24 @@ public class SeqAllocator {
             if (value > 0) {
                 floor.accumulateAndGet(value, Math::max);
             }
+        }
+
+        /** @return true = 本次是「刚进入降级」，调用方据此做一次库下界校准并告警一次 */
+        boolean enterDegraded() {
+            return degraded.compareAndSet(false, true);
+        }
+
+        void exitDegraded() {
+            degraded.set(false);
+        }
+
+        /**
+         * 降级期取号：把下界原子地抬到 {@code +1} 并返回它。
+         *
+         * <p>必须是一个原子操作：先读再写的做法在并发下行会发出重复的号。
+         */
+        long nextAfterFloor() {
+            return floor.updateAndGet(prev -> prev + 1);
         }
     }
 }

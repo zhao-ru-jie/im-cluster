@@ -25,6 +25,12 @@ spring:
       host: ${SPRING_DATA_REDIS_HOST:localhost}
       port: ${SPRING_DATA_REDIS_PORT:6379}
       # password: xxx
+      # Redis 是「热路径共享状态」而不是普通外部依赖：默认的 60s 级命令超时遇到网络黑洞
+      # （主机被摘掉、不发 RST）会把每条上行都挂满一分钟，线程全堵在这里，
+      # 于是「Redis 抖动」变成「整个 IM 服务不可用」。压到 1s + RedisDegrade 的短路，
+      # 故障面才止于「这一次降级」。
+      timeout: ${IM_REDIS_TIMEOUT:1s}
+      connect-timeout: ${IM_REDIS_CONNECT_TIMEOUT:1s}
   # gRPC 服务端：同一进程内同时暴露
   #   im.push.v1.DownstreamPush  （网关侧：供 IM 服务/其它网关实例推送下行帧）
   #   im.ingress.v1.MessageIngress（IM 侧：供远程网关上行，transport=grpc 的拓扑下由 im-server-boot 承担）
@@ -55,6 +61,15 @@ management:
     health:
       probes:
         enabled: true
+  health:
+    redis:
+      # Redis 不可用不再判成 DOWN：Boot 默认的 Redis 健康指示器一旦报 DOWN，
+      # Actuator 聚合健康变 DOWN -> spring.grpc.server.health 映射成 NOT_SERVING ->
+      # 网关把本实例从轮询里摘掉 = 「Redis 挂」直接升级成「整个集群不可用」。
+      # 现在的口径是：Redis 挂 -> 各条热路径降级（见 im.contract.resilience.RedisDegrade），
+      # 实例仍然可服务，故障面必须止于「能力降级」而不是「实例消失」。
+      # 可观测性改用指标 im_redis_degrade_fallback_total / 日志 [redis-degrade]。
+      enabled: false
   metrics:
     tags:
       application: ${spring.application.name}

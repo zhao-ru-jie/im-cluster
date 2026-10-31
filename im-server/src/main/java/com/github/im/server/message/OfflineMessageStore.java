@@ -1,6 +1,7 @@
 package com.github.im.server.message;
 
 import com.github.im.contract.RedisKeys;
+import com.github.im.contract.resilience.RedisDegrade;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -16,13 +17,16 @@ import org.springframework.stereotype.Component;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 离线存储（归属 IM 服务，不再放在连接层）。
@@ -217,12 +221,33 @@ public class OfflineMessageStore {
             return 1
             """.getBytes(StandardCharsets.UTF_8);
 
+    /** Redis 不可用时的本地缓冲上限（每个用户），只为「同一实例的在线用户」兜底 */
+    private static final int LOCAL_BUFFER_PER_USER = 100;
+    /** 本地缓冲的全局用户数上限：宁可丢掉最老的，也不让降级期把堆撑爆 */
+    private static final int LOCAL_BUFFER_MAX_USERS = 10_000;
+    /** 每次机会性回写最多 flush 多少条，避免 Redis 刚恢复时被一次性打满 */
+    private static final int LOCAL_FLUSH_BATCH = 20;
+
     private final StringRedisTemplate redis;
     private final Duration frameTtl;
     private final int maxFramesPerUser;
     private final Duration pointerTtl;
     /** 服务端指标：registry 为 null 时退化为空操作 */
     private final MessageMetrics metrics;
+
+    /**
+     * 降级缓冲：{@code userId -> 还没写进 Redis 的帧}（有界，队头是最老的）。
+     *
+     * <p>它<b>不是</b>第二份队列，而是「Redis 写不进去的那几条先别丢」的临时寄存处：
+     * <ul>
+     *   <li>本实例的 {@link #peek} 会把它拼在 Redis 帧之后一起下发，所以用户此刻重连仍能收到；</li>
+     *   <li>{@link #store} / {@link #peek} 每次都会尝试把它回写（{@link #flushLocal}），
+     *       成功后立刻移出——回写是 at-least-once，重复由客户端按 seq 去重；</li>
+     *   <li><b>跨实例不保证</b>：Redis 挂掉期间别的实例看不到这些帧。这正是「降级」与「正常态」的分界，
+     *       不假装它是一致性方案。</li>
+     * </ul>
+     */
+    private final Map<String, Deque<String>> localBuffer = new ConcurrentHashMap<>();
 
     /** 单测/无指标场景用：不接 registry */
     public OfflineMessageStore(StringRedisTemplate redis, Duration frameTtl,
@@ -264,14 +289,16 @@ public class OfflineMessageStore {
     // ==== 单聊：帧队列 ====
 
     public void store(String userId, String frame) {
-        Object raw = redis.execute((RedisCallback<Object>) connection -> connection.scriptingCommands().eval(
-                PUSH_FRAME, ReturnType.MULTI, 2,
-                queueKey(userId),
-                positionKey(userId),
-                frame.getBytes(StandardCharsets.UTF_8),
-                String.valueOf(maxFramesPerUser).getBytes(StandardCharsets.UTF_8),
-                String.valueOf(frameTtl.toMillis()).getBytes(StandardCharsets.UTF_8)));
-        recordSingle(raw, 1);
+        if (userId == null || frame == null) {
+            return;
+        }
+        // 顺手把降级期积压的挪回 Redis：不额外起任务，用已有的调用频率摊薄
+        flushLocal(userId);
+        if (!writeFrame(userId, frame)) {
+            // Redis 写不进去：先留在本进程。直接丢是不行的——用户重连时这条就永远看不到了，
+            // 而「离线消息」恰恰是「用户不在线」这个最需要兜底的场景。
+            bufferLocally(userId, frame);
+        }
     }
 
     /**
@@ -365,6 +392,7 @@ public class OfflineMessageStore {
         if (max <= 0) {
             return FrameBatch.EMPTY;
         }
+        flushLocal(userId);
         List<String> legacy = legacyDrain(userId, max);
         int budget = max - legacy.size();
         if (budget <= 0) {
@@ -373,11 +401,15 @@ public class OfflineMessageStore {
         long cursor = cursorOf(userId, deviceId);
         // score 是 per-user 入队序号（从 1 起），超过 2^53 才会丢精度，实际不可达
         Range<Double> range = Range.of(Range.Bound.exclusive((double) cursor), Range.Bound.unbounded());
-        Set<Tuple> tuples = readFrames(queueKey(userId), range, Limit.limit().count(budget));
+        Set<Tuple> tuples = RedisDegrade.call("offline.peek",
+                () -> readFrames(queueKey(userId), range, Limit.limit().count(budget)),
+                () -> null);
+        // 降级期积压的帧：Redis 里没有它们，只能从本进程补上
+        List<String> local = localFrames(userId);
         if (tuples == null || tuples.isEmpty()) {
-            return new FrameBatch(List.of(), 0L, legacy);
+            return new FrameBatch(local, 0L, legacy);
         }
-        List<String> frames = new ArrayList<>(tuples.size());
+        List<String> frames = new ArrayList<>(tuples.size() + local.size());
         long ackSeq = 0L;
         for (Tuple tuple : tuples) {
             byte[] member = tuple.getValue();
@@ -387,6 +419,9 @@ public class OfflineMessageStore {
                 ackSeq = (long) (double) score;
             }
         }
+        // 本地的是「更新的」那几条，排在 Redis 帧之后；它们没有 score，所以不参与 ackSeq，
+        // 会在下一次 flush 成功前被重复下发一次（客户端按 seq 去重）
+        frames.addAll(local);
         return new FrameBatch(frames, ackSeq, legacy);
     }
 
@@ -399,17 +434,26 @@ public class OfflineMessageStore {
         if (ackSeq <= 0) {
             return cursorOf(userId, deviceId);
         }
-        Long cursor = redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
-                ADVANCE_CURSOR, ReturnType.INTEGER, 1,
-                key(cursorKey(userId, deviceId)),
-                String.valueOf(ackSeq).getBytes(StandardCharsets.UTF_8),
-                String.valueOf(frameTtl.toMillis()).getBytes(StandardCharsets.UTF_8)));
+        Long cursor = RedisDegrade.call("offline.ack",
+                () -> redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
+                        ADVANCE_CURSOR, ReturnType.INTEGER, 1,
+                        key(cursorKey(userId, deviceId)),
+                        String.valueOf(ackSeq).getBytes(StandardCharsets.UTF_8),
+                        String.valueOf(frameTtl.toMillis()).getBytes(StandardCharsets.UTF_8))),
+                () -> null);
         return cursor == null ? 0L : cursor;
     }
 
-    /** 某台设备已确认到的位置（0 = 从未确认过） */
+    /**
+     * 某台设备已确认到的位置（0 = 从未确认过）。
+     *
+     * <p>Redis 不可用时返回 0 = 「从头补」：重复补发是幂等的（客户端按 seq 去重），
+     * 而猜一个更大的值就意味着永久漏掉中间那段。
+     */
     public long cursorOf(String userId, String deviceId) {
-        String raw = redis.opsForValue().get(cursorKey(userId, deviceId));
+        String raw = RedisDegrade.call("offline.cursor",
+                () -> redis.opsForValue().get(cursorKey(userId, deviceId)),
+                () -> null);
         if (raw == null || raw.isBlank()) {
             return 0L;
         }
@@ -430,10 +474,16 @@ public class OfflineMessageStore {
     public long pendingFrames(String userId, String deviceId) {
         long cursor = cursorOf(userId, deviceId);
         Range<Double> range = Range.of(Range.Bound.exclusive((double) cursor), Range.Bound.unbounded());
-        Long queued = redis.execute((RedisCallback<Long>) connection ->
-                connection.zSetCommands().zCount(queueKey(userId), range));
-        Long legacy = redis.opsForList().size(RedisKeys.userLegacyOffline(userId));
-        return (queued == null ? 0L : queued) + (legacy == null ? 0L : legacy);
+        Long queued = RedisDegrade.call("offline.pendingFrames",
+                () -> redis.execute((RedisCallback<Long>) connection ->
+                        connection.zSetCommands().zCount(queueKey(userId), range)),
+                () -> null);
+        Long legacy = RedisDegrade.call("offline.pendingLegacy",
+                () -> redis.opsForList().size(RedisKeys.userLegacyOffline(userId)),
+                () -> null);
+        // 降级期积压的那几条也要算进来，否则 remaining 会显示 0 而 peek 里还有内容
+        long buffered = localBufferedCount(userId);
+        return (queued == null ? 0L : queued) + (legacy == null ? 0L : legacy) + buffered;
     }
 
     /**
@@ -532,7 +582,9 @@ public class OfflineMessageStore {
         if (limit <= 0) {
             return Map.of();
         }
-        Map<Object, Object> entries = redis.opsForHash().entries(RedisKeys.userOfflinePtr(userId));
+        Map<Object, Object> entries = RedisDegrade.call("offline.pendingConversations",
+                () -> redis.opsForHash().entries(RedisKeys.userOfflinePtr(userId)),
+                Map::of);
         if (entries.isEmpty()) {
             return Map.of();
         }
@@ -556,7 +608,9 @@ public class OfflineMessageStore {
 
     /** 仍滞留待补发的会话数（用于 {@code remaining} 提示，不做精确到条数的估算） */
     public long pendingConversationCount(String userId) {
-        Long size = redis.opsForHash().size(RedisKeys.userOfflinePtr(userId));
+        Long size = RedisDegrade.call("offline.pendingConvCount",
+                () -> redis.opsForHash().size(RedisKeys.userOfflinePtr(userId)),
+                () -> null);
         return size == null ? 0L : size;
     }
 
@@ -571,12 +625,15 @@ public class OfflineMessageStore {
         if (conversationId == null || conversationId.isBlank() || nextSeq <= 0) {
             return false;
         }
-        Long moved = redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
-                ADVANCE_GROUP_CURSOR, ReturnType.INTEGER, 1,
-                key(groupCursorKey(userId, deviceId)),
-                conversationId.getBytes(StandardCharsets.UTF_8),
-                String.valueOf(nextSeq).getBytes(StandardCharsets.UTF_8),
-                String.valueOf(pointerTtl.toMillis()).getBytes(StandardCharsets.UTF_8)));
+        Long moved = RedisDegrade.call("offline.ackGroup",
+                () -> redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
+                        ADVANCE_GROUP_CURSOR, ReturnType.INTEGER, 1,
+                        key(groupCursorKey(userId, deviceId)),
+                        conversationId.getBytes(StandardCharsets.UTF_8),
+                        String.valueOf(nextSeq).getBytes(StandardCharsets.UTF_8),
+                        String.valueOf(pointerTtl.toMillis()).getBytes(StandardCharsets.UTF_8))),
+                () -> null);
+        // 推进失败 = false：调用方只会重补一遍，不会把指针抬错（那才是丢消息）
         return moved != null && moved > 0;
     }
 
@@ -589,7 +646,9 @@ public class OfflineMessageStore {
         if (conversationId == null || conversationId.isBlank()) {
             return 0L;
         }
-        Object raw = redis.opsForHash().get(groupCursorKey(userId, deviceId), conversationId);
+        Object raw = RedisDegrade.call("offline.groupCursor",
+                () -> redis.opsForHash().get(groupCursorKey(userId, deviceId), conversationId),
+                () -> null);
         Long seq = parseSeq(raw);
         return seq == null ? 0L : seq;
     }
@@ -601,7 +660,10 @@ public class OfflineMessageStore {
      * 因为那可能是旧版网关还没写过设备表。
      */
     public Set<String> knownDevices(String userId) {
-        Set<String> members = redis.opsForSet().members(RedisKeys.userDevices(userId));
+        // 空集合本身就是「不知道有哪些端」的保守语义，Redis 不可用时正好退化成它
+        Set<String> members = RedisDegrade.call("offline.knownDevices",
+                () -> redis.opsForSet().members(RedisKeys.userDevices(userId)),
+                () -> null);
         return members == null ? Set.of() : members;
     }
 
@@ -644,13 +706,120 @@ public class OfflineMessageStore {
      * 会话历史（新设备上线时），重则把还没补的那段永久标记成已补发。
      */
     public void clearPending(String userId, String conversationId) {
-        redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
-                CLEAR_PENDING, ReturnType.INTEGER, 1,
-                key(RedisKeys.userOfflinePtr(userId)),
-                conversationId.getBytes(StandardCharsets.UTF_8)));
+        // 清不掉只会让锚点多留一会儿（多补一遍），比让整个 pull 失败好
+        RedisDegrade.run("offline.clearPending", () ->
+                redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
+                        CLEAR_PENDING, ReturnType.INTEGER, 1,
+                        key(RedisKeys.userOfflinePtr(userId)),
+                        conversationId.getBytes(StandardCharsets.UTF_8))));
     }
 
     // ==== 内部 ====
+
+    /** 真正写一次帧队列；{@code false} = 已降级（Redis 不可用或返回空） */
+    private boolean writeFrame(String userId, String frame) {
+        Object raw = RedisDegrade.call("offline.store",
+                () -> redis.execute((RedisCallback<Object>) connection -> connection.scriptingCommands().eval(
+                        PUSH_FRAME, ReturnType.MULTI, 2,
+                        queueKey(userId),
+                        positionKey(userId),
+                        frame.getBytes(StandardCharsets.UTF_8),
+                        String.valueOf(maxFramesPerUser).getBytes(StandardCharsets.UTF_8),
+                        String.valueOf(frameTtl.toMillis()).getBytes(StandardCharsets.UTF_8))),
+                () -> null);
+        if (raw == null) {
+            return false;
+        }
+        recordSingle(raw, 1);
+        return true;
+    }
+
+    /** 放进降级缓冲（有界：单用户超上限丢最老的，全局用户数超上限丢新用户的） */
+    private void bufferLocally(String userId, String frame) {
+        if (localBuffer.size() >= LOCAL_BUFFER_MAX_USERS && !localBuffer.containsKey(userId)) {
+            log.warn("[offline] 降级缓冲已达用户上限 {}，丢弃新帧 user={}", LOCAL_BUFFER_MAX_USERS, userId);
+            return;
+        }
+        Deque<String> queue = localBuffer.computeIfAbsent(userId, _ -> new ArrayDeque<>());
+        synchronized (queue) {
+            while (queue.size() >= LOCAL_BUFFER_PER_USER) {
+                queue.pollFirst();
+            }
+            queue.addLast(frame);
+        }
+        log.debug("[offline] 帧进入降级缓冲 user={} depth={}", userId, queue.size());
+    }
+
+    /** 降级缓冲的当前内容（快照，调用方可以安全遍历） */
+    private List<String> localFrames(String userId) {
+        Deque<String> queue = localBuffer.get(userId);
+        if (queue == null) {
+            return List.of();
+        }
+        synchronized (queue) {
+            return queue.isEmpty() ? List.of() : List.copyOf(queue);
+        }
+    }
+
+    private long localBufferedCount(String userId) {
+        Deque<String> queue = localBuffer.get(userId);
+        if (queue == null) {
+            return 0L;
+        }
+        synchronized (queue) {
+            return queue.size();
+        }
+    }
+
+    /**
+     * 把降级缓冲尽力回写 Redis（{@value #LOCAL_FLUSH_BATCH} 条一批）。
+     *
+     * <p>回写是 <b>at-least-once</b>：可能同一条帧既走了本地下发、又写进了 Redis，
+     * 客户端按 seq 去重即可——这里选的是一致性更弱、但绝不丢消息的一侧。
+     */
+    private void flushLocal(String userId) {
+        Deque<String> queue = localBuffer.get(userId);
+        if (queue == null || RedisDegrade.isOpen("offline.store")) {
+            return;
+        }
+        int flushed = 0;
+        while (flushed < LOCAL_FLUSH_BATCH) {
+            String frame;
+            synchronized (queue) {
+                frame = queue.peekFirst();
+            }
+            if (frame == null) {
+                break;
+            }
+            if (!writeFrame(userId, frame)) {
+                break;
+            }
+            synchronized (queue) {
+                // 期间可能已被别的线程换掉队头，只在仍是同一条时移除
+                if (frame.equals(queue.peekFirst())) {
+                    queue.pollFirst();
+                }
+            }
+            flushed++;
+        }
+        if (queue.isEmpty()) {
+            localBuffer.remove(userId, queue);
+        }
+        if (flushed > 0) {
+            log.info("[offline] 降级缓冲回写 {} 条 user={}", flushed, userId);
+        }
+    }
+
+    /** 仅用于可观测性 / 测试：当前降级缓冲里的总帧数 */
+    public int localBufferedTotal() {
+        int total = 0;
+        for (Deque<String> queue : localBuffer.values()) {
+            synchronized (queue) {
+                total += queue.size();
+            }
+        }
+        return total;
+    }
 
     /**
      * 按位置区间读帧（只读命令，不删除任何数据）。

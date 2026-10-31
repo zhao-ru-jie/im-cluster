@@ -1,6 +1,7 @@
 package com.github.im.server.conversation;
 
 import com.github.im.contract.RedisKeys;
+import com.github.im.contract.resilience.RedisDegrade;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -182,13 +183,17 @@ public class ConversationStore {
      */
     public boolean updateMeta(String conversationId, String type, long seq, long time,
                               String from, String digest, String msgId) {
-        Long updated = redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
-                ADVANCE_META, ReturnType.INTEGER, 1,
-                key(RedisKeys.convMeta(conversationId)),
-                String.valueOf(seq).getBytes(StandardCharsets.UTF_8),
-                bytes(type), String.valueOf(time).getBytes(StandardCharsets.UTF_8),
-                bytes(from), bytes(digest), bytes(msgId),
-                String.valueOf(listTtl.toMillis()).getBytes(StandardCharsets.UTF_8)));
+        Long updated = RedisDegrade.call("conv.updateMeta",
+                () -> redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
+                        ADVANCE_META, ReturnType.INTEGER, 1,
+                        key(RedisKeys.convMeta(conversationId)),
+                        String.valueOf(seq).getBytes(StandardCharsets.UTF_8),
+                        bytes(type), String.valueOf(time).getBytes(StandardCharsets.UTF_8),
+                        bytes(from), bytes(digest), bytes(msgId),
+                        String.valueOf(listTtl.toMillis()).getBytes(StandardCharsets.UTF_8))),
+                () -> null);
+        // false 的语义是「这条消息的 seq 比已知的旧」——Redis 不可用时也返回 false，
+        // 调用方（受理路径）本来就不靠它决定成败，会话列表滞后可由拉取接口补
         return updated != null && updated > 0;
     }
 
@@ -224,13 +229,15 @@ public class ConversationStore {
      * @param baselineSeq 该用户首次看到这个会话时的 lastSeq（已读基线，历史不算未读）
      */
     public void touch(String userId, String conversationId, long lastTime, long baselineSeq) {
-        redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
-                TOUCH_USER_CONVERSATION, ReturnType.INTEGER, 2,
-                key(convsKey(userId)), key(readKey(userId)),
-                bytes(conversationId),
-                String.valueOf(lastTime).getBytes(StandardCharsets.UTF_8),
-                String.valueOf(baselineSeq).getBytes(StandardCharsets.UTF_8),
-                String.valueOf(listTtl.toMillis()).getBytes(StandardCharsets.UTF_8)));
+        // 会话列表是「可重建的投影」：写不进去只影响列表排序/未读，不影响消息本身
+        RedisDegrade.run("conv.touch", () ->
+                redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
+                        TOUCH_USER_CONVERSATION, ReturnType.INTEGER, 2,
+                        key(convsKey(userId)), key(readKey(userId)),
+                        bytes(conversationId),
+                        String.valueOf(lastTime).getBytes(StandardCharsets.UTF_8),
+                        String.valueOf(baselineSeq).getBytes(StandardCharsets.UTF_8),
+                        String.valueOf(listTtl.toMillis()).getBytes(StandardCharsets.UTF_8))));
     }
 
     /**
@@ -394,9 +401,16 @@ public class ConversationStore {
 
     // ==== 已读位置 ====
 
-    /** 该用户在某个会话上已读到哪（0 = 从未读过，但通常已被基线初始化成首见时的 lastSeq） */
+    /**
+     * 该用户在某个会话上已读到哪（0 = 从未读过，但通常已被基线初始化成首见时的 lastSeq）。
+     *
+     * <p>Redis 不可用时读成 0：未读数会偏大（可能显示「有一堆未读」），但不会把没读的判成已读。
+     * 反方向的兜底才是危险的——它会让用户永远看不到那几条消息。
+     */
     public long readSeq(String userId, String conversationId) {
-        Object raw = redis.opsForHash().get(readKey(userId), conversationId);
+        Object raw = RedisDegrade.call("conv.readSeq",
+                () -> redis.opsForHash().get(readKey(userId), conversationId),
+                () -> null);
         return parseLong(raw, 0L);
     }
 
@@ -406,15 +420,17 @@ public class ConversationStore {
         if (ids.isEmpty()) {
             return Map.of();
         }
-        List<Object> raw = redis.executePipelined((RedisCallback<Object>) connection -> {
-            for (String conversationId : ids) {
-                connection.hashCommands().hGet(key(readKey(userId)), bytes(conversationId));
-            }
-            return null;
-        });
+        List<Object> raw = RedisDegrade.call("conv.readSeqs",
+                () -> redis.executePipelined((RedisCallback<Object>) connection -> {
+                    for (String conversationId : ids) {
+                        connection.hashCommands().hGet(key(readKey(userId)), bytes(conversationId));
+                    }
+                    return null;
+                }),
+                List::of);
         Map<String, Long> result = new LinkedHashMap<>(ids.size());
         for (int i = 0; i < ids.size(); i++) {
-            result.put(ids.get(i), parseLong(raw.get(i), 0L));
+            result.put(ids.get(i), parseLong(i < raw.size() ? raw.get(i) : null, 0L));
         }
         return result;
     }
@@ -440,14 +456,16 @@ public class ConversationStore {
         Map<String, Long> result = new LinkedHashMap<>(ids.size());
         for (int from = 0; from < ids.size(); from += READ_SEQ_BATCH) {
             List<String> batch = ids.subList(from, Math.min(from + READ_SEQ_BATCH, ids.size()));
-            List<Object> raw = redis.executePipelined((RedisCallback<Object>) connection -> {
-                for (String userId : batch) {
-                    connection.hashCommands().hGet(key(readKey(userId)), bytes(conversationId));
-                }
-                return null;
-            });
+            List<Object> raw = RedisDegrade.call("conv.readSeqsOf",
+                    () -> redis.executePipelined((RedisCallback<Object>) connection -> {
+                        for (String userId : batch) {
+                            connection.hashCommands().hGet(key(readKey(userId)), bytes(conversationId));
+                        }
+                        return null;
+                    }),
+                    List::of);
             for (int i = 0; i < batch.size(); i++) {
-                result.put(batch.get(i), parseLong(raw.get(i), 0L));
+                result.put(batch.get(i), parseLong(i < raw.size() ? raw.get(i) : null, 0L));
             }
         }
         return result;
@@ -460,13 +478,17 @@ public class ConversationStore {
      * @return 推进后的已读位置
      */
     public long markRead(String userId, String conversationId, long seq, long capSeq) {
-        Long current = redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
-                ADVANCE_READ, ReturnType.INTEGER, 1,
-                key(readKey(userId)),
-                bytes(conversationId),
-                String.valueOf(Math.max(seq, 0)).getBytes(StandardCharsets.UTF_8),
-                String.valueOf(capSeq).getBytes(StandardCharsets.UTF_8),
-                String.valueOf(listTtl.toMillis()).getBytes(StandardCharsets.UTF_8)));
+        Long current = RedisDegrade.call("conv.markRead",
+                () -> redis.execute((RedisCallback<Long>) connection -> connection.scriptingCommands().eval(
+                        ADVANCE_READ, ReturnType.INTEGER, 1,
+                        key(readKey(userId)),
+                        bytes(conversationId),
+                        String.valueOf(Math.max(seq, 0)).getBytes(StandardCharsets.UTF_8),
+                        String.valueOf(capSeq).getBytes(StandardCharsets.UTF_8),
+                        String.valueOf(listTtl.toMillis()).getBytes(StandardCharsets.UTF_8))),
+                () -> null);
+        // 0 = 「这次没有推进」。Redis 不可用时宁可让已读位置停在原处（用户下次上报会再推一次），
+        // 也不能让上报把位置写坏
         return current == null ? 0L : current;
     }
 

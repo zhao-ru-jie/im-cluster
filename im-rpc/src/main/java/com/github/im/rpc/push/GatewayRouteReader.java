@@ -1,6 +1,7 @@
 package com.github.im.rpc.push;
 
 import com.github.im.contract.RedisKeys;
+import com.github.im.contract.resilience.RedisDegrade;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.RedisCallback;
@@ -50,9 +51,27 @@ public class GatewayRouteReader {
      */
     private static final int SHARD_SIZE = 500;
 
+    /** 降级缓存容量上限：超过就整表丢掉重建，路由本身是可重建的短期信息 */
+    private static final int ROUTE_CACHE_LIMIT = 20_000;
+    /** 缓存有效期与网关侧的 key TTL 对齐（30s）：过期后宁可当离线，也不要把消息推给早就没连的实例 */
+    private static final long ROUTE_CACHE_TTL_MS = 30_000;
+
     private final StringRedisTemplate redis;
     /** 分片并发用虚拟线程：纯阻塞等 Redis，数量受「人数 / SHARD_SIZE」约束，不会膨胀 */
     private final ExecutorService shards = Executors.newVirtualThreadPerTaskExecutor();
+
+    /**
+     * 最近一次成功查到的路由（Redis 降级期拿来用）。
+     *
+     * <p>为什么值得缓存：「查不到路由」的默认处理是<b>把目标判成离线</b>，于是消息全量涌进
+     * 离线队列——而离线队列同样在 Redis 上。Redis 抖一下，路由与队列会被同一条故障链打两次。
+     * 用一份 30 秒内的旧路由去推，最坏是推给一个已断开的实例（那次推送失败，才走离线），
+     * 比「所有人都判离线」好得多。
+     */
+    private final Map<String, CachedRoute> routeCache = new ConcurrentHashMap<>();
+
+    private record CachedRoute(Set<String> instances, long at) {
+    }
 
     public GatewayRouteReader(StringRedisTemplate redis) {
         this.redis = redis;
@@ -63,14 +82,17 @@ public class GatewayRouteReader {
      */
     public Set<String> instancesOf(String userId) {
         String key = RedisKeys.gatewayUser(userId);
-        try {
-            Set<String> members = redis.opsForSet().members(key);
-            return members == null ? Set.of() : members;
-        } catch (RuntimeException e) {
-            // 滚动升级期间可能遇到旧版写入的 String 类型 key：按离线处理，
-            // 由 IM 服务的离线队列兜底；网关会很快用 SET 重写这个 key（TTL 30s）
-            return Set.of();
+        Set<String> fresh = RedisDegrade.call("route.read",
+                () -> redis.opsForSet().members(key),
+                () -> null);
+        if (fresh == null) {
+            // Redis 不可用 / 熔断期：用最近一次查到的路由（滚动升级期间旧 String 类型 key 也走这里）
+            Set<String> stale = cachedRoute(userId);
+            log.debug("[route] 路由查询降级 user={} cached={}", userId, stale.size());
+            return stale;
         }
+        rememberRoute(userId, fresh);
+        return fresh;
     }
 
     /**
@@ -130,12 +152,34 @@ public class GatewayRouteReader {
             }
         } catch (RuntimeException e) {
             // 两种情况会走到这里：Redis Cluster 下跨 slot（CROSSSLOT），或旧 String 类型 key。
-            // 逐条退化的代价是慢，但绝不能让整条群消息因为路由查询失败而全部落离线。
-            log.debug("[route] 批量路由不可用（{}），退化为逐条查询", e.getMessage());
+            // 逐条退化在这里<b>没有收益</b>：Redis 已经不可用时，逐条只是把 N 次失败重放一遍
+            // （熔断打开前还有 N 次超时），所以直接用降级缓存。
+            log.debug("[route] 批量路由不可用（{}），改用降级缓存", e.getMessage());
             for (String id : ids) {
-                out.put(id, instancesOf(id));
+                out.put(id, cachedRoute(id));
             }
         }
+    }
+
+    /** 最近一次成功查到的路由；超过 {@value #ROUTE_CACHE_TTL_MS} 或从未查到过就是空集合 */
+    private Set<String> cachedRoute(String userId) {
+        CachedRoute cached = routeCache.get(userId);
+        if (cached == null || System.currentTimeMillis() - cached.at() > ROUTE_CACHE_TTL_MS) {
+            return Set.of();
+        }
+        return cached.instances();
+    }
+
+    /** 只缓存「查到了实例」的结果：空集合缓存下来没有意义，还会占满容量 */
+    private void rememberRoute(String userId, Set<String> instances) {
+        if (instances == null || instances.isEmpty()) {
+            routeCache.remove(userId);
+            return;
+        }
+        if (routeCache.size() >= ROUTE_CACHE_LIMIT) {
+            routeCache.clear();
+        }
+        routeCache.put(userId, new CachedRoute(Set.copyOf(instances), System.currentTimeMillis()));
     }
 
     /** pipeline 结果可能是 {@code Set<String>}，也可能是原始 {@code Set<byte[]>}，两种都认 */

@@ -27,6 +27,15 @@ spring:
     redis:
       host: ${SPRING_DATA_REDIS_HOST:localhost}
       port: ${SPRING_DATA_REDIS_PORT:6379}
+      # 默认命令超时是 60s 级：Redis 被网络黑洞时上行会全堵在这里，远超 gRPC deadline。
+      # 1s + RedisDegrade 短路，把「Redis 挂」限制成「这一次降级」。
+      timeout: ${IM_REDIS_TIMEOUT:1s}
+      connect-timeout: ${IM_REDIS_CONNECT_TIMEOUT:1s}
+      # 真正的「消除单点」要靠部署形态：单节点 Redis 只能靠降级扛故障，不能自动切换。
+      # 上高可用时把 host/port 换成哨兵（主从 + 自动 failover），客户端会自己找到新主：
+      # sentinel:
+      #   master: ${IM_REDIS_SENTINEL_MASTER:mymaster}
+      #   nodes: ${IM_REDIS_SENTINEL_NODES:127.0.0.1:26379,127.0.0.1:26380}
   # IM 服务对外暴露的 gRPC：
   #   im.ingress.v1.MessageIngress -> SubmitMessage / BatchSubmit / PullPending（网关调用）
   grpc:
@@ -61,6 +70,14 @@ management:
       probes:
         enabled: true
       show-details: never
+  health:
+    redis:
+      # 关键：Redis 挂不能让本实例被判 NOT_SERVING 而被网关摘掉。
+      # 默认指示器 -> 聚合 DOWN -> spring.grpc.server.health NOT_SERVING -> 网关摘实例，
+      # 而 Redis 恰恰是所有实例共享的同一个单点：摘完等于全集群不可用。
+      # 现在 Redis 故障时各热路径各自降级（im.contract.resilience.RedisDegrade），
+      # 实例继续服务本机可完成的读写；可观测性看指标与 [redis-degrade] 日志。
+      enabled: false
 
 im:
   # —— 存储形态 ——
@@ -69,6 +86,13 @@ im:
   #   mongodb      : MongoDB（im-storage-mongodb 模块），文档形态；需要配下面 im.mongo.*
   # 三种形态各自提供同一组端口（消息 / 群 / 成员 / 关系链），业务侧不感知介质。
   storage: ${IM_STORAGE:mongodb}
+  redis:
+    degrade:
+      # Redis 承载的是「热路径共享状态」（发号/幂等/离线队列/游标/水位/路由/在线态），
+      # 它挂掉时不能每条请求都去等一次超时：连续失败这么多次后短路，窗口期内直接走本地兜底。
+      # 窗口结束后会放一个请求去试探，成功即恢复（见 com.github.im.contract.resilience.RedisDegrade）。
+      fail-threshold: ${IM_REDIS_DEGRADE_FAIL_THRESHOLD:3}
+      open-millis: ${IM_REDIS_DEGRADE_OPEN_MILLIS:2000}
   db:
     url: ${IM_DB_URL:jdbc:mysql://127.0.0.1:3306/im-cluster?useSSL=true&useUnicode=true&characterEncoding=UTF-8&autoReconnect=true&failOverReadOnly=false}
     username: ${IM_DB_USERNAME:root}

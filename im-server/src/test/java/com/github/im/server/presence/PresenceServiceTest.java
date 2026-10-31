@@ -193,7 +193,7 @@ class PresenceServiceTest {
     @Test
     @DisplayName("下线：其它实例还连着时<不广播>，也不写 lastSeen")
     void offlineReportIsIgnoredWhileStillOnline() {
-        when(store.online("alice")).thenReturn(true);
+        when(store.onlineState("alice")).thenReturn(PresenceStore.OnlineState.ONLINE);
 
         PresenceReportAck ack = service.reportPresence(PresenceReport.newBuilder()
                 .setUserId("alice")
@@ -211,7 +211,7 @@ class PresenceServiceTest {
     @Test
     @DisplayName("下线：确认没人连着才广播，并记下 lastSeen")
     void offlineReportBroadcastsWhenTrulyOffline() {
-        when(store.online("alice")).thenReturn(false);
+        when(store.onlineState("alice")).thenReturn(PresenceStore.OnlineState.OFFLINE);
         when(notifier.notifyChange(eq("alice"), eq(false), anyLong())).thenReturn(2);
 
         PresenceReportAck ack = service.reportPresence(PresenceReport.newBuilder()
@@ -224,6 +224,24 @@ class PresenceServiceTest {
         assertTrue(ack.getBroadcast());
         verify(store).touchLastSeen("alice", 300L);
         verify(notifier).notifyChange("alice", false, 300L);
+    }
+
+    @Test
+    @DisplayName("下线：Redis 降级导致在线态不可判定时<不广播>，也不能当成「确实离线」")
+    void offlineReportIsSkippedWhenPresenceUnknown() {
+        when(store.onlineState("alice")).thenReturn(PresenceStore.OnlineState.UNKNOWN);
+
+        PresenceReportAck ack = service.reportPresence(PresenceReport.newBuilder()
+                .setUserId("alice")
+                .setOnline(false)
+                .setGatewayInstance("10.0.0.2:7001")
+                .setTs(400L)
+                .build());
+
+        assertEquals(0, ack.getCode());
+        assertFalse(ack.getBroadcast(), "「不知道」不能当成「确实下线」——Redis 抖一下所有人的好友列表就灰了");
+        verify(notifier, never()).notifyChange(anyString(), anyBoolean(), anyLong());
+        verify(store, never()).touchLastSeen(anyString(), anyLong());
     }
 
     @Test

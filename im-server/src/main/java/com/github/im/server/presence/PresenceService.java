@@ -176,7 +176,20 @@ public class PresenceService implements PresencePort {
                     .setBroadcast(delivered > 0)
                     .build();
         }
-        if (store.online(userId)) {
+        PresenceStore.OnlineState state = store.onlineState(userId);
+        if (state == PresenceStore.OnlineState.UNKNOWN) {
+            // Redis 降级：我们<b>不知道</b>其它实例上还有没有这个用户的连接。
+            // 此时广播「全局下线」就是拿展示信息去换一个错误的副作用——列表灰一下比误判下线轻，
+            // 所以这里跳过广播，等下一次真实的上报或心跳再纠正。
+            log.warn("[presence] 在线态不可判定（Redis 降级），跳过下线广播 user={} gateway={}",
+                    userId, report.getGatewayInstance());
+            return PresenceReportAck.newBuilder()
+                    .setCode(0)
+                    .setMessage("presence degraded, offline broadcast skipped")
+                    .setBroadcast(false)
+                    .build();
+        }
+        if (state == PresenceStore.OnlineState.ONLINE) {
             // 别的网关实例上还有这个用户的连接：这次「下线」只是局部的，绝不能广播全局下线
             log.debug("[presence] 收到下线上报但仍在线，跳过广播 user={} gateway={}",
                     userId, report.getGatewayInstance());

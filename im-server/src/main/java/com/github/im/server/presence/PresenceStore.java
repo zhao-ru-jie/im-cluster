@@ -1,6 +1,7 @@
 package com.github.im.server.presence;
 
 import com.github.im.contract.RedisKeys;
+import com.github.im.contract.resilience.RedisDegrade;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -118,18 +119,38 @@ public class PresenceStore {
         return result;
     }
 
+    /**
+     * 在线判定的三态结果。
+     *
+     * <p>为什么必须是三态而不是 boolean：这里同时存在两种完全不同的「不在线」——
+     * <ul>
+     *   <li>{@link #OFFLINE}：查到了，确实没有连接；</li>
+     *   <li>{@link #UNKNOWN}：Redis 不可用，<b>不知道</b>。</li>
+     * </ul>
+     * 合并成 boolean 后，「不知道」会被当成「确实下线」，于是下线路径会跳过
+     * 「其它实例是否还有连接」的复核，直接广播全局下线——Redis 抖动一下，所有人的好友列表
+     * 都灰一遍。展示口径可以退化成离线，<b>但事件驱动的副作用不能</b>。
+     */
+    public enum OnlineState {
+        ONLINE, OFFLINE, UNKNOWN
+    }
+
     /** 单个用户是否在线（不关心设备数与 lastSeen 的调用方用这个，少两条命令） */
     public boolean online(String userId) {
+        return onlineState(userId) == OnlineState.ONLINE;
+    }
+
+    /** 在线状态（三态）：展示用 {@link #online}，需要据此做副作用判断的用这个 */
+    public OnlineState onlineState(String userId) {
         if (userId == null || userId.isBlank()) {
-            return false;
+            return OnlineState.OFFLINE;
         }
-        try {
-            Long size = redis.opsForSet().size(RedisKeys.gatewayUser(userId));
-            return size != null && size > 0;
-        } catch (RuntimeException e) {
-            log.debug("[presence] 在线判定失败，按离线处理 user={} err={}", userId, e.getMessage());
-            return false;
-        }
+        return RedisDegrade.call("presence.online",
+                () -> {
+                    Long size = redis.opsForSet().size(RedisKeys.gatewayUser(userId));
+                    return size != null && size > 0 ? OnlineState.ONLINE : OnlineState.OFFLINE;
+                },
+                () -> OnlineState.UNKNOWN);
     }
 
     /**

@@ -4,6 +4,7 @@ import com.github.im.contract.MessageEnvelope;
 import com.github.im.contract.MessageEnvelopes;
 import com.github.im.contract.MessageIngress;
 import com.github.im.contract.RedisKeys;
+import com.github.im.contract.resilience.RedisDegrade;
 import com.github.im.proto.ingress.v1.AckPendingRequest;
 import com.github.im.proto.ingress.v1.AckPendingResponse;
 import com.github.im.proto.ingress.v1.ConversationSummary;
@@ -222,7 +223,12 @@ public class MessageService implements MessageIngress {
                     envelope.from(), envelope.to(), envelope.convType(),
                     envelope.clientMsgId(), envelope.body(), receivedAt,
                     envelope.contentType(), envelope.attrs()));
-            redis.opsForValue().set(idemKey, serverMsgId + IDEM_SEP + seq, IDEM_TTL);
+            // 幂等记录：先落进程内（同一实例的重试立刻可判重），再尽力写 Redis。
+            // Redis 写失败<b>不能</b>把已经落库成功的消息变成 503 —— 那会让客户端重试出一条新消息，
+            // 幂等记录反而是「因为保它而丢了本来要保的东西」。
+            String idemValue = serverMsgId + IDEM_SEP + seq;
+            seqAllocator.rememberIdem(idemKey, idemValue);
+            RedisDegrade.run("idem.set", () -> redis.opsForValue().set(idemKey, idemValue, IDEM_TTL));
             metrics.phase(MessageMetrics.PHASE_PERSIST, System.nanoTime() - persistStartedAt);
 
             // 会话模型：元信息 + 成员会话列表（写扩散）。放在推送之前，因为
