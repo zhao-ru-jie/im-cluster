@@ -136,6 +136,14 @@ message PullPendingRequest {
   // 游标必须是 per-device 的——手机和网页各自补到哪互不相干。用用户级单一游标时，
   // 先上线的设备一确认，另一个设备就永远补不到那段消息（这正是之前的 at-most-once 来源之一）。
   string device_id = 4;
+
+  // 显式请求一次「新端回放」（见 PullPendingResponse.replay_frames）。
+  //
+  // 自动路径<b>不需要</b>它：服务端发现这台设备从没被回放过，会自己带上回放
+  // （标记 im:user:{userId}:replay:{deviceId}，在网关确认写成功之后才落）。
+  // 这个开关留给「客户端本地库被清空 / 重装，但 deviceId 没变」——
+  // 此时服务端认为它已经回放过，只有显式请求才能再要一次。
+  bool replay = 5;
 }
 
 message PullPendingResponse {
@@ -148,6 +156,20 @@ message PullPendingResponse {
   // 0 / 空 map 表示本批没有需要确认的东西（没有帧、或全部来自旧结构的一次性迁移读）。
   int64 ack_single_seq = 3;               // 单聊：本批覆盖到的最大 seq
   map<string, int64> ack_group_seqs = 4;  // 群聊：conversation_id -> 本批补到哪（下一条待补的 seq）
+
+  // —— 新端回放：最近 M 个会话 × 每个最近 N 条 ——
+  //
+  // 与 frames 同构（都是 msg.push），客户端不需要第二套解析、也不需要额外的落库路径。
+  // 关键区别：**不参与补发游标**。ack_single_seq / ack_group_seqs 只描述 frames；
+  // 回放是「快照」而不是「队列」，把它算进游标等于新设备首次上线顺手把离线队列
+  // 标成已消费——那才是真的丢消息。
+  //
+  // 为什么要有它：群补发锚点会在「所有已登记设备都补过」之后退休（clearPending），
+  // 此后新增设备拿到的补发是空的，只能宿主自己拉历史。回放把「新端登录能看到最近消息」
+  // 变成服务端的职责，而不是每个宿主自己实现一遍。
+  repeated string replay_frames = 5;
+  int32 replay_conversations = 6;  // 本次回放覆盖了几个会话（用于日志与客户端提示）
+  bool replay_truncated = 7;       // 回放不完整（预算用尽或某会话读失败），客户端可自行拉更早历史
 }
 
 message AckPendingRequest {
@@ -155,6 +177,13 @@ message AckPendingRequest {
   string device_id = 2;                     // 与 PullPendingRequest.device_id 一致，定位游标
   int64 ack_single_seq = 3;                 // 原样回传 PullPendingResponse.ack_single_seq
   map<string, int64> ack_group_seqs = 4;    // 原样回传 PullPendingResponse.ack_group_seqs
+
+  // 回放帧是否也全部写进连接了 → 服务端给这台设备落「已回放过」标记。
+  //
+  // 为什么要等这个确认而不是在生成回放时就落标记：标记一落，自动回放就不再触发。
+  // 网关写失败时若已经落了标记，这台设备会停在「服务端以为它有了、它实际什么都没有」的状态，
+  // 而且没有任何机制能纠正它。宁可在写失败时重复回放（客户端按 seq 去重），也不要假成功。
+  bool replay_delivered = 5;
 }
 
 message AckPendingResponse {

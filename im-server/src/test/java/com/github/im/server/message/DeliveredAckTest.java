@@ -252,7 +252,7 @@ class DeliveredAckTest {
         return new MessageService(TestRedis.template(), repository, store(),
                 new ClientFrames(), delivery, seqAllocator, watermarkStore(),
                 new ConversationStore(TestRedis.template(), TTL, 1000), groupMembers, stateNotifier(),
-                null, null, null, Duration.ofMinutes(2), new MessageMetrics(null));
+                null, null, null, Duration.ofMinutes(2), new MessageMetrics(null), null);
     }
 
     /** 状态回执器：真正走一遍 {@link MessageStateNotifier}，推送落到 {@link #pushed} 队列里 */

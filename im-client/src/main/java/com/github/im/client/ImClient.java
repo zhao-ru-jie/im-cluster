@@ -493,6 +493,23 @@ public final class ImClient implements AutoCloseable {
         sendControl(frames.sync(table.inboundWatermarks()));
     }
 
+    /**
+     * 主动要一次「新端回放」：服务端会把最近 M 个会话的最近 N 条重新推一遍。
+     *
+     * <p>什么时候需要它：服务端只在<b>这台设备第一次上线</b>时自动回放。如果宿主本地库
+     * 被清空（用户手动清缓存、换机但复用了同一个 deviceId、本地表迁移失败），
+     * 服务端那边仍然记着「已经回放过」，自动路径不会触发——这时调一次本方法即可。
+     *
+     * <p>重复调用是安全的：回放帧与离线补发帧走同一条 {@code msg.push} 通道，
+     * 本地消息表按 {@code (conversationId, seq)} 精确去重，重复帧被静默丢弃。
+     * 回放帧也<b>不推进</b>任何补发游标，所以它不会让离线队列里没收到过的消息被跳过。
+     *
+     * @return 本帧是否发出（没连上为 false，可以重连后再调）
+     */
+    public boolean requestReplay() {
+        return sendControl(frames.sync(table.inboundWatermarks(), true));
+    }
+
     // ==== 本地消息表访问 ====
 
     /**

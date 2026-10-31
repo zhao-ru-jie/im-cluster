@@ -279,7 +279,7 @@ class ConversationFlowTest {
         return new MessageService(TestRedis.template(), repository, store(),
                 new ClientFrames(), delivery, seqAllocator, watermarkStore,
                 new ConversationStore(TestRedis.template(), TTL, 1000), groupMembers, null, null,
-                null, null, Duration.ofMinutes(2), new MessageMetrics(null));
+                null, null, Duration.ofMinutes(2), new MessageMetrics(null), null);
     }
 
     private OfflineMessageStore store() {

@@ -72,6 +72,9 @@ class MessageServicePullPendingTest {
             redis.delete(RedisKeys.userDevices(id));
             redis.delete(RedisKeys.userOfflinePtr(id));
             redis.delete(RedisKeys.userLegacyOffline(id));
+            redis.delete(RedisKeys.userReplay(id, WEB));
+            redis.delete(RedisKeys.userReplay(id, PHONE));
+            redis.delete(RedisKeys.userReplay(id, "default"));
         }
     }
 
@@ -297,14 +300,63 @@ class MessageServicePullPendingTest {
         verify(repository).since(eq(conversation), eq(8L), anyInt());
     }
 
+    // ==== 新端回放 ====
+
+    @Test
+    @DisplayName("新端回放与补发走两套账：不推进任何游标，标记等网关确认写成功之后才落")
+    void replayIsIndependentOfCursors() {
+        String userId = newUser();
+        String conversation = TestRedis.conversationId();
+        // 会话列表里要有它，回放才知道该回放哪个会话
+        conversations().touch(userId, conversation, 1_700_000_000_000L, 0);
+        when(repository.before(eq(conversation), anyLong(), anyInt()))
+                .thenReturn(List.of(message(conversation, 1), message(conversation, 2)));
+        GroupMemberRepository groupMembers = mock(GroupMemberRepository.class);
+        when(groupMembers.groupsOf(userId)).thenReturn(List.of());
+        MessageService service = service(replayService(groupMembers));
+
+        PullPendingResponse first = service.pullPending(request(userId, WEB, 200));
+        assertEquals(2, first.getReplayFramesCount());
+        assertEquals(1, first.getReplayConversations());
+        assertEquals(0, first.getAckSingleSeq(), "回放不能产生单聊游标确认");
+        assertEquals(0, first.getAckGroupSeqsCount(), "回放不能产生群补发游标确认");
+
+        // 网关还没确认写成功 → 标记不落，重复 pull 仍然回放（客户端按 seq 去重，重复无害）
+        assertEquals(2, service.pullPending(request(userId, WEB, 200)).getReplayFramesCount(),
+                "写失败时下次重连必须还能拿到回放");
+
+        service.ackPending(AckPendingRequest.newBuilder()
+                .setUserId(userId).setDeviceId(WEB).setReplayDelivered(true).build());
+
+        assertEquals(0, service.pullPending(request(userId, WEB, 200)).getReplayFramesCount(),
+                "确认之后这台设备不再自动回放");
+        assertEquals(2, service.pullPending(PullPendingRequest.newBuilder()
+                        .setUserId(userId).setDeviceId(WEB).setReplay(true).build()).getReplayFramesCount(),
+                "显式请求仍然能再要一次：本地库被清空但 deviceId 没变时靠它");
+    }
+
     // ==== 辅助 ====
 
     private MessageService service() {
+        return service(null);
+    }
+
+    /** @param replay 可空：传入真的 {@link NewDeviceReplayService} 才覆盖回放路径 */
+    private MessageService service(NewDeviceReplayService replay) {
         return new MessageService(TestRedis.template(), repository, store(),
                 new ClientFrames(), delivery, seqAllocator, watermarkStore,
-                new ConversationStore(TestRedis.template(), TTL, 1000),
+                conversations(),
                 mock(GroupMemberRepository.class), null, null, null, null, Duration.ofMinutes(2),
-                new MessageMetrics(null));
+                new MessageMetrics(null), replay);
+    }
+
+    private NewDeviceReplayService replayService(GroupMemberRepository groupMembers) {
+        return new NewDeviceReplayService(conversations(), groupMembers, repository, new ClientFrames(),
+                TestRedis.template(), true, 20, 20, 300, TTL);
+    }
+
+    private ConversationStore conversations() {
+        return new ConversationStore(TestRedis.template(), TTL, 1000);
     }
 
     private OfflineMessageStore store() {

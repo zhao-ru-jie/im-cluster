@@ -133,7 +133,9 @@ public class SessionLifecycle {
         }
         // 设备级上报：台账 + 多端登录通知（「你的账号在另一台设备登录了」）
         reportDevice(session, true);
-        pullPending(session, Map.of());
+        // 建连时不带水位、也不显式要回放：服务端会自己判断「这台设备是不是第一次上线」，
+        // 首次就连同回放一起下发（见 NewDeviceReplayService）
+        pullPending(session, Map.of(), false);
     }
 
     /** 收到一帧上行报文（WS 的 TextMessage / TCP 的长度帧解码后的 String） */
@@ -163,7 +165,9 @@ public class SessionLifecycle {
         }
         if (ClientFrames.TYPE_SYNC.equals(type)) {
             // 上报消费水位 + 顺带补拉缺口。放在 send 之前处理：它不改消息流，只更新服务端视图。
-            pullPending(session, watermarksOf(node));
+            // replay 显式开关：客户端本地库被清空/重装但 deviceId 没变时，服务端已不再自动回放，
+            // 只能靠这个标志再要一次（缺省 false，正常重连不会重复回放）。
+            pullPending(session, watermarksOf(node), boolValue(node, "replay", false));
             return;
         }
         if (ClientFrames.TYPE_RECV.equals(type)) {
@@ -289,9 +293,14 @@ public class SessionLifecycle {
      * <p>反过来（先 ack 再写、或服务端读即删）在网络抖动下的表现是：
      * 用户看到「有离线消息」的提示，重连后却永远收不到那一批——这正是之前 at-most-once 的来源。
      *
-     * @param session 补发所属连接，deviceId 决定用哪一套游标（手机/网页各自补、互不干扰）
+     * <p>同一个响应里还带着一队<b>新端回放帧</b>（{@code replay_frames}）：它不推进任何游标，
+     * 用来给「第一次上线的设备」填最近 M 个会话的最近 N 条。顺序上先写回放、再写补发，
+     * 这样客户端在一轮里看到的 seq 是单调的。
+     *
+     * @param session         补发所属连接，deviceId 决定用哪一套游标（手机/网页各自补、互不干扰）
+     * @param replayRequested 客户端显式要一次回放（本地库被清空/重装但 deviceId 没变）
      */
-    private void pullPending(ClientSession session, Map<String, Long> watermarks) {
+    private void pullPending(ClientSession session, Map<String, Long> watermarks, boolean replayRequested) {
         String userId = session.userId();
         MessageIngress ingress = ingressProvider.getIfAvailable();
         if (ingress == null) {
@@ -302,22 +311,24 @@ public class SessionLifecycle {
             PullPendingRequest.Builder request = PullPendingRequest.newBuilder()
                     .setUserId(userId)
                     .setDeviceId(deviceId)
-                    .setMax(DEFAULT_PULL_MAX);
+                    .setMax(DEFAULT_PULL_MAX)
+                    .setReplay(replayRequested);
             if (!watermarks.isEmpty()) {
                 request.putAllWatermarks(watermarks);
             }
             // 通过grpc调用RemoteMessageIngress这个类，grpc服务端MessageIngressGrpcService接收到请求，会调用MessageService这个类进行业务处理
             PullPendingResponse pending = ingress.pullPending(request.build());
-            boolean allSent = true;
-            for (String frame : pending.getFramesList()) {
-                // 只推给发起补发的这条连接，不是扇出到该用户所有设备：
-                // 每台设备都有自己的补发游标，会各自拉一遍；扇出会让「手机上线」把同一批
-                // 离线消息同时砸给网页，重复一遍而且让各端的未读数一起跳。
-                if (!connectionManager.sendTo(userId, session, frame)) {
-                    allSent = false;
-                    break;
-                }
-            }
+            // 先回放（更早的消息）再补发（之后缺的）：一轮里客户端看到的 seq 天然单调，
+            // 不用自己倒排。只推给发起补发的这条连接——每台设备都有自己的游标，
+            // 扇出会让「手机上线」把同一批同时砸给网页，各端未读数一起跳。
+            int replayWritten = writeFrames(userId, session, pending.getReplayFramesList());
+            boolean replayComplete = replayWritten == pending.getReplayFramesCount();
+            // 回放没写完就不要再往下写补发：下次重连整批重来，顺序仍然保持一致，
+            // 而「回放只写了一半、补发全写成功」会让服务端误以为这台设备已经看全了。
+            int pendingWritten = replayComplete
+                    ? writeFrames(userId, session, pending.getFramesList())
+                    : 0;
+            boolean allSent = replayComplete && pendingWritten == pending.getFramesCount();
             if (allSent) {
                 // 「我发出去了」由网关自证，与客户端的端到端 ACK（msg.recv → AckDelivered）
                 // 不是同一件事，别把这里当成后者的重复实现：
@@ -326,11 +337,16 @@ public class SessionLifecycle {
                 // 不能只留 ACK：客户端可能永远不回（进程被杀、冻结、关机），等它才清队列等于让
                 // 队列无限堆积、每次重连重发同一批；而且用户说「没收到」时，正是靠
                 // 「游标动了没 / 水位动了没」区分「网关没写出去」还是「客户端没收到」。
-                ackPending(ingress, userId, deviceId, pending);
+                //
+                // 回放帧单独确认（replay_delivered）：它不推进游标，只让服务端记下
+                // 「这台设备已经回过放了」，否则每次重连都会重放一遍最近 N 条。
+                ackPending(ingress, userId, deviceId, pending,
+                        pending.getReplayFramesCount() > 0 && replayWritten > 0);
             } else {
                 // 不 ack = 服务端游标不动，下次重连重发同一批。绝不「先确认再写」。
-                log.warn("[offline] 补发中途写失败，保留原位置待下次重连重发 user={} device={} delivered={}/{}",
-                        userId, deviceId, pending.getFramesCount() - 1, pending.getFramesCount());
+                log.warn("[offline] 补发/回放中途写失败，保留原位置待下次重连重发 user={} device={} delivered={}/{}",
+                        userId, deviceId, replayWritten + pendingWritten,
+                        pending.getReplayFramesCount() + pending.getFramesCount());
             }
             if (pending.getRemaining() > 0) {
                 log.info("user {} still has {} pending messages", userId, pending.getRemaining());
@@ -353,8 +369,12 @@ public class SessionLifecycle {
      * <p>失败只记日志不回抛：确认丢了最坏就是下次重连重复补发（客户端按 seq 去重），
      * 把补发失败升级成连接层错误反而会伤害真正稀缺的东西。
      */
-    private void ackPending(MessageIngress ingress, String userId, String deviceId, PullPendingResponse pending) {
-        if (pending.getAckSingleSeq() <= 0 && pending.getAckGroupSeqsCount() == 0) {
+    private void ackPending(MessageIngress ingress, String userId, String deviceId,
+                            PullPendingResponse pending, boolean replayDelivered) {
+        boolean hasCursorAck = pending.getAckSingleSeq() > 0 || pending.getAckGroupSeqsCount() > 0;
+        // 只有回放帧、没有任何游标可推时也要回一次：否则这台设备永远不被记为「已回放过」，
+        // 每次重连都要重放最近 N 条。
+        if (!hasCursorAck && !replayDelivered) {
             return;
         }
         try {
@@ -363,12 +383,30 @@ public class SessionLifecycle {
                     .setDeviceId(deviceId)
                     .setAckSingleSeq(pending.getAckSingleSeq())
                     .putAllAckGroupSeqs(pending.getAckGroupSeqsMap())
+                    .setReplayDelivered(replayDelivered)
                     .build());
         } catch (RuntimeException e) {
             metrics.ingressFailed("ack", e);
             log.error("[offline] 补发确认失败（下次重连会重发同一批，客户端按 seq 去重）user={} device={} err={}",
                     userId, deviceId, e.getMessage());
         }
+    }
+
+    /**
+     * 逐帧写进这条连接，遇到第一帧失败就停。
+     *
+     * @return 实际写成功的帧数。调用方拿它和总数比较来决定要不要 ack——
+     *         中途失败就停在原地，下次重连整批重来（客户端按 seq 去重）
+     */
+    private int writeFrames(String userId, ClientSession session, List<String> frames) {
+        int written = 0;
+        for (String frame : frames) {
+            if (!connectionManager.sendTo(userId, session, frame)) {
+                break;
+            }
+            written++;
+        }
+        return written;
     }
 
     /**

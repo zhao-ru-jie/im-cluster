@@ -174,6 +174,18 @@ public final class RedisKeys {
         return root + ":user:" + tag(userId) + ":offline:ptr";
     }
 
+    /**
+     * 新端回放标记（String，带 TTL）：这台设备已经收到过一次「最近 M 会话 × N 条」的回放。
+     *
+     * <p>存在性就是全部语义，为什么要一个独立 key 而不是复用现有信号：设备水位
+     * （{@code im:wm}）与补发游标只在「真的收到过东西」时才出现，一台连上就安静待着的设备
+     * 会一直看起来像新设备，于是每次重连都回放 300 帧。标记只由网关确认写成功之后落，
+     * 因此它表达的是「服务端已经把回放交给这台设备了」。
+     */
+    public static String userReplay(String userId, String deviceId) {
+        return root + ":user:" + tag(userId) + ":replay:" + deviceId;
+    }
+
     /** 用户本地删除的消息（Set：seq），按会话分开 */
     public static String userDeleted(String userId, String conversationId) {
         return root + ":user:" + tag(userId) + ":deleted:" + conversationId;

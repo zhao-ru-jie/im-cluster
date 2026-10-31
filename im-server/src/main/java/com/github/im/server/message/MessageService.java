@@ -123,6 +123,8 @@ public class MessageService implements MessageIngress {
     private final Duration recallWindow;
     /** 服务端指标：registry 为 null 时全部退化为空操作，单测直接传 {@code new MessageMetrics(null)} */
     private final MessageMetrics metrics;
+    /** 可空：新端回放（最近 M 会话 × N 条）；未装配时补发行为与此前完全一致 */
+    private final NewDeviceReplayService replayService;
 
     public MessageService(StringRedisTemplate redis,
                           MessageRepository messageRepository,
@@ -138,7 +140,8 @@ public class MessageService implements MessageIngress {
                           MessageUpdateNotifier updateNotifier,
                           ConversationFlagNotifier flagNotifier,
                           @Value("${im.recall.window:2m}") Duration recallWindow,
-                          MessageMetrics metrics) {
+                          MessageMetrics metrics,
+                          NewDeviceReplayService replayService) {
         this.redis = redis;
         this.messageRepository = messageRepository;
         this.offlineMessageStore = offlineMessageStore;
@@ -154,6 +157,7 @@ public class MessageService implements MessageIngress {
         this.flagNotifier = flagNotifier;
         this.recallWindow = recallWindow == null ? Duration.ofMinutes(2) : recallWindow;
         this.metrics = metrics;
+        this.replayService = replayService;
     }
 
     @Override
@@ -622,6 +626,12 @@ public class MessageService implements MessageIngress {
      *       从会话历史取消息、用 {@link ClientFrames#frameOf} 重建帧。</li>
      * </ol>
      *
+     * <p>另有一条与补发并列、但语义不同的通道：<b>新端回放</b>
+     * （{@link NewDeviceReplayService}，写进 {@code replay_frames}）。补发回答「这台设备缺了什么」，
+     * 回放回答「这台设备第一次上线应该看到什么」。后者不依赖任何游标，所以群锚点退休
+     * （{@code clearPending}）之后它仍然是满的，也不会被 {@link #ackPending} 推进——
+     * 两者在同一响应里但走两套账。
+     *
      * <p><b>本方法只读不移除，也不推进任何游标</b>。这是「至少一次」的实现方式：
      * 返回的帧等网关真的写进客户端连接之后，由它调 {@link #ackPending} 推进。
      * 写失败 / 进程崩溃 = 游标不动，下次重连从原位置重读（客户端按 seq 去重）。
@@ -655,6 +665,15 @@ public class MessageService implements MessageIngress {
             pendingConversations = pullGroupPending(userId, deviceId, request.getWatermarksMap(),
                     max - out.size(), out, groupAcks);
         }
+        // 新端回放：与补发<b>完全独立</b>——独立预算、独立字段，也不参与 ack 游标。
+        // 绝不能并进 out：那会让网关的 ackPending 顺手把离线队列标成「已消费」，
+        // 而那批消息这台设备根本没收到过（它只是收到了同一会话里更近的 N 条）。
+        NewDeviceReplayService.Replay replay = replayService == null
+                ? NewDeviceReplayService.Replay.empty()
+                : replayService.build(userId, deviceId, request.getReplay());
+        if (replay.included()) {
+            metrics.replay(replay.frames().size(), replay.conversations());
+        }
         // 补发量是「离线积压是否在消化」的直接证据：入队与补发两条曲线应该大致贴合
         metrics.offlinePulled(out.size());
         return PullPendingResponse.newBuilder()
@@ -664,6 +683,9 @@ public class MessageService implements MessageIngress {
                 .setRemaining((int) (offlineMessageStore.pendingFrames(userId, deviceId) + pendingConversations))
                 .setAckSingleSeq(batch.ackSeq())
                 .putAllAckGroupSeqs(groupAcks)
+                .addAllReplayFrames(replay.frames())
+                .setReplayConversations(replay.conversations())
+                .setReplayTruncated(replay.truncated())
                 .build();
     }
 
@@ -698,6 +720,12 @@ public class MessageService implements MessageIngress {
                 if (offlineMessageStore.allDevicesReached(devices, userId, conversationId, nextSeq)) {
                     offlineMessageStore.clearPending(userId, conversationId);
                 }
+            }
+            if (request.getReplayDelivered() && replayService != null) {
+                // 回放帧也全部写进连接了 → 这台设备不再自动回放。
+                // 落标记放在这里而不是生成回放时：网关写失败时若已经落标记，
+                // 这台设备就永久停在「服务端以为它有了、它其实什么都没有」的状态。
+                replayService.markReplayed(userId, deviceId);
             }
             log.debug("[offline] 补发确认 user={} device={} singleCursor={} groupAdvanced={}",
                     userId, deviceId, cursor, advanced);

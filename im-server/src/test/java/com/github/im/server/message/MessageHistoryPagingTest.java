@@ -111,7 +111,7 @@ class MessageHistoryPagingTest {
         // history 只用到 repository 与 frames；其余依赖给 null 即可（构造器只做赋值）
         return new MessageService(null, repository, null, new ClientFrames(), null,
                 null, null, null, null, null, null, null, null, Duration.ofMinutes(2),
-                new MessageMetrics(null));
+                new MessageMetrics(null), null);
     }
 
     /** 升序构造 seq 列表对应的消息 */

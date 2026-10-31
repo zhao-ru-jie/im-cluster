@@ -161,8 +161,25 @@ public final class Frames {
      * 客户端紧接着发 sync 是为了<b>补上自己的水位</b>：服务端据此把 seq 下界抬到水位之上。
      */
     public String sync(Map<String, Long> watermarks) {
+        return sync(watermarks, false);
+    }
+
+    /**
+     * 同上，但可以显式要求一次「新端回放」。
+     *
+     * <p>服务端只在「这台设备第一次上线」时自动回放最近 M 个会话 × 每个最近 N 条
+     * （见 {@code NewDeviceReplayService}）。客户端本地库被清空、或者重装了 App 但
+     * deviceId 没变时，服务端认为这台设备已经回放过，只能靠这个标志再要一次。
+     *
+     * <p>重复回放是安全的：本地消息表按 {@code (conversationId, seq)} 去重，
+     * 重复帧会被 {@code recordInbound} 直接丢弃。
+     */
+    public String sync(Map<String, Long> watermarks, boolean replay) {
         Map<String, Object> frame = base(T_SYNC);
         frame.put("watermarks", watermarks == null ? Map.of() : watermarks);
+        if (replay) {
+            frame.put("replay", true);
+        }
         return write(frame);
     }
 

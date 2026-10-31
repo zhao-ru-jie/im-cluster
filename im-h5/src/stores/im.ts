@@ -46,6 +46,15 @@ function sortMessages(list: ChatMessage[]): ChatMessage[] {
   });
 }
 
+/** 已见水位：会话 -> 最后一条 seq。服务端据此抬补发起点、并据此判断要不要回放 */
+function watermarksOf(conversations: ConversationItem[]): Record<string, number> {
+  const watermarks: Record<string, number> = {};
+  conversations.forEach((item) => {
+    watermarks[item.conversationId] = item.lastSeq;
+  });
+  return watermarks;
+}
+
 /** 待发送消息的归属（ack 帧里没有 conversationId，只能自己记） */
 const pendingConv = new Map<string, string>();
 /** 帧监听只绑一次：退出再登录时重复 onFrame 会让同一帧被处理两遍 */
@@ -170,10 +179,7 @@ export const useImStore = defineStore('im', {
 
     /** 连上之后：上报已读水位，让服务端把断线期间的离线帧补下来 */
     onConnected(): void {
-      const watermarks: Record<string, number> = {};
-      this.conversations.forEach((item) => {
-        watermarks[item.conversationId] = item.lastSeq;
-      });
+      const watermarks = watermarksOf(this.conversations);
       imSocket.send({ type: 'sync', watermarks });
       void this.refreshConversations(true);
       // 断线期间发出的消息可能还在队列里：给它们一次机会，超过超时时间的标记失败
@@ -274,6 +280,19 @@ export const useImStore = defineStore('im', {
           // 未知帧忽略即可：服务端加字段/加类型时老客户端不能崩
           break;
       }
+    },
+
+    /**
+     * 主动要一次「新端回放」：服务端把最近 M 个会话的最近 N 条重新推一遍。
+     *
+     * <p>服务端只在这台设备<b>第一次上线</b>时自动回放。本地 IndexedDB 被清空
+     * （用户清缓存、换设备但复用了同一个 deviceId）时自动路径不会触发，
+     * 「重新同步最近消息」这类按钮就调这里。
+     *
+     * <p>重复回放是安全的：回放帧与实时帧同构，`mergeMessage` 按 seq / clientMsgId 合并。
+     */
+    requestReplay(): void {
+      imSocket.send({ type: 'sync', watermarks: watermarksOf(this.conversations), replay: true });
     },
 
     /* ---------------------------- 收消息/回执 ---------------------------- */

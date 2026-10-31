@@ -84,6 +84,8 @@ public class MessageMetrics {
     private final Counter offlinePulled;
     private final Counter recipientsDelivered;
     private final Counter recipientsOffline;
+    private final Counter replayFrames;
+    private final Counter replaySessions;
 
     /**
      * 最近一次单聊落离线后观测到的队列深度。
@@ -104,6 +106,8 @@ public class MessageMetrics {
             this.offlinePulled = null;
             this.recipientsDelivered = null;
             this.recipientsOffline = null;
+            this.replayFrames = null;
+            this.replaySessions = null;
             return;
         }
         // 分位数在客户端算：Prometheus 侧不必存 histogram bucket，
@@ -133,6 +137,12 @@ public class MessageMetrics {
         this.recipientsOffline = Counter.builder("im.message.recipients")
                 .description("消息接收方按投递结果计数")
                 .tag(TAG_RESULT, "offline")
+                .register(registry);
+        this.replayFrames = Counter.builder("im.replay.frames")
+                .description("新端回放推出的帧数（一次回放 = 最近 M 会话 × N 条）")
+                .register(registry);
+        this.replaySessions = Counter.builder("im.replay.sessions")
+                .description("触发过新端回放的连接次数（设备维度：每台设备只自动回放一次）")
                 .register(registry);
         Gauge.builder("im.offline.queue.depth", offlineDepth, AtomicLong::get)
                 .description("最近一次写入后观测到的单聊离线队列深度（近似值，见字段注释）")
@@ -206,6 +216,21 @@ public class MessageMetrics {
             return;
         }
         offlinePulled.increment(frames);
+    }
+
+    /**
+     * 新端回放：帧数 + 触发次数。
+     *
+     * <p>这两个数与 {@code im.offline.frames.pulled} 分开：补发是「欠账在还」，
+     * 回放是「新设备开户」。回放次数持续增长说明有设备反复被当成新设备
+     * （deviceId 不稳定、或回放标记没落下来），那是要查的信号，混进补发就看不出来了。
+     */
+    public void replay(int frames, int conversations) {
+        if (registry == null || frames <= 0) {
+            return;
+        }
+        replayFrames.increment(frames);
+        replaySessions.increment();
     }
 
     /** 上行 gRPC 入口的耗时与结果（result: ok / invalid / error） */

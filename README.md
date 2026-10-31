@@ -592,6 +592,42 @@ message accepted: traceId=trace-e2e-0001 conv=s:alice:bob seq=13 msgId=01a166bb-
 每台设备有自己的游标、会各自拉一遍；如果用扇出，手机上线会把同一批离线消息同时砸给网页，
 重复一遍，还会让两端的未读数一起跳。
 
+#### 新端回放：第一次上线的设备看到什么
+
+补发回答的是「这台设备缺了什么」，而它的两条数据源都有「消费完就退休」的语义——群锚点在
+「所有已登记设备都补过」之后会被 `clearPending` 摘掉。于是有个很具体的洞：
+**老设备都补完了 → 用户换新手机 → 服务端手里一条待补都没有**，新设备拿到的补发是空的，
+只能宿主自己一页页拉历史。
+
+所以在补发之外还有一条并列但独立的通道（`NewDeviceReplayService` →
+`PullPendingResponse.replay_frames`）：设备第一次上线时，服务端从**会话历史**重新切一份快照
+推给它——最近活跃的 M 个会话 × 每个最新 N 条。
+
+| 维度 | 补发（`frames`） | 新端回放（`replay_frames`） |
+|---|---|---|
+| 回答的问题 | 这台设备**缺**了什么 | 这台设备第一次上线该**看到**什么 |
+| 数据源 | 离线队列 + 群补发锚点（有游标） | 会话列表 + 会话历史（无游标） |
+| 预算 | 每批最多 200 帧（网关 `DEFAULT_PULL_MAX`） | `im.replay.max-frames`（默认 300） |
+| 是否推进游标 | 是（`ack_single_seq` / `ack_group_seqs`） | **否**，一帧都不推 |
+| 触发 | 每次建连 / `sync` | 每台设备**自动一次**；或客户端显式 `{"type":"sync","replay":true}` |
+
+三条硬约定：
+
+- **不参与游标**：回放帧单独占字段。混进 `frames` 会让新设备首次上线顺手把「离线队列已消费」
+  一起确认掉——那批消息它根本没收到过（它只收到了同一会话里更近的 N 条）；
+- **标记等确认**：`im:user:{u}:replay:{deviceId}` 只在网关把回放帧**全部写进连接**、回了
+  `ackPending(replay_delivered=true)` 之后才落。生成回放时就落标记的话，一旦写失败，这台设备会
+  永久停在「服务端以为它有了、它其实什么都没有」；宁可重复回放（客户端按
+  `(conversationId, seq)` 去重），也不要假成功；
+- **重叠是故意的**：新设备两条路都会走一遍，同一批消息可能出现两次。去重成本在客户端是一次
+  哈希查找；按集合精确求差要在服务端为每台设备维护一份「已回放 seq」，代价远大于收益。
+
+顺序是「先回放、后补发」：更早的消息先到，客户端在一轮里看到的 seq 天然单调。网关中途写失败
+就整批不 ack，下次重连从头再来，顺序不会乱。
+
+`replay_truncated=true` 表示这次没覆盖全部近期会话（预算用尽，或某个会话读历史失败）——
+客户端需要更早的内容时，仍应自己调 `/conv/{id}/messages` 翻页。
+
 ### 会话列表与未读数
 
 在此之前「会话」只是一个字符串约定（`s:a:b` / `g:{id}`），没有实体，所以做不了会话列表、
@@ -746,8 +782,13 @@ conversationId / seq / contentType），怎么推由 `VendorPushPort` 的实现�
 从 3 变 2（旧连接被踢且已移出会话表），全部断开后归 0（无空壳泄漏）。
 
 `sync` 帧是客户端**重连后必须发一次**的对账动作：它把「每个会话我见到了哪个 seq」报给服务端。
-服务端用它做两件事——补拉缺口、抬高 seq 发号下界。后者是 Redis 序号计数器整体丢失时
-唯一还能防止「新消息 seq 比客户端水位还小、被当历史去重丢弃」的依据（详见「seq 发号与三道下界」）。
+服务端用它做三件事——补拉缺口、抬高 seq 发号下界、附带下发「新端回放」。其中抬高发号下界
+是 Redis 序号计数器整体丢失时唯一还能防止「新消息 seq 比客户端水位还小、被当历史去重丢弃」
+的依据（详见「seq 发号与三道下界」）。
+
+`sync` 还可以带 `{"replay": true}`：显式要求一次新端回放。服务端只在设备第一次上线时自动回放，
+本地库被清空、或重装 App 但 `deviceId` 没变时，只有这个标志能再要一次
+（见「新端回放」）。
 
 ### 心跳保活
 
@@ -933,6 +974,10 @@ CREATE TABLE im_group_member (
 2. 网关把帧全部写进客户端连接；
 3. **全部成功才**调 `MessageIngress.ackPending` → 服务端推进游标；
 4. 中途失败 / 进程崩溃 = 不确认 = 游标不动，下次重连从原位置重读（客户端按 seq 去重）。
+
+新端回放帧走同一套「先写后确认」，但确认的是另一件事：网关把回放帧也全部写成功之后才带
+`ackPending(replay_delivered=true)`，服务端据此给这台设备落「已回放过」标记——它一个字都
+不推进补发游标，所以「收到了最近 N 条」不等于「缺的那批已经补齐」。
 
 **为什么单聊队列从 List 换成 ZSet**：补发起点是「这台设备已确认到的位置」，需要能按位置定位读
 （`ZRANGEBYSCORE key (cursor +inf LIMIT n`）。List 只能按下标读，而 `LTRIM` 一裁下标就整体漂移。
@@ -1135,6 +1180,8 @@ Nacos 未启用或连不上时，`NacosNodeDiscovery.resolveTarget()` **自动�
 | **离线补发丢消息** | 补发是 at-least-once：`pullPending` 读不删，网关全部写成功才 `ackPending` 推进游标；失败重连重复补，客户端按 seq 去重 |
 | **补发"已送达"不可判定** | 客户端 `sync` 上报的水位按 `im:wm:{userId}:{deviceId}` 落 Redis（30d TTL），是 delivered 的唯一可信口径 |
 | **多端互相吃掉离线消息** | 补发进度按设备分开（`im:offline:cur` / `im:offline:gcur`），用户级只保留「最早未补发」锚点；锚点要等所有登记设备都补过才退休 |
+| **新设备拿不到历史**（锚点退休后补发为空） | 新端回放：设备第一次上线从会话历史切快照（最近 M 会话 × N 条），走独立字段、不碰游标；标记在网关确认写成功后落（`im:user:{u}:replay:{deviceId}`） |
+| **回放被误当成补发** | 回放帧与补发帧分字段下发，`ack_single_seq`/`ack_group_seqs` 只描述补发；回放单独用 `ackPending(replay_delivered)` 确认，绝不推进补发游标 |
 | **会话列表写失败** | 只记 error，不影响受理：消息已落库，补发与历史拉取都不依赖会话列表（它只是「入口」） |
 | **未读数与真实消息数不一致** | 不存计数，用 `last_seq - read_seq` 相减，天然自愈 |
 | **网关宕机** | 路由 TTL 过期 + Nacos 健康剔除；残留路由由其他健康节点清理；消息转离线 |
@@ -1351,6 +1398,11 @@ kubectl apply -f k8s/im-node.yaml     # 或 im-gateway.yaml + im-server.yaml（�
 | `im.conversation.list-ttl` | `IM_CONVERSATION_LIST_TTL` | `30d` | 会话列表 / 已读位置保留时长（长期无消息自然消失） |
 | `im.conversation.fanout-limit` | `IM_CONVERSATION_FANOUT_LIMIT` | `1000` | 会话列表写扩散的人数上限，超过则只更新元信息（靠群反查表补齐） |
 | `im.read-stat.cache-ttl` | — | `2s` | 群已读聚合的成员快照缓存时长；`0` 关闭（每次聚合都查存储） |
+| `im.replay.enabled` | — | `true` | 新端回放总开关（关掉后退回「只补发」的旧行为） |
+| `im.replay.max-conversations` | — | `20` | 回放多少个会话（按最后消息时间倒序） |
+| `im.replay.per-conversation` | — | `20` | 每个会话回放多少条 |
+| `im.replay.max-frames` | — | `300` | 一轮回放的帧总数上限；超出部分报 `replay_truncated` |
+| `im.replay.marker-ttl` | — | `30d` | 「这台设备已回放过」标记的 TTL；过期后下次上线会再回放一次（客户端去重） |
 | `im.node.grpc-port` / `grpc-host` | `IM_GRPC_PORT` / `IM_GRPC_HOST` | `9090` / 自动探测 | 实例 ID |
 | `im.node.grpc.tls.enabled` / `trust-cert` | `IM_GRPC_TLS` / `IM_GRPC_TRUST` | `false` / 空 | gRPC TLS |
 | `im.node.grpc.health-check-enabled` | `IM_GRPC_HEALTH_CHECK` | `true` | 客户端健康检查（排除 NOT_SERVING 实例） |
@@ -1368,6 +1420,7 @@ kubectl apply -f k8s/im-node.yaml     # 或 im-gateway.yaml + im-server.yaml（�
 | `im:offline:gcur:{userId}:{deviceId}` (Hash) | IM 服务（网关 ack 驱动） | IM 服务（每设备在每个会话已补发到的 seq） |
 | `im:gateway:devices:{userId}` (SET) | 网关 | IM 服务（该用户登记过的设备，判断锚点能否退休） |
 | `im:wm:{userId}:{deviceId}` (Hash) | IM 服务 | IM 服务（客户端亲口确认的已见 seq，delivered 口径，30d TTL） |
+| `im:user:{userId}:replay:{deviceId}` (String) | IM 服务（网关 ack 驱动） | IM 服务（这台设备已回过放；存在性即语义，30d TTL） |
 | `im:offline:{userId}` (List) | — | **已废弃**，升级窗口内读一次把积压帧发掉 |
 | `im:conv:msgs:{conversationId}` | IM 服务（`im.storage=redis`） | IM 服务 |
 | `im:seq:{conversationId}` | IM 服务 | IM 服务 |
@@ -1453,6 +1506,7 @@ im-cluster/
 │   ├── message/ClientFrames.java             # 下行 msg.push / msg.state 帧序列化（实时与历史同构）
 │   ├── message/MessageStateNotifier.java     # 状态回执：把 delivered/read 推回发送方（仅单聊）
 │   ├── message/MessageReadStatService.java   # 群已读聚合：谁读了/还有几人没读（按需算，不落库）
+│   ├── message/NewDeviceReplayService.java   # 新端回放：最近 M 会话 × N 条（独立于补发，不碰游标）
 │   ├── message/MessageUpdateNotifier.java    # 变更事件：撤回广播全会话、删除只推操作者自己的端
 │   ├── message/MessageDigests.java           # 会话摘要与媒体占位符（列表与通知共用同一份文案）
 │   ├── push/HttpVendorPush.java              # 厂商推送（离线通知）：HTTP 中转，默认关闭

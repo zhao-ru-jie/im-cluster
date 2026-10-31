@@ -257,6 +257,11 @@ export interface SyncFrame {
   ver?: 1;
   type: 'sync';
   watermarks: Record<string, number>;
+  /**
+   * 显式要求一次「新端回放」（最近 M 个会话 × 每个最近 N 条）。
+   * 服务端只在设备第一次上线时自动回放；本地缓存清空但 deviceId 没变时要靠这个标志。
+   */
+  replay?: boolean;
 }
 
 export interface TypingFrame {
